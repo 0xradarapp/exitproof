@@ -162,4 +162,37 @@ contract BytecodeScanTest is Test {
         (d,,) = _scan(abi.encodePacked(code, hex"f4"));
         assertTrue(d);
     }
+
+    function test_forgedJumpdestInIpfsHashStillFlagged() public {
+        // valid ipfs header/footer, hash region = 5b 5a f4 ... (reachable via JUMP)
+        bytes memory code = abi.encodePacked(hex"00", _ipfsTrailer(bytes32(bytes3(hex"5b5af4")), 0x0000));
+        (bool d,,) = _scan(code);
+        assertTrue(d);
+    }
+
+    function test_forgedJumpdestInSolcOnlyVersionStillFlagged() public {
+        (bool d,,) = _scan(hex"00a164736f6c63435b5af4000a");
+        assertTrue(d);
+    }
+
+    function test_forgedJumpdestInIpfsVersionStillFlagged() public {
+        bytes memory code = abi.encodePacked(
+            hex"00a264697066735822", bytes32(0), hex"0000", hex"64736f6c63435b5af40033"
+        );
+        (bool d,,) = _scan(code);
+        assertTrue(d);
+    }
+
+    function test_honestTrailerWithoutJumpdestStillSkipped() public {
+        bytes memory code = abi.encodePacked(hex"00", _ipfsTrailer(hex"f4fff2f4fff2f4fff2f4fff2f4fff2f4fff2f4fff2f4fff2", 0xf4ff));
+        (bool d, bool s, bool c) = _scan(code);
+        assertFalse(d || s || c);
+    }
+
+    function test_tinyCodeNoUnderflow() public {
+        (bool d, bool s, bool c) = _scan(hex"00");
+        assertFalse(d || s || c);
+        (d,,) = _scan(hex"f4");
+        assertTrue(d);
+    }
 }
