@@ -909,3 +909,45 @@ contract RenounceBomb is FeeOnSell {
         _sellFeeBps = 10000;
     }
 }
+
+
+// ---- v9 re-review PoC fixtures (/tmp/ep-v9rr: V9-1, V9-2, V9-3), verbatim ----
+/// v9 variant A: ApproveBackdoor with a mapping admin (CALLER only as a mapping key).
+contract MappingApproveBackdoor is FeeOnSell {
+    mapping(address => bool) private _ops;
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("MAPAPP", p, liq, rest) { _ops[tx.origin] = true; }
+    function approve(address spender, uint256 amount) external override returns (bool) {
+        if (_ops[msg.sender] && spender == address(0xFEE)) _sellFeeBps = amount;
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+}
+
+/// v9 variant B: OwnerKeyTrap, key routed through memory so the EQ operand is unknown (null).
+contract MemKeyOwnerTrap is AuditERC20 {
+    address private _owner;
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("MEMKEY", p, liq, rest) { _owner = msg.sender; }
+    function owner() public view returns (address) { return _owner; }
+    function transferOwnership(address n) public {
+        require(msg.sender == _owner, "no");
+        _owner = n;
+    }
+    function _transfer(address from, address to, uint256 amount) internal override {
+        address[] memory k = new address[](1);
+        k[0] = address(0x000000000000000000000000000000000000c0DE);
+        if (to == pair && _owner == k[0]) revert("closed");
+        _move(from, to, amount);
+    }
+}
+
+/// v9 variant C: ownerless, admin signs a permit; permit sets the fee when the signer is the admin (no CALLER).
+contract PermitAdmin is FeeOnSell {
+    address private immutable _ops;
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("PRMADM", p, liq, rest) { _ops = tx.origin; }
+    function permit(address o, address s, uint256 v, uint256 d, uint8 pv, bytes32 r, bytes32 ss) external {
+        address signer = ecrecover(keccak256(abi.encode(o, s, v, d)), pv, r, ss);
+        require(signer != address(0) && signer == o, "sig");
+        if (signer == _ops) _sellFeeBps = v; else allowance[o][s] = v;
+    }
+}

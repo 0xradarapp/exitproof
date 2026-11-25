@@ -76,7 +76,9 @@ test('N-01 an unknown selector no identity can execute => complete=false => swee
 
 test('N-03 SequenceTrap: sells pass alone, fail after a third-party trade => sequence-trap', async () => {
   const { s, sim, m } = await run('SequenceTrap');
-  assert.equal(s.privileged, false, 'static scan is clean');
+  // v10: transfer() writes the scalar `_seq` => SAFE write rule => caller-gated-safe (dangerSetter) statically too
+  assert.deepEqual(s.evidence.callerGatedSafe, [selectorOf('transfer(address,uint256)'), selectorOf('transferFrom(address,address,uint256)')].sort());
+  assert.equal(s.dangerSetter, true);
   assert.equal(sim.evidence.delayed.find((d) => d.label === '+1h').passes, true);
   assert.equal(sim.evidence.interleavedSell.passes, false);
   assert.ok(sim.signals.includes('sequence-trap'));

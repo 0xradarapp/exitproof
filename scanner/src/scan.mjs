@@ -31,7 +31,7 @@ import { keccak256, hexToBytes, bytesToHex, getAddress } from 'viem';
 import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS, CORE_ERC20, SAFE } from './selectors.mjs';
 import { readProxySlots, UPGRADE_SLOTS, isAddress20 } from './proxy.mjs';
 
-export const SCANNER_VERSION = 9;
+export const SCANNER_VERSION = 10;
 const OWNER_CALL_GAS = 100_000n;
 
 const JUMP = 0x56, JUMPI = 0x57, JUMPDEST = 0x5b, PUSH0 = 0x5f, EQ = 0x14;
@@ -58,7 +58,10 @@ set([CALL, CALLCODE], [7, 1]); set([DELEGATECALL, STATICCALL], [6, 1]);
 
 // Symbolic values: bigint literal | 'C' (CALLER/ORIGIN) | 'S' (SLOAD-derived) | 'A' (ADDRESS) | null (unknown).
 /** SLOAD-derived: 'S' (computed slot) or 'S:0x<slot>' (literal slot). */
-const isS = (v) => typeof v === 'string' && (v === 'S' || v.startsWith('S:') || v.startsWith('KEEP:') || v.startsWith('OWNERW:'));
+const isS = (v) => typeof v === 'string' && (v === 'S' || v.startsWith('S:') || v.startsWith('KEEP:')
+  || v.startsWith('OWNERW:') || v.startsWith('OWNERC:'));
+/** v10 (d): a value traced to calldata (the from / to arguments) or CALLER. */
+const isCalldataOrCaller = (v) => v === 'C' || v === 'CD' || v === 'CD4' || v === 'CD4A';
 const MASK160 = (1n << 160n) - 1n;
 const NOT_MASK160 = ((1n << 256n) - 1n) ^ MASK160;
 const isAddrLitG = (v) => v > 0n && v < 1n << 160n;
@@ -122,10 +125,14 @@ function stepStack(x, stack, onCmp) {
   let out = fold(op, args);
   // v9 expression tags for the ownership-plumbing check: CD4 = calldataload(4), CD4A = and(CD4, 2^160-1),
   // KEEP:<slot> = and(sload(slot), not(2^160-1)), OWNERW:<slot> = or(KEEP:<slot>, CD4A)
-  if (op === 0x35 && args[0] === 4n) { stack.push('CD4'); return; }
+  // v10: CD = any other calldata word (from / to arguments), K = keccak-derived (a mapping slot), kept through ADD
+  if (op === 0x35) { stack.push(args[0] === 4n ? 'CD4' : 'CD'); return; }
+  if (op === 0x20) { stack.push('K'); return; }
+  if (op === 0x01 && (args[0] === 'K' || args[1] === 'K')) { stack.push('K'); return; }
   if (op === 0x16 && out === null) {
     const [a, b] = args;
     if ((a === 'CD4' && b === MASK160) || (b === 'CD4' && a === MASK160)) { stack.push('CD4A'); return; }
+    if ((a === 'CD' && b === MASK160) || (b === 'CD' && a === MASK160)) { stack.push('CD'); return; }
     const sl = [a, b].find((v) => typeof v === 'string' && v.startsWith('S:'));
     if (sl && (a === NOT_MASK160 || b === NOT_MASK160)) { stack.push(`KEEP:${sl.slice(2)}`); return; }
   }
@@ -134,6 +141,7 @@ function stepStack(x, stack, onCmp) {
     const keep = [a, b].find((v) => typeof v === 'string' && v.startsWith('KEEP:'));
     const other = keep === a ? b : a;
     if (keep && other === 'CD4A') { stack.push(`OWNERW:${keep.slice(5)}`); return; }
+    if (keep && other === 'C') { stack.push(`OWNERC:${keep.slice(5)}`); return; }
     if (keep && other === 0n) { stack.push(keep); return; }
   }
   if (op === 0x33 || op === 0x32) out = 'C';
@@ -432,7 +440,10 @@ function blockContextOf(ins, df, disp, liveIdx) {
 // For every dispatcher selector outside SAFE: the literals compared (EQ / XOR) on the paths reachable from its entry,
 // e.g. `require(key == 0x1234)`. The simulator adds them to its ABI-less argument patterns.
 const MAX_HINTS = 8;
-const PLUMBING = Object.freeze({ '0xf2fde38b': 'transfer', '0x715018a6': 'renounce' }); // transferOwnership, renounceOwnership
+// transferOwnership(address), renounceOwnership(), acceptOwnership()
+const PLUMBING = Object.freeze({ '0xf2fde38b': 'transfer', '0x715018a6': 'renounce', '0x79ba5097': 'accept' });
+const TOTAL_SUPPLY = '0x18160ddd';
+const OWNER_GETTER = '0x8da5cb5b';
 const HINT_LIMIT = 1n << 160n;
 function selectorHintsOf(ins, df, disp, liveIdx) {
   const hints = {};
@@ -441,6 +452,8 @@ function selectorHintsOf(ins, df, disp, liveIdx) {
   const plumbing = [];
   const opAt = new Map(ins.map((x) => [x.pc, x.op]));
   const liveCaller = liveIdx.some((k) => ins[k].op === 0x33 || ins[k].op === 0x32);
+  const supplySlot = df.unresolved ? null : getterSlot(ins, df, disp, TOTAL_SUPPLY);
+  const ownerSlot = df.unresolved ? null : getterSlot(ins, df, disp, OWNER_GETTER);
   for (const sel of Object.keys(disp.entries).sort(sortStr)) {
     const safe = !!SAFE[sel];
     const consts = new Set();
@@ -459,7 +472,7 @@ function selectorHintsOf(ins, df, disp, liveIdx) {
       for (const v of args) for (const x of asSet(v) ?? []) if (x > 1n && x < HINT_LIMIT) consts.add(x);
     };
     const onOp = (x, stack) => {
-      if (x.op === 0x55) sstores.push({ slot: stack.length ? stack[stack.length - 1] : null, value: stack.length > 1 ? stack[stack.length - 2] : null });
+      if (x.op === 0x55) sstores.push({ pc: x.pc, slot: stack.length ? stack[stack.length - 1] : null, value: stack.length > 1 ? stack[stack.length - 2] : null });
       if ([0xf0, 0xf1, 0xf2, 0xf4, 0xf5, 0xfa, 0xff].includes(x.op)) calls++;
     };
     const starts = disp.entries[sel];
@@ -468,7 +481,10 @@ function selectorHintsOf(ins, df, disp, liveIdx) {
     if (safe) {
       // v9: inside an allowlisted function CALLER may be a mapping key or the from/owner side of the accounting,
       // never compared with storage or a literal (an admin branch in approve(), a backdoor in permit, ...)
-      if (r.unresolved || callerCompared) callerGatedSafe.push(sel);
+      // v10 write rule: an allowlisted function may only SSTORE into mapping (keccak-derived) slots, or into the slot
+      // totalSupply() reads (mint / burn branches of the shared _update)
+      const badWrite = sstores.some((w) => w.slot !== 'K' && !(supplySlot !== null && w.slot === supplySlot));
+      if (r.unresolved || callerCompared || badWrite) callerGatedSafe.push(sel);
       continue;
     }
     // v8 rule: an unknown selector whose reachable code reads CALLER or ORIGIN is caller-gated. Unresolved jumps fall
@@ -476,8 +492,8 @@ function selectorHintsOf(ins, df, disp, liveIdx) {
     const readsCaller = r.unresolved ? liveCaller
       : [...r.visited].some((k) => ins[k].op === 0x33 || ins[k].op === 0x32);
     if (readsCaller && !DANGEROUS[sel]) {
-      if (PLUMBING[sel] && !r.unresolved && isPlumbing(PLUMBING[sel], sstores, calls, callerSlots)
-        && ownerSlotHarmless(ins, df, disp, sstores[0].slot)) plumbing.push(sel);
+      const slots = PLUMBING[sel] && !r.unresolved ? plumbingSlots(PLUMBING[sel], sstores, calls, callerSlots, ownerSlot) : null;
+      if (slots && slots.every((sl) => ownerSlotHarmless(ins, df, disp, sl))) plumbing.push(sel);
       else callerGated.push(sel);
     }
     if (r.unresolved && !consts.size) continue;
@@ -488,18 +504,65 @@ function selectorHintsOf(ins, df, disp, liveIdx) {
   return { hints, callerGated, callerGatedSafe, plumbing };
 }
 
+/** The single literal slot a no-argument getter reads (totalSupply(), owner()), or null. */
+function getterSlot(ins, df, disp, sel) {
+  const starts = disp.entries[sel];
+  if (!starts?.length) return null;
+  const slots = new Set();
+  let other = false;
+  const r = computeEntries(ins, starts.map((k) => [k, [...(df.entries.get(k) ?? [])]]), null, (x, stack) => {
+    if (x.op !== 0x54) return;
+    const v = stack.length ? stack[stack.length - 1] : null;
+    if (typeof v === 'bigint') slots.add(v); else other = true;
+  });
+  return !r.unresolved && !other && slots.size === 1 ? [...slots][0] : null;
+}
+
 /**
- * v9 ownership plumbing (transferOwnership / renounceOwnership): (a) no external call, (b) exactly one SSTORE, to a
- * literal slot this function compares with CALLER, (c) the stored value is exactly and(calldataload(4), 2^160-1)
- * (transfer) or 0 (renounce), optionally merged into the slot's other bits (solc's read-modify-write), nothing else.
+ * v9/v10 ownership plumbing (transferOwnership / renounceOwnership / acceptOwnership, Ownable and Ownable2Step).
+ * Common: (a) no external call; every SSTORE to a literal slot; values exact:
+ *   Ownable      transfer: one store O := and(calldataload(4), mask)        (O compared with CALLER)
+ *                renounce: one store O := 0                                 (O compared with CALLER)
+ *   Ownable2Step transfer: one store P := and(calldataload(4), mask), P != O, O = owner() slot compared with CALLER
+ *                accept:   two stores P := 0 and O := CALLER, P compared with CALLER, O = owner() slot
+ *                renounce: two stores P := 0 and O := 0, O compared with CALLER
+ * "value exact" allows solc's read-modify-write merge into the slot's other bits. Returns the slots written (for (d))
+ * or null.
  */
-function isPlumbing(kind, sstores, calls, callerSlots) {
-  if (calls !== 0 || sstores.length !== 1 || typeof sstores[0].slot !== 'bigint') return false;
-  const slot = `0x${sstores[0].slot.toString(16)}`;
-  if (!callerSlots.has(`S:${slot}`)) return false;
-  const v = sstores[0].value;
-  if (kind === 'transfer') return v === 'CD4A' || v === `OWNERW:${slot}`;
-  return v === 0n || v === `KEEP:${slot}`;
+function plumbingSlots(kind, sstores, calls, callerSlots, ownerSlot) {
+  if (calls !== 0) return null;
+  const byPc = new Map();
+  for (const w of sstores) {
+    const k = `${w.slot}|${typeof w.value === 'bigint' ? `0x${w.value.toString(16)}` : w.value}`;
+    (byPc.get(w.pc) ?? byPc.set(w.pc, new Set()).get(w.pc)).add(k);
+  }
+  if ([...byPc.values()].some((x) => x.size !== 1)) return null; // one context-independent write per instruction
+  const writes = sstores.filter((w, i) => sstores.findIndex((y) => y.pc === w.pc) === i);
+  if (!writes.every((w) => typeof w.slot === 'bigint')) return null;
+  const hx = (b) => `0x${b.toString(16)}`;
+  const compared = (b) => callerSlots.has(`S:${hx(b)}`);
+  const isZero = (w) => w.value === 0n || w.value === `KEEP:${hx(w.slot)}`;
+  const isNewOwner = (w) => w.value === 'CD4A' || w.value === `OWNERW:${hx(w.slot)}`;
+  const isCaller = (w) => w.value === 'C' || w.value === `OWNERC:${hx(w.slot)}`;
+  const isOwnerSlot = (b) => ownerSlot === null || b === ownerSlot;
+  if (writes.length === 1) {
+    const [w] = writes;
+    if (kind === 'transfer' && isNewOwner(w) && compared(w.slot) && isOwnerSlot(w.slot)) return [w.slot];
+    if (kind === 'renounce' && isZero(w) && compared(w.slot) && isOwnerSlot(w.slot)) return [w.slot];
+    // Ownable2Step.transferOwnership: writes the pending slot only; the owner slot is the one compared
+    if (kind === 'transfer' && isNewOwner(w) && ownerSlot !== null && w.slot !== ownerSlot && compared(ownerSlot)) {
+      return [w.slot, ownerSlot];
+    }
+    return null;
+  }
+  if (writes.length === 2 && ownerSlot !== null) {
+    const o = writes.find((w) => w.slot === ownerSlot);
+    const pend = writes.find((w) => w.slot !== ownerSlot);
+    if (!o || !pend || !isZero(pend)) return null;
+    if (kind === 'accept' && isCaller(o) && compared(pend.slot)) return [o.slot, pend.slot];
+    if (kind === 'renounce' && isZero(o) && compared(o.slot)) return [o.slot, pend.slot];
+  }
+  return null;
 }
 
 /**
@@ -522,8 +585,8 @@ function ownerSlotHarmless(ins, df, disp, slotBig) {
     if (x.op === 0x16 && args.some((v) => v === MASK160)) return; // address cleanup mask
     if (x.op === 0x14) {
       const other = args.find((v) => v !== tag) ?? null;
-      // EQ with from / to (calldata, possibly masked, or an unknown joined value) or CALLER; never a literal or storage
-      if (other === null || (typeof other === 'string' && !isS(other))) return;
+      // v10: EQ only with a value traced to calldata (from / to) or CALLER; an unknown (e.g. via memory) fails
+      if (isCalldataOrCaller(other)) return;
     }
     ok = false;
   };

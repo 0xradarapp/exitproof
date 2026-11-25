@@ -94,6 +94,8 @@ const SAFE_SIGNATURES = [
   'increaseAllowance(address,uint256)', 'decreaseAllowance(address,uint256)',
   'permit(address,address,uint256,uint256,uint8,bytes32,bytes32)', 'nonces(address)', 'DOMAIN_SEPARATOR()',
   'eip712Domain()', 'owner()', 'getOwner()', 'supportsInterface(bytes4)',
+  // v10: OpenZeppelin ERC20Burnable (checked by the SAFE caller / write rules in scan.mjs like every SAFE selector)
+  'burn(uint256)', 'burnFrom(address,uint256)',
   'pair()', 'uniswapV2Pair()', 'uniswapV2Router()', 'router()', 'deployer()',
 ];
 export const SAFE = Object.freeze(Object.fromEntries(

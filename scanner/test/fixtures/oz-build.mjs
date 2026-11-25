@@ -1,4 +1,4 @@
-// Builds real OpenZeppelin Contracts v5 tokens (ERC20 + ERC20Permit + Ownable) for the v9 "standard OZ bodies stay
+// Builds real OpenZeppelin Contracts v5 tokens (ERC20, ERC20Permit, ERC20Burnable, Ownable, Ownable2Step) for the v9 "standard OZ bodies stay
 // clean" tests -> oz-fixtures.json (committed; tests need no compiler). OZ is MIT; point OZ_DIR at a checkout:
 //   OZ_DIR=/path/to/openzeppelin-contracts node scanner/test/fixtures/oz-build.mjs
 import { execFileSync } from 'node:child_process';
@@ -17,9 +17,14 @@ pragma solidity ^0.8.20;
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ERC20Burnable} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 contract OzPlain is ERC20 { constructor(address pair, uint256 liq, uint256 rest) ERC20("OzPlain", "OZP") { _mint(pair, liq); _mint(msg.sender, rest); } }
 contract OzPermit is ERC20Permit { constructor(address pair, uint256 liq, uint256 rest) ERC20("OzPermit", "OZPM") ERC20Permit("OzPermit") { _mint(pair, liq); _mint(msg.sender, rest); } }
 contract OzOwnedPermit is ERC20Permit, Ownable { constructor(address pair, uint256 liq, uint256 rest) ERC20("OzOwned", "OZO") ERC20Permit("OzOwned") Ownable(msg.sender) { _mint(pair, liq); _mint(msg.sender, rest); } }
+contract OzBurnable is ERC20Burnable { constructor(address pair, uint256 liq, uint256 rest) ERC20("OzBurn", "OZB") { _mint(pair, liq); _mint(msg.sender, rest); } }
+contract OzOwnable2Step is ERC20, Ownable2Step { constructor(address pair, uint256 liq, uint256 rest) ERC20("Oz2Step", "OZ2") Ownable(msg.sender) { _mint(pair, liq); _mint(msg.sender, rest); } }
+contract OzOwnedBurnablePermit is ERC20Burnable, ERC20Permit, Ownable { constructor(address pair, uint256 liq, uint256 rest) ERC20("OzOBP", "OBP") ERC20Permit("OzOBP") Ownable(msg.sender) { _mint(pair, liq); _mint(msg.sender, rest); } }
 `;
 const input = {
   language: 'Solidity',
