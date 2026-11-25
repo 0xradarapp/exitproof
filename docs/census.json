@@ -1,0 +1,524 @@
+{
+  "meta": {
+    "type": "meta",
+    "version": 1,
+    "block": "76868206",
+    "blockTimestamp": 1795637242,
+    "blockTime": "2026-11-25T20:07:22.000Z",
+    "chainId": 196,
+    "upstream": "https://rpc.xlayer.tech",
+    "factory": "0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF",
+    "wokb": "0xe538905cf8410324e03A5A23C1c177a474D59b2b",
+    "N": 600,
+    "M": 200,
+    "seed": 196,
+    "prng": "mulberry32 partial Fisher-Yates",
+    "dustOkb": 0.01,
+    "amountInRule": "min(0.001 OKB, 1% of WOKB reserve)",
+    "inspectMode": "permissive",
+    "scannerVersion": 4,
+    "startedAt": "2026-11-25T20:17:09.787Z",
+    "sample": {
+      "totalPairs": 27534,
+      "wokbPairs": 26996,
+      "nonWokbPairs": 538,
+      "livePairs": 953,
+      "liveWokbReserve": "28790561474412143879213",
+      "lastNWindow": 600,
+      "recentRange": [
+        3779,
+        27533
+      ],
+      "olderPool": 353,
+      "pickedRecent": 600,
+      "pickedOlder": 200,
+      "skipped": {
+        "dust": 26043,
+        "empty": 1356,
+        "noReserves": 0,
+        "dustInLastN": 562
+      }
+    }
+  },
+  "runs": [
+    {
+      "type": "run",
+      "at": "2026-11-25T20:17:09.789Z",
+      "forkHead": "76868214",
+      "stack": {
+        "processor": "0x215a67c3495BdAAaA9D7294399c9635582d6FfcB",
+        "circuitId": "1",
+        "registry": "0xF6168876932289D073567f347121A267095f3DD6",
+        "router": "0x13D69Cf7d6CE4218F646B759Dcf334D82c023d8e",
+        "verified": {
+          "netlistSha256": "a3d81e06cb23a74fd2bcec5ae8f57b9a50243b801f4ac10904cabe37afdd983b",
+          "evals": "2048/2048",
+          "at": "2026-11-25T20:12:57.094Z"
+        }
+      }
+    }
+  ],
+  "done": {
+    "type": "done",
+    "at": "2026-11-25T21:59:47.208Z",
+    "seconds": 6742,
+    "processed": 800,
+    "stats": {
+      "report": 740,
+      "revert": 60,
+      "error": 0
+    },
+    "proxy": {
+      "requests": 77751,
+      "retries": 478,
+      "refused": 10
+    }
+  },
+  "summary": {
+    "sampled": 800,
+    "measured": 740,
+    "cannotBuy": 60,
+    "errors": 0,
+    "classified": 800,
+    "skipped": {
+      "dust": 26043,
+      "empty": 1356,
+      "noReserves": 0,
+      "dustInLastN": 562
+    },
+    "counts": {
+      "cannotSell": 230,
+      "sellTaxHigh": 4,
+      "buyTaxHigh": 16,
+      "sellTaxAny": 25,
+      "buyTaxAny": 110,
+      "ownerActive": 656,
+      "ownerGetter": 313,
+      "dangerSetter": 284,
+      "dangerousOwnerSwitches": 284,
+      "listedDangerousSelector": 281,
+      "upgradeable": 7,
+      "unknownSelectorPrivileged": 655,
+      "privileged": 656,
+      "circuitMismatch": 0
+    },
+    "percent": {
+      "cannotSell": 31.1,
+      "sellTaxHigh": 0.5,
+      "buyTaxHigh": 2.2,
+      "sellTaxAny": 3.4,
+      "buyTaxAny": 14.9,
+      "ownerActive": 88.6,
+      "ownerGetter": 42.3,
+      "dangerSetter": 38.4,
+      "dangerousOwnerSwitches": 38.4,
+      "listedDangerousSelector": 38,
+      "upgradeable": 0.9,
+      "unknownSelectorPrivileged": 88.5,
+      "privileged": 88.6,
+      "circuitMismatch": 0
+    },
+    "eoa": {
+      "cannotSellChecked": 230,
+      "cannotSellEoaAlsoFails": 225,
+      "cannotSellEoaSells": 3,
+      "cannotSellEoaCannotBuy": 2,
+      "cannotBuyChecked": 58,
+      "cannotBuyEoaAlsoFails": 50,
+      "cannotBuyEoaBuys": 8,
+      "cannotBuyEoaBuysCannotSell": 8
+    },
+    "allowed": {
+      "permissive": 503,
+      "balanced": 367,
+      "strict": 84
+    },
+    "allowedPct": {
+      "permissive": 68,
+      "balanced": 49.6,
+      "strict": 11.4
+    },
+    "unscannedAllowedPct": {
+      "permissive": 68,
+      "balanced": 38.2,
+      "strict": 0
+    },
+    "reasons": {
+      "permissive": {
+        "0": 503,
+        "1": 230,
+        "2": 4,
+        "3": 3,
+        "cannotBuy": 60
+      },
+      "balanced": {
+        "0": 367,
+        "1": 230,
+        "2": 4,
+        "3": 3,
+        "4": 4,
+        "5": 132,
+        "cannotBuy": 60
+      },
+      "strict": {
+        "0": 84,
+        "1": 230,
+        "2": 25,
+        "3": 10,
+        "4": 4,
+        "5": 113,
+        "7": 274,
+        "cannotBuy": 60
+      }
+    },
+    "cannotBuyErrors": {
+      "SwapFailed": 58,
+      "TooLittle": 2
+    },
+    "honeypotLike": 237,
+    "honeypotLikePct": 32,
+    "cannotBuyPct": 7.5,
+    "byGroup": {
+      "recent": {
+        "measured": 547,
+        "cannotBuy": 53,
+        "cannotSellPct": 37.5,
+        "cannotBuyPct": 8.8,
+        "permissiveBlockedPct": 38.8,
+        "allowedPct": {
+          "permissive": 61.2,
+          "balanced": 46.3,
+          "strict": 14.3
+        }
+      },
+      "older": {
+        "measured": 193,
+        "cannotBuy": 7,
+        "cannotSellPct": 13,
+        "cannotBuyPct": 3.5,
+        "permissiveBlockedPct": 13,
+        "allowedPct": {
+          "permissive": 87,
+          "balanced": 59.1,
+          "strict": 3.1
+        }
+      }
+    },
+    "notable": [
+      {
+        "token": "0x4D87750a795b0Ae310A24349fA9108585100A90e",
+        "pair": "0xAd71E567501633f96948cd46E4700799006D3D15",
+        "symbol": "PUFF",
+        "group": "older",
+        "pairIndex": 8,
+        "liquidityOkb": 757.2202,
+        "facts": 174,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax 5-15%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setUniswapV2Pair(address)",
+          "setSwapAndLiquifyEnabled(bool)"
+        ]
+      },
+      {
+        "token": "0xaa7EDeA4F673b0259e82628103f064E884ad3d9B",
+        "pair": "0x047F755492FeaAF22b383FAf71E877Cb80EF167A",
+        "symbol": "XFROG",
+        "group": "older",
+        "pairIndex": 2839,
+        "liquidityOkb": 533.974,
+        "facts": 174,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax 5-15%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setSwapAndLiquifyEnabled(bool)"
+        ]
+      },
+      {
+        "token": "0xB313D39cAf815C58129Ad67EEa451dC57c30d96e",
+        "pair": "0xF6BbB32b277983f37e7Fe8ed7d2a678Da19e62b6",
+        "symbol": "KINGX",
+        "group": "recent",
+        "pairIndex": 6618,
+        "liquidityOkb": 532.1624,
+        "facts": 110,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax 5-15%, owner active, upgradeable",
+        "reason": "cannot sell (all modes)",
+        "dangerous": []
+      },
+      {
+        "token": "0xbB173865363dAF3E7779252C329DA3F3f23736fC",
+        "pair": "0xaE026018052F04358fcF87EFB45DdA6AF26aDCaE",
+        "symbol": "NIUB",
+        "group": "recent",
+        "pairIndex": 21253,
+        "liquidityOkb": 431.174,
+        "facts": 46,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax 5-15%, owner active",
+        "reason": "cannot sell (all modes)",
+        "dangerous": []
+      },
+      {
+        "token": "0x246E5eF65D29DD6375413959c1378F7612A8b983",
+        "pair": "0x247930e5Feb2E5Db916E2d1bFB2620e86aE2e728",
+        "symbol": "DOGFART",
+        "group": "recent",
+        "pairIndex": 5612,
+        "liquidityOkb": 370.8563,
+        "facts": 174,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax 5-15%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setMaxWalletAmount(uint256)",
+          "setMarketingFee(uint256)",
+          "excludeFromFees(address,bool)",
+          "setSwapAndLiquifyEnabled(bool)"
+        ]
+      },
+      {
+        "token": "0xf03D1b8666Ff16e3372103704Dd7f6740dc7bEbc",
+        "pair": "0xEffa6A6168C955c3211e3E89fc46AD301D4cbE10",
+        "symbol": "OKDOG",
+        "group": "recent",
+        "pairIndex": 6883,
+        "liquidityOkb": 229.3702,
+        "facts": 38,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active",
+        "reason": "cannot sell (all modes)",
+        "dangerous": []
+      },
+      {
+        "token": "0x4C225fb675c0c475b53381463782a7F741D59763",
+        "pair": "0xDFdEB88d43970BCBfB2E6B1C531A97C2EC8aeFAF",
+        "symbol": "OEOE",
+        "group": "recent",
+        "pairIndex": 11573,
+        "liquidityOkb": 131.3019,
+        "facts": 166,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setMaxWalletAmount(uint256)",
+          "setMarketingFee(uint256)",
+          "excludeFromFees(address,bool)",
+          "setSwapAndLiquifyEnabled(bool)"
+        ]
+      },
+      {
+        "token": "0x38273c0AF7EFb2d410923F3C102D446AC1D7DAaB",
+        "pair": "0xE783788ffcDa04220aA4A8C55Db906De7C6C7345",
+        "symbol": "CATSHIT",
+        "group": "recent",
+        "pairIndex": 4460,
+        "liquidityOkb": 119.6362,
+        "facts": 166,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setMaxWalletAmount(uint256)",
+          "setMarketingFee(uint256)",
+          "excludeFromFees(address,bool)",
+          "setSwapAndLiquifyEnabled(bool)"
+        ]
+      },
+      {
+        "token": "0x6A456d47355ff55773d2962b5eBCAC38260aE028",
+        "pair": "0x771db0425dE8135eAb28A60f3b213fF22d562E81",
+        "symbol": "XPEPE",
+        "group": "recent",
+        "pairIndex": 6409,
+        "liquidityOkb": 103.4436,
+        "facts": 166,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setMaxWalletAmount(uint256)",
+          "setMarketingFee(uint256)",
+          "excludeFromFees(address,bool)",
+          "setSwapAndLiquifyEnabled(bool)"
+        ]
+      },
+      {
+        "token": "0xF1110E05878B5Eb5cD62cC332e0079E8c3e6aB99",
+        "pair": "0x87C7B326406a001A56a38C5bDAb573232474d274",
+        "symbol": "FLAME",
+        "group": "recent",
+        "pairIndex": 5727,
+        "liquidityOkb": 85.2355,
+        "facts": 166,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setPaused(bool)",
+          "setTradingEnabled(bool)"
+        ]
+      },
+      {
+        "token": "0xA3f84Fe915D7560cCB60c5C22aB0bBAf772dF352",
+        "pair": "0x160085c09bA9489D912a9468C3f40F6b42edb939",
+        "symbol": "Xing",
+        "group": "recent",
+        "pairIndex": 7701,
+        "liquidityOkb": 76.1762,
+        "facts": 166,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setSwapAndLiquifyEnabled(bool)"
+        ]
+      },
+      {
+        "token": "0xA48ff5028E4141C13AfF251289A7035a55E691D4",
+        "pair": "0x64772582ed58355b74E14717394B6724212bBE31",
+        "symbol": "DOG",
+        "group": "recent",
+        "pairIndex": 24065,
+        "liquidityOkb": 66.3613,
+        "facts": 166,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "excludeFromFee(address)",
+          "includeInFee(address)"
+        ]
+      },
+      {
+        "token": "0x6BB87A0318310d97F8D3dBC69531B97A39035555",
+        "pair": "0x6Da9fa7Aa44D758B14e53048E798490d4D0d7058",
+        "symbol": "Babyokb",
+        "group": "older",
+        "pairIndex": 526,
+        "liquidityOkb": 65.4991,
+        "facts": 166,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setMaxWalletAmount(uint256)",
+          "setMarketingFee(uint256)",
+          "excludeFromFees(address,bool)",
+          "setSwapAndLiquifyEnabled(bool)"
+        ]
+      },
+      {
+        "token": "0x387d9a8F8424B12B8aad2d1b7618726Ba8356789",
+        "pair": "0x7C121AAC27230f95F4b3f49643ca1658312ac774",
+        "symbol": "Potato",
+        "group": "recent",
+        "pairIndex": 12481,
+        "liquidityOkb": 56.2937,
+        "facts": 38,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active",
+        "reason": "cannot sell (all modes)",
+        "dangerous": []
+      },
+      {
+        "token": "0xCEd157fDc1961E8a59D57F66A30954c9B4598F50",
+        "pair": "0xBAF2F626C292A9e3Ea3558B2Cd3e7335EB8Fb5d9",
+        "symbol": "MubarakX ",
+        "group": "recent",
+        "pairIndex": 5972,
+        "liquidityOkb": 55.0236,
+        "facts": 166,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setSwapAndLiquifyEnabled(bool)",
+          "setMaxTxAmount(uint256)"
+        ]
+      },
+      {
+        "token": "0x541683b205CB9D1D0bF4a1Acc1DE3dE634c6d0D3",
+        "pair": "0xb5fbE4D87E7159d1C9042C1CC1f559e8162990F9",
+        "symbol": "DORAE",
+        "group": "recent",
+        "pairIndex": 7592,
+        "liquidityOkb": 50.8395,
+        "facts": 166,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setMaxWalletAmount(uint256)"
+        ]
+      },
+      {
+        "token": "0x648367A6F46b0bF727deA950990d0bd479097777",
+        "pair": "0xF6032070523db316A8B9eDa76a7Ff1B115bA2Ba0",
+        "symbol": "领头羊",
+        "group": "recent",
+        "pairIndex": 27056,
+        "liquidityOkb": 49.5002,
+        "facts": 38,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active",
+        "reason": "cannot sell (all modes)",
+        "dangerous": []
+      },
+      {
+        "token": "0xf7c868cc4FA5A7300C399c62d891e3DfCE440556",
+        "pair": "0x2caE7e73144dC884848c2DF50F6AA822314fA9F4",
+        "symbol": "XMONEY",
+        "group": "recent",
+        "pairIndex": 6646,
+        "liquidityOkb": 45.5724,
+        "facts": 174,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax 5-15%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setUniswapV2Pair(address)",
+          "includeInFee(address)"
+        ]
+      },
+      {
+        "token": "0x00D60b54B02Cbc121b0C84C087df5Fbf396ee626",
+        "pair": "0x32217755c5F3bcA923A491e9c9F9A2aC68840E44",
+        "symbol": "WUKONG",
+        "group": "recent",
+        "pairIndex": 6224,
+        "liquidityOkb": 45.2897,
+        "facts": 166,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax <5%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setSwapAndLiquifyEnabled(bool)"
+        ]
+      },
+      {
+        "token": "0x9923F9FFb322095eA46cFcd4e43Af82cfd3d853e",
+        "pair": "0xEe81E04624D8AF45b6c14735b92c1513E0a1AAe8",
+        "symbol": "RUOK",
+        "group": "recent",
+        "pairIndex": 9327,
+        "liquidityOkb": 43.9002,
+        "facts": 174,
+        "eoa": "EOA buys, cannot sell",
+        "factsText": "CANNOT SELL, sell tax >=50%/unmeasurable, buy tax 5-15%, owner active, danger switches",
+        "reason": "cannot sell (all modes)",
+        "dangerous": [
+          "setSwapAndLiquifyEnabled(bool)"
+        ]
+      }
+    ],
+    "liquidityOkb": {
+      "median": 0.05358056806640294,
+      "total": 11892.69
+    }
+  }
+}
