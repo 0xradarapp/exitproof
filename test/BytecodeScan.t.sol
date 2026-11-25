@@ -36,8 +36,13 @@ contract BytecodeScanTest is Test {
     }
 
     function test_plainErc20IsClean() public {
-        address t = address(new PlainToken());
-        (bool d, bool s, bool c) = h.scan(t);
+        // Compiled metadata hash is arbitrary and changes with any source edit, so pin it to a
+        // hash with no 0x5b/f2/f4/ff (honest trailer). The code body is real solc output.
+        bytes memory code = address(new PlainToken()).code;
+        require(code.length > 53, "short");
+        uint256 st = code.length - 53;
+        for (uint256 i = st + 8; i < st + 42; ++i) code[i] = 0x11;
+        (bool d, bool s, bool c) = _scan(code);
         assertFalse(d);
         assertFalse(s);
         assertFalse(c);
@@ -141,8 +146,12 @@ contract BytecodeScanTest is Test {
     }
 
     function test_solcOnlyTrailerNotFlagged() public {
-        (bool d, bool s, bool c) = _scan(hex"5b00a164736f6c6343f4fff2000a");
+        // honest solc-only trailer is scanned in full and is clean
+        (bool d, bool s, bool c) = _scan(hex"5b00a164736f6c6343000818000a");
         assertFalse(d || s || c);
+        // forged version bytes f4 f4 f4 reachable by fall-through (a1=LOG1, 64=PUSH5)
+        (d,,) = _scan(hex"00a164736f6c6343f4f4f4000a");
+        assertTrue(d);
     }
 
     function test_realOpBeforeTrailerStillFlagged() public {
@@ -194,5 +203,28 @@ contract BytecodeScanTest is Test {
         assertFalse(d || s || c);
         (d,,) = _scan(hex"f4");
         assertTrue(d);
+    }
+
+    function test_pushOverrunIntoIpfsTrailerStillFlagged() public {
+        // PUSH32 whose immediates swallow header (8) + hash bytes 0..23; hash byte 24 = f4 executes
+        bytes memory hash = new bytes(32);
+        hash[24 - 0] = 0xf4;
+        bytes memory code;
+        code = abi.encodePacked(hex"7f", _ipfsTrailerBytes(hash, hex"0000"));
+        // code = 7f + trailer; PUSH32 covers 32 bytes after it = header(8)+hash[0..23]; hash[24] is executed
+        (bool d,,) = _scan(code);
+        assertTrue(d);
+    }
+
+    function test_honestAlignedTrailerWithF4InHashSkipped() public {
+        bytes memory hash = new bytes(32);
+        hash[24] = 0xf4;
+        bytes memory code = abi.encodePacked(hex"6001", _ipfsTrailerBytes(hash, hex"0000"));
+        (bool d, bool s, bool c) = _scan(code);
+        assertFalse(d || s || c);
+    }
+
+    function _ipfsTrailerBytes(bytes memory hash32, bytes2 hi2) internal pure returns (bytes memory) {
+        return abi.encodePacked(hex"a264697066735822", hash32, hi2, hex"64736f6c63430008180033");
     }
 }

@@ -7,7 +7,7 @@ pragma solidity 0.8.24;
 /// @dev The whole runtime code is scanned, including any Solidity CBOR metadata trailer. That
 ///      trailer is data whose 32-byte IPFS hash would otherwise yield a false positive for ~1 in 3
 ///      ordinary tokens, so a trailer is excluded, but ONLY if it matches one of two exact solc
-///      layouts (ipfs+solc, length 0x33; solc-only, length 0x0a). The length field alone is never
+///      layout (ipfs+solc, length 0x33; solc-only is scanned in full). The length field alone is never
 ///      trusted, so a forged length cannot move the scan boundary. Other layouts (e.g. old bzzr1
 ///      swarm trailers) are scanned in full and may false-positive (conservative).
 ///      This is a linear-time heuristic: it does not resolve jump targets, so unreachable code
@@ -27,11 +27,13 @@ library BytecodeScan {
             if size {
                 let ptr := mload(0x40)
                 extcodecopy(t, ptr, 0, size)
-                // Exclude a strictly-validated Solidity CBOR metadata trailer from the scan. Only two
-                // exact layouts are recognised, and only if none of the variable bytes (hash/version)
+                // Exclude a strictly-validated Solidity CBOR metadata trailer from the scan. Only the
+                // ipfs+solc layout is recognised (the solc-only layout is scanned in full: its bytes
+                // are executable-reachable by fall-through and contain no 0xf2/f4/ff when honest), and only if none of the variable bytes (hash/version)
                 // is 0x5b (JUMPDEST): the EVM does not treat the trailer as data, so a JUMP into a
                 // forged 0x5b there could reach hidden opcodes. Otherwise the full code is scanned.
                 // Free memory pointer is intentionally not bumped: the buffer is scratch only.
+                let scanEnd := size
                 let l := 0
                 if gt(size, 1) {
                     l := or(
@@ -47,19 +49,15 @@ library BytecodeScan {
                         eq(shr(208, mload(add(ptr, add(st, 42)))), 0x64736f6c6343)
                     ) {
                         if iszero(or(has5b(add(ptr, add(st, 8)), 34), has5b(add(ptr, add(st, 48)), 3))) {
-                            size := st
+                            scanEnd := st
                         }
-                    }
-                }
-                if and(gt(size, 0x0b), eq(l, 0x0a)) {
-                    // a1 64 "solc" 43 <3 bytes version> 00 0a
-                    let st := sub(size, 0x0c)
-                    if eq(shr(200, mload(add(ptr, st))), 0xa164736f6c6343) {
-                        if iszero(has5b(add(ptr, add(st, 7)), 3)) { size := st }
                     }
                 }
                 let i := 0
                 for {} lt(i, size) { i := add(i, 1) } {
+                    // Trailer is skipped only if the linear scan reaches it on an instruction
+                    // boundary; if a PUSH overran into it, execution can fall through, so keep scanning.
+                    if eq(i, scanEnd) { break }
                     let op := byte(0, mload(add(ptr, i)))
                     if gt(op, 0xf1) {
                         if eq(op, 0xf4) { hasDelegatecall := 1 }
