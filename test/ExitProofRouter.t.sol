@@ -277,6 +277,8 @@ contract ExitProofRouterTest is Test {
     }
 
     function test_buy_feeOnTransfer_5pct_bucket1() public {
+        // FeeToken(500) burns 5% of EVERY transfer. Buy side = delivery loss over two hops (pair -> router ->
+        // holder/buyer): 1 - 0.95^2 = 9.75% -> bucket 1. Sell side = holder -> pair: 5% -> bucket 1.
         FeeToken t = new FeeToken(SUPPLY, 500);
         _list(address(t), false);
         Rep memory r = _inspect(address(t), 1 ether, PERMISSIVE);
@@ -291,6 +293,20 @@ contract ExitProofRouterTest is Test {
         // strict: sell tax is checked before buy tax (spec reason order) -> 2
         (uint8 reason,) = _blocked(address(t), 1 ether, STRICT);
         assertEq(reason, 2);
+    }
+
+    function test_feeOnTransfer_8pct_buy_crosses_15pct() public {
+        // FeeToken(800): buy side 1 - 0.92^2 = 15.36% (two delivery hops) -> bucket 2; sell side 8% -> bucket 1.
+        // The buyer really loses >15% receiving the token, so permissive blocks on the BUY tax (reason 3), while
+        // the sell leg alone would have passed.
+        FeeToken t = new FeeToken(SUPPLY, 800);
+        _list(address(t), false);
+        Rep memory r = _inspect(address(t), 1 ether, PERMISSIVE);
+        assertEq(_f(r.facts, 0, 1), 1, "sellOk");
+        assertEq(_f(r.facts, 3, 2), 2, "buyTax bucket 2");
+        assertEq(_f(r.facts, 1, 2), 1, "sellTax bucket 1");
+        (uint8 reason,) = _blocked(address(t), 1 ether, PERMISSIVE);
+        assertEq(reason, 3);
     }
 
     function test_txOriginTrap_known_limitation() public {
@@ -413,8 +429,9 @@ contract ExitProofRouterTest is Test {
             uint256 used = g - gasleft();
             (bytes4 sel, bytes memory rest) = _strip(err);
             assertTrue(sel == ExitProofRouter.ProbeResult.selector);
-            (bool ok, uint256 out) = abi.decode(rest, (bool, uint256));
+            (bool ok, uint256 held, uint256 out) = abi.decode(rest, (bool, uint256, uint256));
             assertTrue(ok);
+            assertEq(held, 1000e18, "clean hop loses nothing");
             assertGt(out, 0);
             emit log_named_uint("probeSell gas (incl. helper CREATE2)", used);
             assertLt(used, router.PROBE_GAS());

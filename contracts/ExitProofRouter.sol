@@ -43,7 +43,7 @@ contract ExitProofRouter {
     // ------------------------------------------------------------------ errors / events
     error Blocked(uint8 reason, uint16 facts);
     error Report(uint16 facts, bool allow, uint8 reason, uint256 buyOut, uint256 sellOut);
-    error ProbeResult(bool ok, uint256 out);
+    error ProbeResult(bool ok, uint256 held, uint256 out);
     error BadPair();
     error Expired();
     error TooLittle();
@@ -172,40 +172,53 @@ contract ExitProofRouter {
 
     /// @notice Sell probe: moves `amount` of `token` (held by this router) to a fresh holder, which sells its whole
     ///         balance into `pair`; the `tokenIn` output is paid to this router and measured by balance diff.
-    ///         Self-call only; ALWAYS reverts with `ProbeResult(ok, out)` so no state survives.
+    ///         Self-call only; ALWAYS reverts with `ProbeResult(ok, held, out)` so no state survives.
+    ///         `held` = the holder's balance after the router -> holder hop (0 if unknown).
     /// @dev Never bubbles foreign revert data: every token/pair interaction is a low-level call whose result is
     ///      reduced to a bool, so a token cannot forge a ProbeResult.
     function probeSell(address pair, address token, address tokenIn, uint256 amount) external {
         if (msg.sender != address(this)) revert NotSelf();
         uint256 fee = _factoryFee[_pairFactory(pair)];
-        if (fee == 0) revert ProbeResult(false, 0);
+        if (fee == 0) revert ProbeResult(false, 0, 0);
         fee -= 1;
         // reserves BEFORE any token transfer (a hook cannot move the baseline)
         (bool ok, uint256 rTok, uint256 rIn) = _reserves(pair, token, tokenIn);
-        if (!ok) revert ProbeResult(false, 0);
+        if (!ok) revert ProbeResult(false, 0, 0);
         // Mirror the real path (pair -> router -> buyer -> pair): hand the whole position to a freshly CREATE2-deployed
         // holder, which then sells its entire balance. Everything (the holder included) is rolled back by the revert.
         // The salt varies per call so the holder address is not a fixed, whitelistable constant.
         bytes32 salt = keccak256(abi.encode(token, amount, block.number, gasleft()));
         address holder = address(new ProbeHolder{salt: salt}(salt));
-        if (!_tryTransfer(token, holder, amount)) revert ProbeResult(false, 0);
-        if (!_tryCall(holder, abi.encodeCall(ProbeHolder.sellAll, (token, pair)))) revert ProbeResult(false, 0);
-        uint256 bal;
-        (ok, bal) = _tryBalanceOf(token, pair);
-        if (!ok || bal <= rTok) revert ProbeResult(false, 0);
+        if (!_tryTransfer(token, holder, amount)) revert ProbeResult(false, 0, 0);
+        uint256 held;
+        (ok, held) = _tryBalanceOf(token, holder);
+        if (!ok || held == 0) revert ProbeResult(false, 0, 0);
+        // from here on `held` is known and reported even on failure (it feeds the buy-side tax)
+        if (!_tryCall(holder, abi.encodeCall(ProbeHolder.sellAll, (token, pair)))) revert ProbeResult(false, held, 0);
+        (bool sold, uint256 out) = _probeSwap(pair, token, tokenIn, rTok, rIn, fee);
+        revert ProbeResult(sold, held, out);
+    }
+
+    /// @dev Second half of the probe: pays out what the pair actually received from the holder. Never reverts.
+    function _probeSwap(address pair, address token, address tokenIn, uint256 rTok, uint256 rIn, uint256 fee)
+        internal
+        returns (bool, uint256)
+    {
+        (bool ok, uint256 bal) = _tryBalanceOf(token, pair);
+        if (!ok || bal <= rTok) return (false, 0);
         uint256 requested = _amountOut(bal - rTok, rTok, rIn, fee);
-        if (requested == 0) revert ProbeResult(false, 0);
+        if (requested == 0) return (false, 0);
         uint256 before;
         (ok, before) = _tryBalanceOf(tokenIn, address(this));
-        if (!ok) revert ProbeResult(false, 0);
+        if (!ok) return (false, 0);
         (uint256 a0, uint256 a1) = tokenIn < token ? (requested, uint256(0)) : (uint256(0), requested);
-        if (!_trySwap(pair, a0, a1)) revert ProbeResult(false, 0);
+        if (!_trySwap(pair, a0, a1)) return (false, 0);
         uint256 afterBal;
         (ok, afterBal) = _tryBalanceOf(tokenIn, address(this));
-        if (!ok || afterBal <= before) revert ProbeResult(false, 0);
+        if (!ok || afterBal <= before) return (false, 0);
         uint256 got = afterBal - before;
         // donations to the router during the probe cannot inflate the result
-        revert ProbeResult(true, got < requested ? got : requested);
+        return (true, got < requested ? got : requested);
     }
 
     // ------------------------------------------------------------------ core
@@ -215,10 +228,13 @@ contract ExitProofRouter {
         internal
         returns (Result memory r)
     {
-        uint256 buyTax;
-        (r.buyOut, buyTax) = _buyLeg(pair, pairFee, tokenIn, token);
-        (bool sellOk, uint256 sellTax, uint256 sellOut) = _sellLeg(pair, pairFee, tokenIn, token, r.buyOut);
+        uint256 expected;
+        (r.buyOut, expected) = _buyLeg(pair, pairFee, tokenIn, token);
+        (bool sellOk, uint256 sellTax, uint256 sellOut, uint256 held) =
+            _sellLeg(pair, pairFee, tokenIn, token, r.buyOut);
         r.sellOut = sellOut;
+        // buy tax = the whole delivery loss (pair -> router -> holder) when the hop was observed, else pair -> router
+        uint256 buyTax = _bucket(expected, held != 0 ? held : r.buyOut);
         r.codehash = token.codehash;
         r.facts = _facts(token, r.codehash, sellOk, sellTax, buyTax, mode);
 
@@ -231,38 +247,40 @@ contract ExitProofRouter {
         if (r.allow == (r.reason != 0)) revert BadEval(); // allow <=> reason == 0
     }
 
-    /// @dev Swaps the pair's surplus input into this router; balance-diff aware on both sides.
+    /// @dev Swaps the pair's surplus input into this router; balance-diff aware on both sides. Returns what the
+    ///      router received and the tax-free V2 expectation.
     function _buyLeg(address pair, uint256 pairFee, address tokenIn, address token)
         internal
-        returns (uint256 received, uint256 buyTax)
+        returns (uint256 received, uint256 expected)
     {
         (bool ok, uint256 rTok, uint256 rIn) = _reserves(pair, token, tokenIn);
         if (!ok) revert BadPair();
         uint256 inBal = _balanceOf(tokenIn, pair);
         if (inBal <= rIn) revert TooLittle();
-        uint256 expected = _amountOut(inBal - rIn, rIn, rTok, pairFee);
+        expected = _amountOut(inBal - rIn, rIn, rTok, pairFee);
         if (expected == 0) revert TooLittle();
         uint256 before = _balanceOf(token, address(this));
         (uint256 a0, uint256 a1) = token < tokenIn ? (expected, uint256(0)) : (uint256(0), expected);
         if (!_trySwap(pair, a0, a1)) revert SwapFailed();
         uint256 afterBal = _balanceOf(token, address(this));
         received = afterBal > before ? afterBal - before : 0;
-        buyTax = _bucket(expected, received);
     }
 
-    /// @dev Probes a sale of the WHOLE received position. Unmeasurable sell tax = bucket 3.
+    /// @dev Probes a sale of the WHOLE received position (after a realistic hand-off to a fresh holder).
+    ///      Unmeasurable sell tax = bucket 3.
     function _sellLeg(address pair, uint256 pairFee, address tokenIn, address token, uint256 amount)
         internal
-        returns (bool sellOk, uint256 sellTax, uint256 sellOut)
+        returns (bool sellOk, uint256 sellTax, uint256 sellOut, uint256 held)
     {
         sellTax = 3;
-        if (amount == 0) return (false, 3, 0);
+        if (amount == 0) return (false, 3, 0, 0);
         // post-buy reserves: the same baseline probeSell starts from
         (, uint256 rTok, uint256 rIn) = _reserves(pair, token, tokenIn);
-        (sellOk, sellOut) = _probe(pair, token, tokenIn, amount);
-        sellOk = sellOk && sellOut != 0;
-        // token-equivalent of what came back (inverse V2 math): removes curve concavity from the measurement
-        if (sellOk) sellTax = _bucket(amount, _amountIn(sellOut, rTok, rIn, pairFee));
+        (sellOk, held, sellOut) = _probe(pair, token, tokenIn, amount);
+        sellOk = sellOk && sellOut != 0 && held != 0;
+        // sell tax: tokens the holder sold vs the token-equivalent of what came back (inverse V2 math removes
+        // curve concavity from the measurement)
+        if (sellOk) sellTax = _bucket(held, _amountIn(sellOut, rTok, rIn, pairFee));
     }
 
     /// @dev Packs the circuit input per the frozen spec bit layout.
@@ -299,10 +317,11 @@ contract ExitProofRouter {
         emit Checked(token, r.codehash, msg.sender, r.facts, true, 0, amountIn, out);
     }
 
-    /// @dev Runs probeSell with a hard gas cap; copies at most 68 bytes of returndata.
+    /// @dev Runs probeSell with a hard gas cap; decodes only an exact 100-byte ProbeResult and copies at most
+    ///      100 bytes of returndata.
     function _probe(address pair, address token, address tokenIn, uint256 amount)
         internal
-        returns (bool ok, uint256 out)
+        returns (bool ok, uint256 held, uint256 out)
     {
         bytes memory cd = abi.encodeCall(this.probeSell, (pair, token, tokenIn, amount));
         bytes4 sel = ProbeResult.selector;
@@ -311,15 +330,17 @@ contract ExitProofRouter {
         uint256 okWord;
         assembly ("memory-safe") {
             let success := call(PROBE_GAS, address(), 0, add(cd, 32), mload(cd), 0, 0)
-            if and(iszero(success), eq(returndatasize(), 68)) {
+            if and(iszero(success), eq(returndatasize(), 100)) {
                 let p := mload(0x40)
-                returndatacopy(p, 0, 68)
+                returndatacopy(p, 0, 100)
                 if eq(shr(224, mload(p)), shr(224, sel)) {
                     okWord := mload(add(p, 4))
-                    out := mload(add(p, 36))
+                    held := mload(add(p, 36))
+                    out := mload(add(p, 68))
                 }
             }
         }
+        if (okWord > 1) held = 0; // malformed: trust nothing
         ok = okWord == 1;
         if (!ok) out = 0;
     }

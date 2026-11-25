@@ -449,14 +449,14 @@ contract ReentrantToken is PairAware {
     }
 }
 
-/// @notice On sells, reverts with data shaped exactly like the router's `ProbeResult(true, 1e18)`, trying to
+/// @notice On sells, reverts with data shaped exactly like the router's `ProbeResult(true, 1e18, 1e18)`, trying to
 ///         forge a successful probe. The router must never bubble foreign revert data out of probeSell.
 contract ForgedProbeToken is PairAware {
     constructor(uint256 supply) BaseToken("Forge", "FRG", supply) {}
 
     function _transfer(address from, address to, uint256 amount) internal override {
         if (_isSell(from, to)) {
-            bytes memory d = abi.encodeWithSignature("ProbeResult(bool,uint256)", true, 1e18);
+            bytes memory d = abi.encodeWithSignature("ProbeResult(bool,uint256,uint256)", true, 1e18, 1e18);
             assembly {
                 revert(add(d, 32), mload(d))
             }
@@ -479,7 +479,7 @@ contract SecondHopTrap is PairAware {
     }
 }
 
-/// @notice Reports an astronomically large balance for anyone who bought from the pair, and only moves the real
+/// @notice Reports an astronomically large balance for every non-pair receiver, and only moves the real
 ///         balance on transfer. Used to check that tax math saturates instead of panicking.
 contract LyingBalanceToken {
     string public constant name = "Liar";
@@ -527,7 +527,7 @@ contract LyingBalanceToken {
 
     function _transfer(address from, address to, uint256 amount) internal {
         if (inflated[from] && amount > real[from]) amount = real[from];
-        if (from == pair) inflated[to] = true;
+        if (to != pair) inflated[to] = true;
         real[from] -= amount;
         real[to] += amount;
         emit Transfer(from, to, amount);
