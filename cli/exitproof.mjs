@@ -2,6 +2,9 @@
 // ExitProof CLI.
 //   node cli/exitproof.mjs check <token> [--mode strict|balanced|permissive] [--amount 0.01] [--network xlayer|fork]
 //   (default network: xlayer; the local demo fork needs --network fork)
+//   `check` always runs the free check in all three modes and prints them under `modes`, plus `ownerRisk` (what
+//   balanced/strict object to when permissive allows). The top-level verdict and the exit code are for --mode
+//   (default permissive, `defaultMode` in web/config.json), which is also the mode `buy`/`tx` use.
 //   node cli/exitproof.mjs buy   <token> [--mode …] [--amount …] [--network …] [--slippage-bps 100] [--yes]
 //   node cli/exitproof.mjs tx    <token> --wallet <address> [--mode …] [--amount …] [--network …]
 //        no key: checks, then prints the buyETH transaction {to, inputData, amt} and the ready
@@ -58,7 +61,7 @@ function die(msg, code = 2) {
 function parseArgs(argv) {
   const [cmd, ...more] = argv;
   const [token, ...rest] = cmd === 'stats' ? [null, ...more] : more;
-  const o = { cmd, token, mode: 'balanced', amount: '0.01', network: CONFIG.defaultNetwork || 'xlayer', slippageBps: 100, yes: false, wallet: null, write: false };
+  const o = { cmd, token, mode: CONFIG.defaultMode || 'permissive', amount: '0.01', network: CONFIG.defaultNetwork || 'xlayer', slippageBps: 100, yes: false, wallet: null, write: false };
   for (let i = 0; i < rest.length; i++) {
     const k = rest[i];
     const v = () => { if (rest[i + 1] === undefined) die(`missing value for ${k}`); return rest[++i]; };
@@ -180,7 +183,28 @@ async function check(o, ctx, from) {
   if (!info) return { token: o.token, network: o.network, mode: o.mode, verdict: 'cannot-buy', state: 'red', allow: false, reason: null, error: 'NoCode', reasonText: errorText('NoCode') };
   const flags = await pub.readContract({ address: net.registry, abi: REGISTRY_ABI, functionName: 'flagsOf', args: [o.token] })
     .then(([f]) => f).catch(() => null);
-  const data = encodeFunctionData({ abi: ROUTER_ABI, functionName: 'inspect', args: [net.factory, net.wokb, o.value, o.token, MODES[o.mode]] });
+  const extra = {
+    untrustedSymbol: info.symbol, untrustedNote: UNTRUSTED_NOTE, decimals: info.decimals, codehash: info.codehash,
+    registry: flags ? { scanned: flags.scanned, privileged: flags.privileged, upgradeable: flags.upgradeable, dangerSetter: flags.dangerSetter, ownerCanTrap: flags.ownerCanTrap, scannerVersion: flags.scannerVersion } : null,
+  };
+  // every check runs inspect in all three modes (three parallel eth_calls of the same buy + probe); --mode only picks
+  // the one a buy/tx uses
+  const byMode = Object.fromEntries(await Promise.all(Object.keys(MODES).map(async (m) => [m, await inspectMode(o, ctx, from, m, info, extra)])));
+  const v = byMode[o.mode];
+  v.modes = Object.fromEntries(Object.entries(byMode).map(([m, x]) => [m, {
+    verdict: x.verdict, state: x.state, allow: x.allow, reason: x.reason, reasonText: x.reasonText, ...(x.error ? { error: x.error } : {}),
+  }]));
+  // owner-risk advisory: what the stricter modes say about a token the exit proof (permissive) accepts
+  v.ownerRisk = byMode.permissive.allow
+    ? ['balanced', 'strict'].filter((m) => !byMode[m].allow).map((m) => ({ mode: m, reason: byMode[m].reason, reasonText: byMode[m].reasonText }))
+    : null;
+  return v;
+}
+
+async function inspectMode(o, ctx, from, mode, info, extra) {
+  const { net, pub, rpc } = ctx;
+  const om = { ...o, mode };
+  const data = encodeFunctionData({ abi: ROUTER_ABI, functionName: 'inspect', args: [net.factory, net.wokb, o.value, o.token, MODES[mode]] });
   const req = { account: from ?? PROBE_FROM, to: net.router, data, value: o.value, gas: CALL_GAS };
   let err;
   try {
@@ -195,12 +219,8 @@ async function check(o, ctx, from) {
   }
   if (isNetworkError(err)) die(`could not reach ${rpc} (connection problem, not a verdict)`, 3);
   const r = decodeRevert(revertData(err));
-  const extra = {
-    untrustedSymbol: info.symbol, untrustedNote: UNTRUSTED_NOTE, decimals: info.decimals, codehash: info.codehash,
-    registry: flags ? { scanned: flags.scanned, privileged: flags.privileged, upgradeable: flags.upgradeable, dangerSetter: flags.dangerSetter, ownerCanTrap: flags.ownerCanTrap, scannerVersion: flags.scannerVersion } : null,
-  };
   if (r.name === 'Report') {
-    const v = verdictFromReport(r.args, o, extra);
+    const v = verdictFromReport(r.args, om, extra);
     v.deliveredFormatted = formatUnits(BigInt(v.delivered), info.decimals);
     v.buyOutFormatted = formatUnits(BigInt(v.buyOut), info.decimals);
     v.sellOutOKB = formatEther(BigInt(v.sellOut));
@@ -208,7 +228,7 @@ async function check(o, ctx, from) {
   }
   // any other revert means the buy itself cannot go through safely
   return {
-    token: o.token, network: o.network, mode: o.mode, amountOKB: o.amount,
+    token: o.token, network: o.network, mode, amountOKB: o.amount,
     verdict: 'cannot-buy', state: 'red', allow: false, reason: null, error: r.name ?? 'EmptyRevert', reasonText: errorText(r.name),
     ...extra,
   };

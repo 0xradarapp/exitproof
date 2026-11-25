@@ -309,3 +309,16 @@ a { color: var(--exit-deep); }
   .xbits { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .bar-tools { gap: 0.6rem; }
 }
+
+/* ------------------------------------------------------------------ owner-risk advisory + buy mode */
+.advisory { margin-top: 1.5rem; }
+.advisory h2 { font-size: 1.3rem; margin-bottom: 0.35rem; }
+.advisory .side-note { margin-bottom: 0.6rem; max-width: 62ch; }
+.adv-row { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.adv-row .tag, .adv-row .adv-why { grid-column: 1; }
+.adv-row .btn-small { grid-column: 2; grid-row: 1 / span 2; }
+.adv-row.on .btn-small { background: var(--ink); color: #fff; }
+.adv-why { color: var(--ink-soft); font-size: 0.93rem; }
+.buy-mode { font-weight: 600; color: var(--ink) !important; }
+.buy-mode.warn { border-left: 6px solid var(--caution); padding-left: 0.7rem; }
+#buy:disabled { cursor: not-allowed; }

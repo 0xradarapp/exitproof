@@ -36,7 +36,7 @@ const LOCAL_KEY = 'exitproof.checks.v1';
 const storedLang = localStorage.getItem('exitproof.lang');
 const state = {
   lang: LANGS.includes(storedLang) ? storedLang : 'en',
-  cfg: null, netKey: null, mode: 'balanced', last: null, account: null,
+  cfg: null, netKey: null, mode: 'permissive', last: null, account: null, // mode = the buy mode
   deployed: null, // true | false (router null or no code) | null (could not tell: RPC down)
   names: new Map(), // lowercased token address -> sanitized symbol
   rpcPref: {}, // network key -> index of the RPC that answered last
@@ -179,6 +179,8 @@ async function inspect(token, mode, amount) {
   return decodeRevert(walletRevertData(r.error));
 }
 
+const ALL_MODES = ['permissive', 'balanced', 'strict'];
+
 async function runCheck(ev) {
   ev?.preventDefault();
   const token = $('#token').value.trim();
@@ -199,9 +201,15 @@ async function runCheck(ev) {
       last = { kind: 'error', name: 'NoCode', token: addr, mode, amount };
     } else {
       if (meta.symbol) state.names.set(addr.toLowerCase(), meta.symbol);
-      const [flags, r] = await Promise.all([registryFlags(addr), inspect(addr, mode, amount)]);
+      // every check: the same buy + probe in all three modes (three parallel eth_calls). Permissive is the exit proof
+      // and the main decision; balanced/strict are the owner-risk advisory; `mode` is what a buy would use.
+      const [flags, ...runs] = await Promise.all([registryFlags(addr), ...ALL_MODES.map((m) => inspect(addr, m, amount))]);
+      const byMode = Object.fromEntries(ALL_MODES.map((m, i) => [m, runs[i].name === 'Report'
+        ? { allow: reportFields(runs[i].args).allow, reason: reportFields(runs[i].args).reason, facts: reportFields(runs[i].args).facts }
+        : { allow: false, reason: null, error: runs[i].name }]));
+      const r = runs[ALL_MODES.indexOf('permissive')];
       if (r.name === 'Report') {
-        last = { kind: 'report', token: addr, mode, amount, meta, flags, ...reportFields(r.args) };
+        last = { kind: 'report', token: addr, mode, main: 'permissive', amount, meta, flags, byMode, ...reportFields(r.args) };
       } else {
         // a router without code answers every call with "no revert": that is a deployment problem, not a verdict
         if (r.name === 'NoRevert' || r.name === null) {
@@ -239,7 +247,7 @@ function render() {
   const r = state.last;
   const out = $('#result');
   if (!r) { out.innerHTML = ''; $('#buybox').hidden = true; return; }
-  const modeName = MODE_LABEL[state.lang][r.mode];
+  const modeName = MODE_LABEL[state.lang][r.main ?? r.mode];
   const name = r.meta?.symbol ? `${esc(r.meta.symbol)} ` : '';
   const tokenRef = addrLink(r.token);
   if (r.kind === 'error') {
@@ -269,12 +277,12 @@ function render() {
   ];
   const title = { allow: L.allowTitle, policy: L.policyTitle, deny: L.denyTitle }[vs];
   const why = allow ? esc(fill(L.allowBody, { mode: modeName }))
-    : `<span class="plate-code">${esc(fill(L.reasonPrefix, { n: r.reason }))}</span>${esc(reasonText(r.reason, r.mode, state.lang))}`;
+    : `<span class="plate-code">${esc(fill(L.reasonPrefix, { n: r.reason }))}</span>${esc(reasonText(r.reason, r.main, state.lang))}`;
   let sub = '';
   if (vs === 'deny') sub = `${stop()}${esc(L.denyBody)}`;
   if (vs === 'policy') {
     sub = `${stop()}${esc(fill(L.policyBody, { mode: modeName }))}`;
-    if (r.mode !== 'permissive' && policy(withMode(r.facts, 'permissive')).allow) sub += `${state.lang === 'zh' ? '' : ' '}${esc(L.policyLooser)}`;
+    if (r.main !== 'permissive' && policy(withMode(r.facts, 'permissive')).allow) sub += `${state.lang === 'zh' ? '' : ' '}${esc(L.policyLooser)}`;
   }
   out.innerHTML = `
     <div class="plate ${vs}" role="status">
@@ -287,6 +295,7 @@ function render() {
       <div><dt>${esc(L.youGet)}</dt><dd>${fmtUnits(r.delivered, dec)} ${sym}</dd></div>
       <div><dt>${esc(L.sellBack)}</dt><dd>${r.sellOut > 0n ? fmtUnits(r.sellOut, 18) : '0'} OKB</dd></div>
     </dl>
+    ${allow ? advisoryHtml(r) : ''}
     <section class="route" aria-label="${esc(L.route)}">
       <h2>${esc(L.route)}</h2>
       <ol>${stations.map((s) => `
@@ -299,8 +308,48 @@ function render() {
       <button type="button" class="btn-link" data-act="share">${esc(L.copyLink)}</button><span class="meta" id="share-status" aria-live="polite"></span></p>`;
   $('#buybox').hidden = !allow || !canBuy();
   if (allow && !canBuy()) out.insertAdjacentHTML('beforeend', `<p class="notice buy-off">${esc(isLoopbackUrl(net().rpc) ? L.buyOffFork : L.buyDisabled)}</p>`);
-  if (allow) $('#buy').textContent = fill(L.buy, { amount: ethers.formatEther(r.amount) });
+  if (allow) {
+    const bm = r.byMode?.[r.mode];
+    const ok = bm ? bm.allow : allow;
+    const bmName = L[`mode_${r.mode}`];
+    $('#buy').textContent = fill(L.buy, { amount: ethers.formatEther(r.amount) });
+    $('#buy').disabled = !ok;
+    $('#buy-mode').className = ok ? 'buy-mode' : 'buy-mode warn';
+    $('#buy-mode').textContent = ok ? fill(L.buyModeLine, { mode: bmName })
+      : fill(L.buyModeBlocked, { mode: bmName, reason: bm.reason != null ? reasonText(bm.reason, r.mode, state.lang) : errorText(bm.error, state.lang) });
+  }
   $('#buy-status').textContent = '';
+}
+
+/** Owner-risk advisory under the exit proof: what balanced and strict say about the same measured buy, with a
+ *  one-click switch of the buy mode. Amber + triangle where a stricter mode blocks. */
+function advisoryHtml(r) {
+  const L = S();
+  if (!r.byMode) return '';
+  const rows = ['permissive', 'balanced', 'strict'].map((m) => {
+    const v = r.byMode[m];
+    const name = MODE_LABEL[state.lang][m];
+    const head = fill(v.allow ? L.advAllows : L.advBlocks, { mode: L[`mode_${m}`] });
+    const why = m === 'permissive' ? L.advExitProof
+      : v.allow ? L.advNoRisk
+        : v.reason != null ? fill(L.advReason, { text: reasonText(v.reason, m, state.lang), n: v.reason }) : errorText(v.error, state.lang);
+    const on = r.mode === m;
+    return `<li class="adv-row${on ? ' on' : ''}"><span class="tag ${v.allow ? '' : 'warn'}">${esc(head)}</span>
+      <span class="adv-why">${esc(why)}</span>
+      <button type="button" class="btn-small" data-mode="${m}" aria-pressed="${on}">${esc(on ? `✓ ${L.advInUse}` : fill(L.advUse, { mode: name, Mode: L[`mode_${m}`] }))}</button></li>`;
+  }).join('');
+  return `<section class="advisory" aria-labelledby="adv-h"><h2 id="adv-h">${esc(L.advTitle)}</h2>
+    <p class="side-note">${esc(L.advBody)}</p><ul class="list">${rows}</ul></section>`;
+}
+
+/** The buy mode: the form's radio, the advisory buttons and ?mode= all land here. */
+function setMode(m, { rerender = true } = {}) {
+  if (!(m in MODES)) return;
+  state.mode = m;
+  const radio = document.querySelector(`input[name="mode"][value="${m}"]`);
+  if (radio) radio.checked = true;
+  $('#mode-hint').textContent = S()[`modeHint_${m}`];
+  if (state.last?.kind === 'report' && state.last.byMode) { state.last.mode = m; if (rerender) render(); }
 }
 
 function shareUrl(r) {
@@ -332,7 +381,7 @@ function applyLang() {
 // ------------------------------------------------------------------ local history (this browser only)
 function remember(r) {
   const list = lsGet(LOCAL_KEY) || [];
-  list.unshift({ token: r.token, symbol: r.meta?.symbol ?? null, mode: r.mode, net: r.net, allow: r.kind === 'report' && r.allow, reason: r.reason ?? null, error: r.kind === 'error' ? (r.name ?? '') : null, at: Date.now() });
+  list.unshift({ token: r.token, symbol: r.meta?.symbol ?? null, mode: r.main ?? r.mode, net: r.net, allow: r.kind === 'report' && r.allow, reason: r.reason ?? null, error: r.kind === 'error' ? (r.name ?? '') : null, at: Date.now() });
   lsSet(LOCAL_KEY, list.slice(0, 20));
   renderLocal();
 }
@@ -690,7 +739,8 @@ async function buy() {
   st.className = 'buy-status';
   const fail = (text) => { st.className = 'buy-status bad'; st.textContent = text; };
   if (!canBuy()) return fail(L.buyDisabled);
-  if (!r || r.kind !== 'report' || !r.allow || r.net !== state.netKey) { st.textContent = L.buyNeedsCheck; return; }
+  // the buy uses the selected buy mode: its own check must allow (the router re-checks in that mode anyway)
+  if (!r || r.kind !== 'report' || !(r.byMode?.[r.mode]?.allow ?? r.allow) || r.net !== state.netKey) { st.textContent = L.buyNeedsCheck; return; }
   try {
     const account = state.account ?? (await connect());
     if (!account) return;
@@ -814,9 +864,7 @@ async function boot() {
   document.querySelectorAll('[data-lang]').forEach((b) => b.addEventListener('click', () => {
     state.lang = b.dataset.lang; localStorage.setItem('exitproof.lang', state.lang); applyLang();
   }));
-  document.querySelectorAll('input[name="mode"]').forEach((i) => i.addEventListener('change', () => {
-    state.mode = i.value; $('#mode-hint').textContent = S()[`modeHint_${state.mode}`];
-  }));
+  document.querySelectorAll('input[name="mode"]').forEach((i) => i.addEventListener('change', () => setMode(i.value)));
   $('#demo-list').addEventListener('click', (e) => {
     const b = e.target.closest('button[data-addr]');
     if (b) { $('#token').value = b.dataset.addr; $('#token').focus(); }
@@ -828,6 +876,8 @@ async function boot() {
     runCheck();
   });
   $('#result').addEventListener('click', async (e) => {
+    const bm = e.target.closest('button[data-mode]');
+    if (bm) { setMode(bm.dataset.mode); return; }
     const b = e.target.closest('button[data-act]');
     const r = state.last;
     if (!b || !r || r.kind !== 'report') return;
@@ -858,7 +908,7 @@ async function boot() {
   const q = new URLSearchParams(location.search);
   if (q.get('token')) $('#token').value = q.get('token');
   if (q.get('amount') && /^\d+(\.\d+)?$/.test(q.get('amount'))) $('#amount').value = q.get('amount');
-  if (q.get('mode') && q.get('mode') in MODES) { state.mode = q.get('mode'); document.querySelector(`input[name="mode"][value="${state.mode}"]`).checked = true; }
+  setMode(q.get('mode') in MODES ? q.get('mode') : (state.cfg.defaultMode in MODES ? state.cfg.defaultMode : 'permissive'), { rerender: false });
   applyLang();
   await switchNet(await pickNetwork(q));
   applyLang();

@@ -33,17 +33,19 @@ The `exitproof` CLI (`node cli/exitproof.mjs`) reads the chain and **prepares** 
 ## Step 1: check (free, always first)
 
 ```bash
-node cli/exitproof.mjs check <token> --mode balanced --amount <okb> --network xlayer
+node cli/exitproof.mjs check <token> --amount <okb> --network xlayer
 ```
 
-This is an `eth_call` of `inspect(factory, WOKB, amountIn, token, mode)` with `value = amountIn`. It always reverts with a `Report` (facts, allow, reason, the amount bought, the amount delivered to the caller, and the sell-back OKB), and the CLI decodes that. Nothing is signed or sent.
+This runs three `eth_call`s of `inspect(factory, WOKB, amountIn, token, mode)` with `value = amountIn`, one per mode (permissive, balanced, strict). It always reverts with a `Report` (facts, allow, reason, the amount bought, the amount delivered to the caller, and the sell-back OKB), and the CLI decodes that. Nothing is signed or sent.
 
-Output (JSON):
+Output (JSON). The top-level verdict is for `--mode` (default **permissive**); all three are in `modes`:
 
 | field | meaning |
 |---|---|
 | `verdict` | `allow`, `blocked` (the circuit said no) or `cannot-buy` (the buy itself failed) |
 | `state`, `stateText` | `green` (allow), `amber` (blocked by reasons 4-7: the full sell-back **worked**, but the mode's owner/upgrade/scan policy says no) or `red` (reasons 1-3 or `cannot-buy`: no way out, or the tax eats it). Say amber as "sellable now, but risky", never as "honeypot". |
+| `modes` | `{ permissive, balanced, strict }`, each with `verdict`, `state`, `allow`, `reason`, `reasonText` |
+| `ownerRisk` | when permissive allows: the stricter modes that block, with `reason` and `reasonText` (e.g. reason 5, "the owner holds switches that can trap your tokens later"). `[]` = no owner risk found; `null` = permissive itself does not allow |
 | `permissiveWouldAllow` | on an amber block: whether permissive mode would allow it. Tell the user; never switch mode yourself. |
 | `reason`, `reasonText` | why it was blocked (codes below). Read `reasonText` to the user as is. |
 | `decoded` | each fact: `sellOk`, `sellTax`/`buyTax` buckets with ranges, `ownerActive`, `upgradeable`, `danger`, `unscanned`, `mode` |
@@ -55,10 +57,12 @@ Output (JSON):
 
 Exit code: `0` allow, `1` blocked or cannot-buy, `2` bad input, `3` RPC unreachable (a connection problem, **not** a verdict), `4` other error.
 
-Modes (`--mode`, default `balanced`):
+Modes (`--mode`, default `permissive`; it is also the mode `buy`/`tx` use):
+- `permissive` (**recommended default**): the exit proof. The whole position sells back right now, through this router, with the tax under 15%. This is the hard, measured guarantee.
+- `balanced`: also not upgradeable, no active owner with dangerous switches, no unscanned token with an active owner. Since scanner v9 this is conservative: it passes mostly ownerless or plain-Ownable tokens with standard code.
 - `strict`: sellable, no tax, no active owner, not upgradeable, scanned.
-- `balanced`: sellable, tax under 15%, not upgradeable, no active owner with dangerous switches, no unscanned token with an active owner.
-- `permissive`: sellable and tax under 15%.
+
+Recommended flow: buy in permissive, and **always tell the user the owner-risk advisory** (`ownerRisk`) in plain words, e.g. "It sells back fine right now, but balanced mode flags it: the owner can still change fees (reason 5)." If the user wants that protection, re-run `tx` with `--mode balanced` or `--mode strict`; never pick a stricter or looser mode on their behalf.
 
 Reason codes:
 
@@ -75,7 +79,7 @@ Reason codes:
 ## Step 2: prepare the buy
 
 ```bash
-node cli/exitproof.mjs tx <token> --wallet <wallet> --mode balanced --amount <okb> --network xlayer
+node cli/exitproof.mjs tx <token> --wallet <wallet> --mode permissive --amount <okb> --network xlayer
 ```
 
 `tx` is for X Layer mainnet only. Always pass `--network xlayer`. The CLI refuses `tx` for any network whose `buyEnabled` is not true, including the fork.
@@ -92,7 +96,7 @@ This re-runs the check for `<wallet>`. If the check does not allow, it prints `w
 
 ## Step 3: sign (OKX Agentic Wallet)
 
-1. Show the user `description`, the token address, the amount, `expectedReceive`, and the check's `reasonText` or "allowed in <mode> mode". If you show the symbol, quote it and label it as reported by the token, e.g. `token 0x… (calls itself "XYZ")`. Ask for confirmation. **Never sign without it.**
+1. Show the user `description`, the token address, the amount, `expectedReceive`, the check's `reasonText` or "allowed in <mode> mode", and the owner-risk advisory (`check.ownerRisk`) if it is not empty. If you show the symbol, quote it and label it as reported by the token, e.g. `token 0x… (calls itself "XYZ")`. Ask for confirmation. **Never sign without it.**
 2. Run exactly:
    ```bash
    onchainos wallet contract-call --to <to> --chain 196 --input-data <inputData> --amt <amt>

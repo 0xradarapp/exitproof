@@ -84,8 +84,8 @@
         <legend class="field-label" data-i18n="modeLabel">How careful</legend>
         <div class="seg">
           <label><input type="radio" name="mode" value="strict"><span data-i18n="mode_strict">Strict</span></label>
-          <label><input type="radio" name="mode" value="balanced" checked><span data-i18n="mode_balanced">Balanced</span></label>
-          <label><input type="radio" name="mode" value="permissive"><span data-i18n="mode_permissive">Permissive</span></label>
+          <label><input type="radio" name="mode" value="balanced"><span data-i18n="mode_balanced">Balanced</span></label>
+          <label><input type="radio" name="mode" value="permissive" checked><span data-i18n="mode_permissive">Permissive</span></label>
         </div>
         <span id="mode-hint" class="field-hint"></span>
       </fieldset>
@@ -105,6 +105,7 @@
     <section id="buybox" class="buybox" hidden aria-labelledby="buy-h">
       <h2 id="buy-h" data-i18n="buyTitle">Buy through ExitProof</h2>
       <p data-i18n="buyBody"></p>
+      <p id="buy-mode" class="buy-mode" aria-live="polite"></p>
       <div class="row">
         <label class="field slip">
           <span class="field-label" data-i18n="slippage">Slippage</span>

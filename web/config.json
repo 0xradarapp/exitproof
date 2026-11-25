@@ -1,5 +1,6 @@
 {
   "defaultNetwork": "xlayer",
+  "defaultMode": "permissive",
   "networks": {
     "fork": {
       "label": "Local fork",
