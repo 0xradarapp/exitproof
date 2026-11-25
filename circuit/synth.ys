@@ -1,0 +1,9 @@
+read_verilog policy.v
+synth -top policy -flatten
+abc -g AND,NAND,OR,NOR,XOR,XNOR,ANDNOT,ORNOT,MUX
+opt_clean
+abc -g NAND
+opt_clean
+write_verilog -noattr policy_netlist.v
+write_json policy_netlist.json
+stat
