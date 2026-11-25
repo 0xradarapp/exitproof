@@ -2,7 +2,8 @@
 // ExitProof scanner CLI.
 //   node scanner/src/cli.mjs scan <token>                      read-only, RPC_URL (default X Layer public RPC)
 //   node scanner/src/cli.mjs simulate <token> <pair>           FORK_RPC must be an anvil node
-//   node scanner/src/cli.mjs attest <token> [pair]             REGISTRY, ATTESTER_KEY; dry-run unless SEND=1
+//   node scanner/src/cli.mjs attest <token> [pair] [--force]   REGISTRY, ATTESTER_KEY; dry-run unless SEND=1;
+//                                                              refuses to lower any registry flag without --force
 //   node scanner/src/cli.mjs daemon                            RPC_URL REGISTRY START_BLOCK [ATTESTER_KEY FORK_RPC SEND]
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,8 +11,8 @@ import { createPublicClient, createWalletClient, http, defineChain } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts';
 import { scan } from './scan.mjs';
 import { simulate } from './simulate.mjs';
-import { attest, writeReport, reportURI, stringify } from './attest.mjs';
-import { runDaemon } from './daemon.mjs';
+import { attest, writeReport, reportURI, stringify, REGISTRY_ABI } from './attest.mjs';
+import { runDaemon, FLAG_KEYS } from './daemon.mjs';
 
 const BASE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const env = process.env;
@@ -36,7 +37,10 @@ function usage() {
   process.exit(2);
 }
 
-const [cmd, a1, a2] = process.argv.slice(2);
+const argv = process.argv.slice(2);
+const force = argv.includes('--force');
+const [cmd, a1, a2] = argv.filter((x) => x !== '--force');
+const REPORTS = env.REPORTS_DIR ?? path.join(BASE_DIR, 'reports');
 try {
   if (cmd === 'scan') {
     if (!a1) usage();
@@ -54,9 +58,16 @@ try {
       r.ownerCanTrap = sim.ownerCanTrap;
       r.evidence.simulation = sim.evidence;
     }
-    const file = writeReport(path.join(BASE_DIR, 'reports'), { ...r, token: a1, reportURI: reportURI(r.codehash) });
+    const file = writeReport(REPORTS, { ...r, token: a1, reportURI: reportURI(r.codehash) });
     console.log(stringify(r));
     console.error(`report: ${file}`);
+    const cur = await client.readContract({
+      address: env.REGISTRY, abi: REGISTRY_ABI, functionName: 'flagsOf', args: [r.codehash],
+    });
+    const lowered = cur.scanned ? FLAG_KEYS.filter((k) => cur[k] && !r[k]) : [];
+    if (lowered.length && !force) {
+      throw new Error(`refusing to downgrade ${lowered.join(', ')} (registry has true); pass --force to override`);
+    }
     if (env.SEND === '1') {
       if (!walletClient) throw new Error('SEND=1 requires ATTESTER_KEY');
       const hash = await attest(walletClient, env.REGISTRY, r);

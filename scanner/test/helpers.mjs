@@ -105,7 +105,7 @@ export async function listToken(env, infra, token, tokenAmount = SUPPLY / 2n, ok
   return pair;
 }
 
-export async function deployToken(env, name) {
+export async function deployToken(env, name, args = [SUPPLY]) {
   if (name === 'ProxyToken') {
     const impl = await deploy(env, 'Tokens.sol', 'ProxyImpl');
     const { encodeFunctionData } = await import('viem');
@@ -116,5 +116,17 @@ export async function deployToken(env, name) {
     // talk to the proxy with the implementation ABI plus upgradeTo
     return { address: p.address, abi: [...impl.abi, ...p.abi.filter((x) => x.type === 'function')], impl };
   }
-  return deploy(env, 'Tokens.sol', name, [SUPPLY]);
+  return deploy(env, 'Tokens.sol', name, args);
 }
+
+const SCANNER_FIXTURES = JSON.parse(readFileSync(path.join(ROOT, 'scanner/test/fixtures/fixtures.json'), 'utf8'));
+
+/** Deploys a contract from scanner/test/fixtures/ScannerFixtures.sol (prebuilt fixtures.json). */
+export async function deployScannerFixture(env, name, args = []) {
+  const a = SCANNER_FIXTURES[name];
+  const hash = await env.wallet.sendTransaction({ data: encodeDeployData({ abi: a.abi, bytecode: a.bytecode, args }) });
+  const r = await env.pub.waitForTransactionReceipt({ hash });
+  if (r.status !== 'success') throw new Error(`deploy ${name} failed`);
+  return { address: r.contractAddress, abi: a.abi };
+}
+

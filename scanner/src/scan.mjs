@@ -24,46 +24,57 @@
 //    OR hasRole(bytes32,address) (AccessControl) selector present OR dangerSetter.
 //    The owner probe is an eth_call capped at 100k gas; revert, short (<32 byte) return or gas exhaustion => no owner.
 import { keccak256, hexToBytes, bytesToHex, getAddress } from 'viem';
-import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS } from './selectors.mjs';
+import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS, CORE_ERC20 } from './selectors.mjs';
 import { readProxySlots, UPGRADE_SLOTS, isAddress20 } from './proxy.mjs';
 
-export const SCANNER_VERSION = 1;
+export const SCANNER_VERSION = 2;
 const OWNER_CALL_GAS = 100_000n;
 
-const STOP = 0x00, JUMP = 0x56, JUMPI = 0x57, JUMPDEST = 0x5b, PUSH0 = 0x5f, EQ = 0x14, POP = 0x50;
-const CALLCODE = 0xf2, DELEGATECALL = 0xf4, RETURN = 0xf3, REVERT = 0xfd, INVALID = 0xfe, SELFDESTRUCT = 0xff;
-const TERMINATORS = new Set([STOP, RETURN, REVERT, INVALID, SELFDESTRUCT, JUMP]);
+const JUMP = 0x56, JUMPI = 0x57, JUMPDEST = 0x5b, PUSH0 = 0x5f, EQ = 0x14;
+const CALL = 0xf1, CALLCODE = 0xf2, DELEGATECALL = 0xf4, STATICCALL = 0xfa, SELFDESTRUCT = 0xff;
+// Only these end a live run. Undefined opcodes deliberately do NOT (a future fork may define them).
+const TERMINATORS = new Set([0x00, 0xf3, 0xfd, 0xfe, SELFDESTRUCT, JUMP]);
 
-// Cancun defined opcodes.
-const DEFINED = new Set();
-const range = (a, b) => { for (let i = a; i <= b; i++) DEFINED.add(i); };
-range(0x00, 0x0b); range(0x10, 0x1d); DEFINED.add(0x20); range(0x30, 0x3f); range(0x40, 0x4a);
-range(0x50, 0x5f); range(0x60, 0x7f); range(0x80, 0x8f); range(0x90, 0x9f); range(0xa0, 0xa4);
-range(0xf0, 0xf5); DEFINED.add(0xfa); DEFINED.add(0xfd); DEFINED.add(0xfe); DEFINED.add(0xff);
+// Stack effects [inputs, outputs] for the symbolic stack. Ops not listed (and undefined ops) reset it.
+const ARITY = new Map();
+const set = (ops, io) => ops.forEach((o) => ARITY.set(o, io));
+set([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0a, 0x0b, 0x10, 0x11, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x1a,
+  0x1b, 0x1c, 0x1d, 0x20], [2, 1]);
+set([0x08, 0x09], [3, 1]);
+set([0x15, 0x19, 0x31, 0x35, 0x3b, 0x3f, 0x40, 0x49, 0x51, 0x54, 0x5c], [1, 1]);
+set([0x30, 0x32, 0x33, 0x34, 0x36, 0x38, 0x3a, 0x3d, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x4a, 0x58,
+  0x59, 0x5a], [0, 1]);
+set([0x50], [1, 0]);
+set([0x52, 0x53, 0x55, 0x5d, JUMPI], [2, 0]);
+set([0x37, 0x39, 0x3e, 0x5e], [3, 0]);
+set([0x3c], [4, 0]);
+set([0xa0, 0xa1, 0xa2, 0xa3, 0xa4], null); // LOGn: 2+n inputs
+set([0xf0], [3, 1]); set([0xf5], [4, 1]);
+set([CALL, CALLCODE], [7, 1]); set([DELEGATECALL, STATICCALL], [6, 1]);
 
-// Zero-input opcodes that push one (unknown) value.
-const PUSHES_UNKNOWN = new Set([0x30, 0x32, 0x33, 0x34, 0x36, 0x38, 0x3a, 0x3d, 0x41, 0x42, 0x43, 0x44, 0x45,
-  0x46, 0x47, 0x48, 0x4a, 0x58, 0x59, 0x5a]);
+// Symbolic values: bigint literal | 'C' (CALLER/ORIGIN) | 'S' (SLOAD-derived) | 'A' (ADDRESS) | null (unknown).
+const MASK_OPS = new Set([0x04, 0x16, 0x1c]); // DIV, AND, SHR keep taint
+const CMP_OPS = new Set([0x14, 0x03, 0x18]); // EQ, SUB, XOR
 const MAX_PRECOMPILE = 0x0an;
+const isLiteralPrecompile = (v) => typeof v === 'bigint' && v <= MAX_PRECOMPILE;
 
 const isPush = (op) => op >= 0x60 && op <= 0x7f;
 const sortStr = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
-/** Canonical instruction list: [{pc, op, imm (bigint|null), immHex}] */
+/** Canonical instruction list: [{pc, op, imm (bigint|null)}] */
 function decode(bytes) {
   const ins = [];
   for (let pc = 0; pc < bytes.length; pc++) {
     const op = bytes[pc];
     if (isPush(op)) {
       const n = op - 0x5f;
-      const raw = bytes.subarray(pc + 1, pc + 1 + n);
       // truncated trailing PUSH: missing bytes read as zero (EVM semantics)
       const full = new Uint8Array(n);
-      full.set(raw);
-      ins.push({ pc, op, imm: BigInt(bytesToHex(full)), n });
+      full.set(bytes.subarray(pc + 1, pc + 1 + n));
+      ins.push({ pc, op, imm: BigInt(bytesToHex(full)) });
       pc += n;
     } else {
-      ins.push({ pc, op, imm: op === PUSH0 ? 0n : null, n: 0 });
+      ins.push({ pc, op, imm: op === PUSH0 ? 0n : null });
     }
   }
   return ins;
@@ -79,15 +90,17 @@ export function analyzeCode(codeHex) {
     constTargetDelegatecall: 0, constTargetCallcode: 0,
   };
   const selectors = new Set();
+  const callerChecks = [];
+  const externalCallOffsets = [];
   let unsafeDelegate = false;
 
   let live = true;
-  let stack = []; // symbolic: bigint (literal) or null (unknown); top = end. Floor below is unknown.
+  let stack = []; // top = end; the floor below is unknown
   const peek = (d) => (d < stack.length ? stack[stack.length - 1 - d] : null);
   const pop = (k) => { stack.length = Math.max(0, stack.length - k); };
 
   for (let i = 0; i < ins.length; i++) {
-    const { op } = ins[i];
+    const { op, pc } = ins[i];
     if (op === JUMPDEST) { live = true; stack = []; continue; }
     if (!live) {
       if (op === DELEGATECALL) opcodes.deadDelegatecall++;
@@ -109,8 +122,7 @@ export function analyzeCode(codeHex) {
     }
 
     if (op === DELEGATECALL || op === CALLCODE) {
-      const target = peek(1);
-      const constant = target !== null && target <= MAX_PRECOMPILE;
+      const constant = isLiteralPrecompile(peek(1));
       if (op === DELEGATECALL) {
         opcodes.delegatecall++;
         if (constant) opcodes.constTargetDelegatecall++;
@@ -119,26 +131,36 @@ export function analyzeCode(codeHex) {
         if (constant) opcodes.constTargetCallcode++;
       }
       if (!constant) unsafeDelegate = true;
-      pop(op === DELEGATECALL ? 6 : 7);
-      stack.push(null);
-      continue;
+    }
+    if (op === CALL || op === STATICCALL) {
+      const target = peek(1);
+      if (!isLiteralPrecompile(target) && target !== 'A') externalCallOffsets.push(pc);
     }
     if (op === SELFDESTRUCT) opcodes.selfdestruct++;
-
-    if (TERMINATORS.has(op) || !DEFINED.has(op)) { live = false; stack = []; continue; }
+    if (TERMINATORS.has(op)) { live = false; stack = []; continue; }
 
     // symbolic stack step
-    if (ins[i].imm !== null) stack.push(ins[i].imm);
-    else if (op >= 0x80 && op <= 0x8f) stack.push(peek(op - 0x80));
-    else if (op >= 0x90 && op <= 0x9f) {
+    if (ins[i].imm !== null) { stack.push(ins[i].imm); continue; }
+    if (op >= 0x80 && op <= 0x8f) { stack.push(peek(op - 0x80)); continue; }
+    if (op >= 0x90 && op <= 0x9f) {
       const n = op - 0x8f;
       while (stack.length < n + 1) stack.unshift(null);
       const t = stack.length - 1;
       [stack[t], stack[t - n]] = [stack[t - n], stack[t]];
-    } else if (op === POP) pop(1);
-    else if (op === JUMPI) pop(2);
-    else if (PUSHES_UNKNOWN.has(op)) stack.push(null);
-    else stack = []; // unmodelled op: forget everything (conservative)
+      continue;
+    }
+    const io = op >= 0xa0 && op <= 0xa4 ? [2 + op - 0xa0, 0] : ARITY.get(op);
+    if (!io) { stack = []; continue; } // unmodelled / undefined op: forget everything (conservative)
+    const args = Array.from({ length: io[0] }, (_, k) => peek(k));
+    pop(io[0]);
+    if (io[1] === 0) continue;
+    let out = null;
+    if (op === 0x33 || op === 0x32) out = 'C';
+    else if (op === 0x30) out = 'A';
+    else if (op === 0x54) out = 'S';
+    else if (MASK_OPS.has(op)) out = args.find((v) => v === 'C' || v === 'S') ?? null;
+    else if (CMP_OPS.has(op) && args.includes('C') && args.includes('S')) callerChecks.push(pc);
+    stack.push(out);
   }
 
   const sel = [...selectors].sort(sortStr);
@@ -148,9 +170,13 @@ export function analyzeCode(codeHex) {
     selectors: sel,
     dangerous,
     opcodes,
+    callerChecks,
+    externalCalls: { count: externalCallOffsets.length, offsets: externalCallOffsets },
+    unsafeDelegatecall: unsafeDelegate,
     upgradeable: unsafeDelegate || upgradeSelector,
     dangerSetter: dangerous.length > 0 || opcodes.selfdestruct > 0,
-    privilegedCode: sel.includes(HAS_ROLE),
+    accessControl: sel.includes(HAS_ROLE),
+    privilegedCode: sel.includes(HAS_ROLE) || callerChecks.length > 0 || externalCallOffsets.length > 0,
   };
 }
 
@@ -197,26 +223,44 @@ export async function scan(client, token, { blockNumber } = {}) {
       if (data && data.length >= 66) impl = getAddress(`0x${data.slice(26, 66)}`);
     } catch { /* beacon without implementation(): still upgradeable via slot */ }
   }
+  let ia = null;
   if (isAddress20(impl)) {
     const implCode = await client.getCode({ address: impl, blockNumber: bn });
     if (implCode && implCode !== '0x') {
-      const ia = analyzeCode(implCode);
+      ia = analyzeCode(implCode);
       implementation = {
         address: impl, codehash: keccak256(implCode), selectors: ia.selectors, dangerous: ia.dangerous,
-        opcodes: ia.opcodes,
+        callerChecks: ia.callerChecks, externalCalls: ia.externalCalls, opcodes: ia.opcodes,
       };
-      a.dangerSetter ||= ia.dangerSetter;
-      a.privilegedCode ||= ia.privilegedCode;
     }
   }
 
   const owner = await probeOwner(client, address, bn);
   const slotUpgradeable = UPGRADE_SLOTS.some((k) => proxySlots[k] !== null);
-  const upgradeable = a.upgradeable || slotUpgradeable;
-  const dangerSetter = a.dangerSetter;
-  const privileged = owner !== null || a.privilegedCode || dangerSetter;
+  const both = (f) => f(a) || (ia !== null && f(ia));
 
-  const dangerous = [...a.dangerous, ...(implementation?.dangerous ?? [])]
+  // Dispatcher coverage: an ERC-20 whose dispatcher does not show the four core selectors in EQ form uses a
+  // dispatcher we cannot read (XOR/SUB/OR tricks, jump tables, Vyper): fail closed.
+  const merged = new Set([...a.selectors, ...(ia?.selectors ?? [])]);
+  const dispatcherUnrecognized = !CORE_ERC20.every((s) => merged.has(s));
+
+  const reasons = new Set();
+  if (owner !== null) reasons.add('owner-getter');
+  if (both((x) => x.accessControl)) reasons.add('access-control');
+  if (both((x) => x.callerChecks.length > 0)) reasons.add('caller-vs-storage');
+  if (both((x) => x.externalCalls.count > 0)) reasons.add('external-call');
+  if (both((x) => x.dangerous.length > 0)) reasons.add('dangerous-selector');
+  if (both((x) => x.opcodes.selfdestruct > 0)) reasons.add('live-selfdestruct');
+  if (dispatcherUnrecognized) reasons.add('dispatcher-unrecognized');
+  if (a.selectors.some((x) => UPGRADE_SELECTORS.includes(x))) reasons.add('upgrade-selector');
+  if (a.unsafeDelegatecall) reasons.add('delegatecall');
+  if (slotUpgradeable) reasons.add('proxy-slot');
+
+  const upgradeable = a.upgradeable || slotUpgradeable;
+  const dangerSetter = both((x) => x.dangerSetter) || dispatcherUnrecognized;
+  const privileged = owner !== null || both((x) => x.privilegedCode) || dangerSetter;
+
+  const dangerous = [...a.dangerous, ...(ia?.dangerous ?? [])]
     .filter((d, i, arr) => arr.findIndex((x) => x.selector === d.selector) === i)
     .sort((x, y) => sortStr(x.selector, y.selector));
 
@@ -231,7 +275,10 @@ export async function scan(client, token, { blockNumber } = {}) {
       address,
       selectors: a.selectors,
       dangerous,
-      accessControl: a.privilegedCode,
+      reasons: [...reasons].sort(sortStr),
+      accessControl: a.accessControl,
+      callerChecks: a.callerChecks,
+      externalCalls: a.externalCalls,
       proxySlots,
       implementation,
       owner,

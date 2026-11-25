@@ -2,7 +2,9 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { simulate } from '../src/simulate.mjs';
-import { startAnvil, deployInfra, deployToken, listToken, read } from './helpers.mjs';
+import {
+  startAnvil, deployInfra, deployToken, listToken, read, deployScannerFixture, SUPPLY,
+} from './helpers.mjs';
 
 let env;
 let infra;
@@ -108,3 +110,50 @@ test('simulate refuses a non-anvil RPC (never writes to a real chain)', async ()
     srv.close();
   }
 });
+
+/** JSON-RPC proxy in front of anvil that fails every evm_snapshot once an evm_revert has been seen. */
+async function faultyProxy(upstream) {
+  let armed = false;
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', async () => {
+      const msg = JSON.parse(body);
+      res.setHeader('content-type', 'application/json');
+      if (msg.method === 'evm_snapshot' && armed) {
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'injected fault' } }));
+        return;
+      }
+      if (msg.method === 'evm_revert') armed = true;
+      const r = await fetch(upstream, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+      res.end(await r.text());
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  return { url: `http://127.0.0.1:${srv.address().port}`, close: () => srv.close() };
+}
+
+test('an exception after the baseline => ownerCanTrap=true with simulate-error evidence; chain restored', async () => {
+  const { token, pair } = await setup('TimeBombToken');
+  const block = await env.pub.getBlockNumber({ cacheTime: 0 });
+  const p = await faultyProxy(env.rpc);
+  try {
+    const r = await simulate(p.url, token.address, pair.address);
+    assert.equal(r.evidence.baselineSellOk, true);
+    assert.equal(r.ownerCanTrap, true);
+    assert.match(r.evidence.error, /^simulate-error: /);
+  } finally {
+    p.close();
+  }
+  assert.equal(await env.pub.getBlockNumber({ cacheTime: 0 }), block);
+});
+
+test('balanceOf(holder) reverting does not throw out of simulate (pre-baseline: no trap claim)', async () => {
+  const token = await deployScannerFixture(env, 'HolderRevertToken', [SUPPLY]);
+  const pair = await listToken(env, infra, token);
+  const r = await simulate(env.rpc, token.address, pair.address);
+  assert.equal(r.ownerCanTrap, false);
+  assert.equal(r.evidence.baselineSellOk, false);
+  assert.equal(r.evidence.position, 'unreadable');
+});
+

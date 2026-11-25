@@ -4,7 +4,8 @@ import { keccak256 } from 'viem';
 import { scan } from '../src/scan.mjs';
 import { selectorOf } from '../src/selectors.mjs';
 import { SLOTS } from '../src/proxy.mjs';
-import { startAnvil, deployToken } from './helpers.mjs';
+import { startAnvil, deployToken, deployScannerFixture, SUPPLY } from './helpers.mjs';
+import { XOR_DISPATCHER, eqDispatcher } from './fixtures/raw.mjs';
 
 let env;
 before(async () => { env = await startAnvil(); });
@@ -18,11 +19,13 @@ test('CleanToken: all flags false, codehash = keccak(runtime), version 1', async
   const t = await deployToken(env, 'CleanToken');
   const r = await scan(env.pub, t.address);
   assert.deepEqual(FLAGS(r), { privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
-  assert.equal(r.scannerVersion, 1);
+  assert.equal(r.scannerVersion, 2);
   assert.equal(r.codehash, keccak256(await env.pub.getCode({ address: t.address })));
   assert.equal(r.evidence.owner, null);
   assert.ok(r.evidence.selectors.includes(selectorOf('transfer(address,uint256)')));
   assert.deepEqual(r.evidence.dangerous, []);
+  assert.deepEqual(r.evidence.reasons, []);
+  assert.deepEqual(r.evidence.externalCalls, { count: 0, offsets: [] });
 });
 
 test('scan output is identical across runs', async () => {
@@ -95,17 +98,80 @@ test('EIP-1822 PROXIABLE / beacon slot non-zero => upgradeable', async () => {
   }
 });
 
-test('live SELFDESTRUCT => dangerSetter; AccessControl hasRole => privileged', async () => {
+test('live SELFDESTRUCT => dangerSetter; AccessControl hasRole => privileged (recognised ERC-20 dispatcher)', async () => {
   const addr = '0x000000000000000000000000000000000000beef';
-  await env.pub.request({ method: 'anvil_setCode', params: [addr, '0x5f35ff'] });
+  await env.pub.request({ method: 'anvil_setCode', params: [addr, eqDispatcher([], '5b5f35ff')] });
   const r = await scan(env.pub, addr);
   assert.equal(r.dangerSetter, true);
   assert.equal(r.privileged, true);
+  assert.deepEqual(r.evidence.reasons, ['live-selfdestruct']);
   const ac = '0x000000000000000000000000000000000000cafe';
-  await env.pub.request({ method: 'anvil_setCode', params: [ac, '0x5f3560e01c806391d1485414'] });
+  await env.pub.request({ method: 'anvil_setCode', params: [ac, eqDispatcher(['91d14854'])] });
   const r2 = await scan(env.pub, ac);
   assert.equal(r2.privileged, true);
   assert.equal(r2.dangerSetter, false);
+  assert.deepEqual(r2.evidence.reasons, ['access-control']);
+});
+
+test('XOR dispatcher (no EQ selectors) => dispatcher-unrecognized, fail-closed', async () => {
+  const addr = '0x000000000000000000000000000000000000d15c';
+  await env.pub.request({ method: 'anvil_setCode', params: [addr, XOR_DISPATCHER] });
+  const r = await scan(env.pub, addr);
+  assert.equal(r.privileged, true);
+  assert.equal(r.dangerSetter, true);
+  assert.equal(r.upgradeable, false);
+  assert.ok(r.evidence.reasons.includes('dispatcher-unrecognized'));
+  assert.deepEqual(r.evidence.selectors, []);
+});
+
+test('HiddenOwnerToken: custom-slot onlyOwner + unlisted configure(uint256) => privileged via caller check', async () => {
+  const t = await deployScannerFixture(env, 'HiddenOwnerToken', [SUPPLY]);
+  const r = await scan(env.pub, t.address);
+  assert.equal(r.privileged, true);
+  assert.equal(r.dangerSetter, false);
+  assert.equal(r.upgradeable, false);
+  assert.equal(r.evidence.owner, null);
+  assert.ok(r.evidence.callerChecks.length >= 1);
+  assert.deepEqual(r.evidence.reasons, ['caller-vs-storage']);
+});
+
+test('OracleFeeToken: STATICCALL to a stored/immutable oracle in _transfer => privileged (externalCalls)', async () => {
+  const t = await deployScannerFixture(env, 'OracleFeeToken', [SUPPLY, '0x00000000000000000000000000000000000000aa']);
+  const r = await scan(env.pub, t.address);
+  assert.equal(r.privileged, true);
+  assert.equal(r.dangerSetter, false);
+  assert.ok(r.evidence.externalCalls.count >= 1);
+  assert.equal(r.evidence.externalCalls.offsets.length, r.evidence.externalCalls.count);
+  assert.deepEqual(r.evidence.reasons, ['external-call']);
+});
+
+test('fixture audit: flags for every test/fixtures/Tokens.sol token under scanner v2', async () => {
+  // [privileged, upgradeable, dangerSetter, reasons]
+  const expected = {
+    CleanToken: [false, false, false, []],
+    OwnedCleanToken: [true, false, false, ['caller-vs-storage', 'owner-getter']], // renounceOwnership check
+    FeeToken: [false, false, false, []],
+    BlacklistOnBuy: [false, false, false, []],
+    SellTax99: [false, false, false, []],
+    MaxTxToken: [false, false, false, []],
+    CooldownToken: [false, false, false, []],
+    TradingDisabled: [true, false, true, ['caller-vs-storage', 'dangerous-selector', 'owner-getter']],
+    TimeBombToken: [true, false, true, ['caller-vs-storage', 'dangerous-selector', 'owner-getter']],
+    GasBombToken: [false, false, false, []],
+    ReturnBombToken: [false, false, false, []],
+    TxOriginTrap: [false, false, false, []],
+    ScanFalsePositiveToken: [false, false, false, []],
+    ReentrantToken: [true, false, false, ['external-call']], // v2 change: was all-false in v1
+    ForgedProbeToken: [false, false, false, []],
+    ProxyToken: [true, true, true, ['caller-vs-storage', 'dangerous-selector', 'delegatecall', 'proxy-slot', 'upgrade-selector']],
+  };
+  const got = {};
+  for (const name of Object.keys(expected)) {
+    const t = await deployToken(env, name, name === 'FeeToken' ? [SUPPLY, 500n] : [SUPPLY]);
+    const r = await scan(env.pub, t.address);
+    got[name] = [r.privileged, r.upgradeable, r.dangerSetter, r.evidence.reasons];
+  }
+  assert.deepEqual(got, expected);
 });
 
 test('scan rejects an address without code', async () => {

@@ -72,3 +72,9 @@ export const UPGRADE_SELECTORS = Object.freeze(
 export const HAS_ROLE = selectorOf('hasRole(bytes32,address)'); // 0x91d14854
 
 export const OWNER_GETTERS = Object.freeze(['owner()', 'getOwner()'].map(selectorOf));
+
+/** A readable ERC-20 dispatcher must expose all four in EQ form, else it is treated as unrecognized. */
+export const CORE_ERC20 = Object.freeze([
+  'transfer(address,uint256)', 'transferFrom(address,address,uint256)', 'approve(address,uint256)', 'balanceOf(address)',
+].map(selectorOf));
+

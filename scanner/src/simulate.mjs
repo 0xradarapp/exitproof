@@ -159,6 +159,7 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
       return tokenIs0 ? { rT: r0, rQ: r1 } : { rT: r1, rQ: r0 };
     };
     const bal = async (t, who) => (await read(t, ERC20, 'balanceOf', [who]));
+    const safeBal = async (t, who) => { try { return await bal(t, who); } catch { return null; } };
     const swapData = (outT, outQ, to) => encodeFunctionData({
       abi: PAIR, functionName: 'swap', args: [tokenIs0 ? outT : outQ, tokenIs0 ? outQ : outT, to, '0x'],
     });
@@ -235,12 +236,13 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
         for (const caller of callers) if ((applied = await send(caller, token, data))) break;
         if (!applied) continue;
         evidence.unlockedBy.push(signature);
-        if ((await bal(token, holder)) === 0n) evidence.acquiredVia = await acquire();
+        if ((await safeBal(token, holder)) === 0n) evidence.acquiredVia = await acquire();
         baseline = await measure();
         if (baseline.ok && baseline.out > 0n) break;
       }
     }
-    evidence.position = (await bal(token, holder)).toString();
+    const pos = await safeBal(token, holder);
+    evidence.position = pos === null ? 'unreadable' : pos.toString();
     evidence.baselineSellOk = baseline.ok;
     evidence.expectedOut = baseline.out.toString();
     if (!baseline.ok || baseline.out === 0n) {
@@ -250,31 +252,37 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
 
     const ctx = { pair, holder };
     let trappedAny = false;
-    for (const { signature } of setters) {
-      const variants = argVariants(signature, ctx);
-      if (!variants) { evidence.skipped.push(signature); continue; }
-      const abi = [parseAbiItem(`function ${signature}`)];
-      const name = signature.slice(0, signature.indexOf('('));
-      for (const args of variants) {
-        const data = encodeFunctionData({ abi, functionName: name, args });
-        if (data.slice(0, 10) !== toFunctionSelector(signature)) throw new Error('selector mismatch');
-        for (const caller of callers) {
-          const snap = await snapshot();
-          const setOk = await send(caller, token, data);
-          let attempt = null;
-          if (setOk) {
-            const r = await sell();
-            const trapped = !r.ok || r.out * 2n < baseline.out;
-            trappedAny ||= trapped;
-            attempt = { signature, args: toJson(args), caller, sellOk: r.ok, out: r.out.toString(), trapped };
-          }
-          await revert(snap);
-          if (attempt) {
-            evidence.attempts.push(attempt);
-            break; // one successful caller per variant is enough
+    // After a good baseline, any failure to finish the owner-power sweep is treated as a trap (fail closed).
+    try {
+      for (const { signature } of setters) {
+        const variants = argVariants(signature, ctx);
+        if (!variants) { evidence.skipped.push(signature); continue; }
+        const abi = [parseAbiItem(`function ${signature}`)];
+        const name = signature.slice(0, signature.indexOf('('));
+        for (const args of variants) {
+          const data = encodeFunctionData({ abi, functionName: name, args });
+          if (data.slice(0, 10) !== toFunctionSelector(signature)) throw new Error('selector mismatch');
+          for (const caller of callers) {
+            const snap = await snapshot();
+            const setOk = await send(caller, token, data);
+            let attempt = null;
+            if (setOk) {
+              const r = await sell();
+              const trapped = !r.ok || r.out * 2n < baseline.out;
+              trappedAny ||= trapped;
+              attempt = { signature, args: toJson(args), caller, sellOk: r.ok, out: r.out.toString(), trapped };
+            }
+            await revert(snap);
+            if (attempt) {
+              evidence.attempts.push(attempt);
+              break; // one successful caller per variant is enough
+            }
           }
         }
       }
+    } catch (e) {
+      evidence.error = `simulate-error: ${e.shortMessage ?? e.message}`;
+      return { ownerCanTrap: true, evidence };
     }
     return { ownerCanTrap: trappedAny, evidence };
   } finally {

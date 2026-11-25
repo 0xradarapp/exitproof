@@ -27,10 +27,18 @@ test('PUSH immediates are skipped (0xf4 / 0x5b inside data)', () => {
   assert.equal(r.opcodes.deadDelegatecall, 0);
 });
 
-test('terminators end a live run: JUMP, RETURN, REVERT, INVALID, SELFDESTRUCT, undefined', () => {
-  for (const t of ['56', 'f3', 'fd', 'fe', 'ff', '0c', 'ef', '21']) {
+test('terminators end a live run: JUMP, RETURN, REVERT, INVALID, SELFDESTRUCT, STOP', () => {
+  for (const t of ['56', 'f3', 'fd', 'fe', 'ff', '00']) {
     assert.equal(A(`${t}f4`).opcodes.delegatecall, 0, `terminator ${t}`);
   }
+});
+
+test('undefined opcodes do NOT end a live run (conservative against future forks)', () => {
+  for (const t of ['0c', 'ef', '21', '1e']) {
+    assert.equal(A(`${t}f4`).opcodes.delegatecall, 1, `undefined op ${t}`);
+  }
+  // PUSH1 x, 0x1e, POP, DELEGATECALL
+  assert.equal(A('60011e50f4').upgradeable, true);
 });
 
 test('JUMPI falls through: still live', () => {
@@ -101,6 +109,8 @@ test('dangerous selector in dispatcher => dangerSetter; upgradeTo => upgradeable
 test('AccessControl hasRole selector => privilegedCode', () => {
   assert.equal(A('806391d1485414').privilegedCode, true);
   assert.equal(A('00').privilegedCode, false);
+  assert.deepEqual(A('00').callerChecks, []);
+  assert.deepEqual(A('00').externalCalls, { count: 0, offsets: [] });
 });
 
 test('dangerous list is keccak-derived and covers required names', () => {
@@ -123,3 +133,28 @@ test('analysis is deterministic', () => {
   const code = '8063aabbccdd14' + '63a9059cbb811400' + '5bf4';
   assert.deepEqual(A(code), A(code));
 });
+
+test('caller-vs-storage taint: CALLER/ORIGIN compared (EQ/SUB/XOR) with an SLOAD, through AND/SHR/DIV masks', () => {
+  assert.equal(A('335f5414').callerChecks.length, 1, 'CALLER PUSH0 SLOAD EQ');
+  assert.deepEqual(A('335f5414').callerChecks, [3]);
+  assert.equal(A(`335f5473${'ff'.repeat(20)}1614`).callerChecks.length, 1, 'AND mask');
+  assert.equal(A('5f5460a01c3318').callerChecks.length, 1, 'SHR then XOR');
+  assert.equal(A('5f54600204325f03').callerChecks.length, 0, 'unrelated SUB');
+  assert.equal(A('5f546002043203').callerChecks.length, 1, 'DIV then ORIGIN SUB');
+  assert.equal(A('335f3514').callerChecks.length, 0, 'calldata, not storage');
+  assert.equal(A('3360011460015f5414').callerChecks.length, 0, 'taint does not survive EQ');
+  assert.equal(A('335f54600101' + '14').callerChecks.length, 0, 'ADD launders (documented limit)');
+  assert.equal(A('335f5414').privilegedCode, true);
+});
+
+test('external calls: live CALL/STATICCALL to a non-literal, non-ADDRESS target', () => {
+  const call = A('5f5f5f5f5f5f545af1');
+  assert.deepEqual(call.externalCalls, { count: 1, offsets: [8] });
+  assert.equal(call.privilegedCode, true);
+  assert.equal(A('5f5f5f5f5f545afa').externalCalls.count, 1, 'STATICCALL to stored address');
+  assert.equal(A('5f5f5f5f305afa').externalCalls.count, 0, 'self call');
+  assert.equal(A('5f5f5f5f60015afa').externalCalls.count, 0, 'precompile');
+  assert.equal(A('005f5f5f5f5f545afa').externalCalls.count, 0, 'dead');
+  assert.equal(A('5f5f5f5f5f545afa').privilegedCode, true);
+});
+
