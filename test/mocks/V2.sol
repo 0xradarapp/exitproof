@@ -121,6 +121,11 @@ contract MockV2Pair {
         _update(_bal(token0), _bal(token1));
     }
 
+    function skim(address to) external lock {
+        _safeTransfer(token0, to, _bal(token0) - reserve0);
+        _safeTransfer(token1, to, _bal(token1) - reserve1);
+    }
+
     function _checkK(uint256 r0, uint256 r1, uint256 o0, uint256 o1) private returns (uint256 a0In, uint256 a1In) {
         uint256 b0 = _bal(token0);
         uint256 b1 = _bal(token1);
