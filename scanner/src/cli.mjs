@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ExitProof scanner CLI (v5).
-//   node scanner/src/cli.mjs scan <token>                      read-only, RPC_URL (default X Layer public RPC)
+//   node scanner/src/cli.mjs scan <token>                      read-only, RPC_URL (default: both X Layer public RPCs)
 //   node scanner/src/cli.mjs simulate <token> <pair>           FORK_RPC must be an anvil node
 //   node scanner/src/cli.mjs attest <token> [pair] [--force]   REGISTRY + attester key; dry-run unless SEND=1;
 //                                                              refuses to lower a flag of the same codehash without --force
@@ -16,15 +16,17 @@ import { scan, SCANNER_VERSION } from './scan.mjs';
 import { simulate, mergeSimulation } from './simulate.mjs';
 import { attest, writeReport, reportURI, stringify, readEntry, decide, FLAG_KEYS } from './attest.mjs';
 import { runDaemon } from './daemon.mjs';
-import { runBackfill } from './backfill.mjs';
+import { runBackfill, makeTransport, XLAYER_RPCS } from './backfill.mjs';
 import { sendGate, attesterKey } from './send-gate.mjs';
 
 const BASE_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const env = process.env;
-const RPC = env.RPC_URL ?? 'https://rpc.xlayer.tech';
+const RPC = env.RPC_URL ?? XLAYER_RPCS[0];
+// without RPC_URL: both public X Layer RPCs with fallback (rpc.xlayer.tech answers HTTP 403 when rate-limited)
+const transport = env.RPC_URL ? http(RPC) : makeTransport([...XLAYER_RPCS]);
 
 async function clients({ needKey = false, what } = {}) {
-  const client = createPublicClient({ transport: http(RPC) });
+  const client = createPublicClient({ transport });
   let walletClient;
   const key = attesterKey(env);
   if (env.SEND === '1' && needKey) {
@@ -35,7 +37,7 @@ async function clients({ needKey = false, what } = {}) {
       id, name: `chain-${id}`, nativeCurrency: { name: 'OKB', symbol: 'OKB', decimals: 18 },
       rpcUrls: { default: { http: [RPC] } },
     });
-    walletClient = createWalletClient({ chain, transport: http(RPC), account: privateKeyToAccount(key) });
+    walletClient = createWalletClient({ chain, transport, account: privateKeyToAccount(key) });
   }
   return { client, walletClient };
 }

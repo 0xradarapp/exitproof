@@ -4,7 +4,7 @@ This is the deterministic scanner behind `RiskRegistry`. It is open source so an
 
 ```
 cd scanner && npm ci
-node src/cli.mjs scan <token>                         # read-only; RPC_URL (default https://rpc.xlayer.tech)
+node src/cli.mjs scan <token>                         # read-only; RPC_URL (default rpc.xlayer.tech, fallback xlayerrpc.okx.com)
 FORK_RPC=http://127.0.0.1:8545 node src/cli.mjs simulate <token> <pair>   # anvil only
 REGISTRY=0x.. ATTESTER_KEY_FILE=key.txt [SEND=1] node src/cli.mjs attest <token> [pair] [--force]
 RPC_URL=.. REGISTRY=.. START_BLOCK=.. [ATTESTER_KEY_FILE=.. SEND=1 FORK_RPC=..] node src/cli.mjs daemon
