@@ -457,8 +457,10 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
         if (!(await send(holder, token, encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [pair, amt] })))) {
           return fail('transfer');
         }
-        const actualIn = (await bal(token, pair)) - rT;
-        const out = amountOut(actualIn, rT, rQ);
+        // price the swap on the post-transfer reserves (a swap-back inside the transfer moves them)
+        const post = await reserves();
+        const actualIn = (await bal(token, pair)) - post.rT;
+        const out = amountOut(actualIn, post.rT, post.rQ);
         if (out <= 0n) return fail('nothing-arrived');
         if (!(await send(holder, pair, swapData(0n, out, holder)))) return fail('swap');
         return { ok: true, stage: 'ok', amount: amt, expected, actual: (await bal(quote, holder)) - q0 };

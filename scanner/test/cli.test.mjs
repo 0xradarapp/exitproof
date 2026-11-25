@@ -170,6 +170,16 @@ test('backfill (dry-run default): newest qualifying pairs first, dust filtered, 
   const r2 = await run('node', [CLI, 'backfill'], { env: benv });
   assert.equal(JSON.parse(r2.stdout).counts.resumed, 2);
   assert.match(r2.stderr, /resuming: 2 tokens done/);
+  // shards: pair index mod N (#0 and #2 are both in shard 0/2), own state files, budget reported
+  const sh = { ...benv, STATE_FILE: '', STATE_DIR: path.join(dir, 'st'), SWEEP_BUDGET_S: '30', REPORTS_DIR: path.join(dir, 'reports-sh') };
+  const s0 = await run('node', [CLI, 'backfill'], { env: { ...sh, SHARD: '0/2' }, cwd: dir });
+  const s1 = await run('node', [CLI, 'backfill'], { env: { ...sh, SHARD: '1/2' }, cwd: dir });
+  const j0 = JSON.parse(s0.stdout.slice(s0.stdout.indexOf('{')));
+  const j1 = JSON.parse(s1.stdout.slice(s1.stdout.indexOf('{')));
+  assert.deepEqual([j0.shard, j0.candidates, j1.shard, j1.candidates], ['0/2', 2, '1/2', 0]);
+  assert.equal(j0.sweepBudgetS, 30);
+  assert.match(j0.stateFile, /backfill-dry-shard0of2\.json$/);
+  await assert.rejects(run('node', [CLI, 'backfill'], { env: { ...sh, SHARD: '2/2' } }), (e) => /SHARD must be/.test(e.stderr));
 });
 
 test('backfill SEND=1 attests per token (needs FORK_RPC); LIMIT bounds the run', async () => {

@@ -157,3 +157,13 @@ test('N-01 fail-closed rule: a renounced owner (owner() == 0) does not make the 
   assert.ok(!sim.signals.includes('sweep-incomplete'));
   assert.equal(sim.dangerSetter, false);
 });
+
+test('swap-back (Flap-style) token: sells priced on post-transfer reserves => sellable, no baseline-sell-failed', async () => {
+  const { token, pair } = await launchAudit(env, infra, 'SwapBackToken');
+  const sim = await simulate(env.rpc, token.address, pair.address);
+  assert.equal(sim.evidence.baselineSellOk, true);
+  assert.ok(!sim.signals.includes('baseline-sell-failed'), JSON.stringify(sim.signals));
+  assert.ok(!sim.signals.includes('transferFrom-trap'));
+  assert.equal(sim.evidence.transferSell.passes, true);
+  assert.equal(sim.ownerCanTrap, false);
+});

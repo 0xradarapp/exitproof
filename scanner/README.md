@@ -68,6 +68,8 @@ Minimal proxies are resolved. A clone whose runtime is exactly EIP-1167 (`363d3d
 ## Simulation (v5, v6)
 `simulate` runs on an anvil node only and always rewinds it. The holder and the router stand-in are derived from the fork block hash and the token (`holder = keccak(blockHash ++ token)[12:]`), recorded in the evidence, reproducible given the block, and unknown before it, so a token cannot whitelist the simulator. `SimRouter` (`src/sim/SimRouter.sol`, compiled runtime in `src/sim/sim-router.json`, installed with `anvil_setCode`) sells the way a wallet user sells through PotatoSwap's router: `approve`, then `transferFrom(user, pair, amount)` and `swap`, with the user as `tx.origin`.
 
+Every sell (SimRouter and the transfer path) is **priced on the reserves read after the token transfer** (amountIn = pair balance minus the post-transfer reserve), as ExitProofRouter does: Flap-style tokens swap their collected tax into the pair inside the seller's transfer, which moves the reserves. The tax is still measured against the pre-sell reserves.
+
 Sells measured, each in its own snapshot (a sell "passes" when it executes and returns at least 50% of the no-tax V2 output):
 
 | Sell | When |
@@ -125,6 +127,8 @@ The daemon only follows new pairs, so every token listed before it started would
 - dry-run by default. It writes the reports and prints one line per token, a summary and the OKB cost of attesting (measured at 79,041 gas for a first attestation; `ESTIMATE_PAIRS`, 950 by default; `COUNT_ALL=1` counts every live pair);
 - resumable: `STATE_FILE` (default `state/backfill-<dry|send>.json`) pins the block and records the finished tokens. `RESET=1` starts over, and `LIMIT` bounds a run;
 - rate-limit aware: a viem fallback transport over `RPC_URLS` (default `https://rpc.xlayer.tech`, then `https://xlayerrpc.okx.com`; the first one answers HTTP 403 when rate-limited), exponential backoff per token, and `RATE_MS` (250) between tokens;
+- sharded: `SHARD=i/N` (0 <= i < N) takes only the pairs whose factory index is i mod N, with its own state file (`state/backfill-<mode>-shard<i>of<N>.json`; `STATE_DIR` moves the directory), so N processes (each with its own fork) split the backfill without overlap;
+- `SWEEP_BUDGET_S` (default 180, also read by the daemon) is the wall-clock budget of one token's simulation. A sweep cut short by it is incomplete and fails closed (`sweep-incomplete`) when the token has an owner or a caller check, so raise it on a slow or cold fork rather than accept the false positives;
 - `SEND=1` attests through the same decision as the daemon, behind the mainnet gate. It requires `FORK_RPC` (an anvil fork; `FORK_UPSTREAM` re-pins it to the block) unless `STATIC_ONLY=1` (the old `ALLOW_STATIC_ONLY=1` still works). A static-only "clean" attestation would turn strict mode's `unscanned` block into an allow without the sell simulation.
 
 ## Residual risks / limitations

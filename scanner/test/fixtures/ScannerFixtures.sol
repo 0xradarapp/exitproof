@@ -691,3 +691,39 @@ contract TwoStepBomb is FeeOnSell {
         _sellFeeBps = v;
     }
 }
+
+interface IMiniPair {
+    function token0() external view returns (address);
+    function getReserves() external view returns (uint112, uint112, uint32);
+    function swap(uint256, uint256, address, bytes calldata) external;
+}
+
+/// Flap-style "swap-back": on every sell the token first sells the tax it has collected (its own balance) into the
+/// pair, which moves the reserves inside the seller's transfer. Honest and sellable; a sell priced on the reserves
+/// read before the transfer fails the pair's K check.
+contract SwapBackToken is AuditERC20 {
+    bool private _inSwap;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("SWAPBACK", p, liq, rest) {
+        balanceOf[msg.sender] -= rest / 10;
+        balanceOf[address(this)] += rest / 10; // collected tax waiting to be swapped back
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair && from != address(this) && !_inSwap) {
+            uint256 stash = balanceOf[address(this)] / 100;
+            if (stash > 0) {
+                _inSwap = true;
+                _move(address(this), pair, stash);
+                (uint112 r0, uint112 r1,) = IMiniPair(pair).getReserves();
+                bool tokenIs0 = IMiniPair(pair).token0() == address(this);
+                (uint256 rT, uint256 rQ) = tokenIs0 ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+                uint256 inAmt = balanceOf[pair] - rT;
+                uint256 out = inAmt * 9900 * rQ / (rT * 10_000 + inAmt * 9900);
+                IMiniPair(pair).swap(tokenIs0 ? 0 : out, tokenIs0 ? out : 0, address(0xFEE), ""); // to the fee wallet
+                _inSwap = false;
+            }
+        }
+        _move(from, to, amount);
+    }
+}

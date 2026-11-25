@@ -15,7 +15,9 @@
 //   the mainnet gate (CONFIRM_MAINNET=yes). It requires FORK_RPC (an anvil fork, pinned to the block with
 //   FORK_UPSTREAM) unless STATIC_ONLY=1 (ALLOW_STATIC_ONLY=1 is still accepted): a static-only "clean" attestation would turn strict mode's
 //   `unscanned` block into an allow without the sell simulation.
-// Env: RPC_URLS, REGISTRY, FACTORY, BASE_WOKB / BASE_USDT0 (local tests only), BLOCK, LIMIT, DUST_OKB, DUST_USDT, STATE_FILE, REPORTS_DIR, RATE_MS, FORK_RPC,
+// - SHARD=i/N runs one of N parallel shards (pairs with index mod N == i; own state file), SWEEP_BUDGET_S (180)
+//   bounds each token's simulation (an exhausted budget with an owner / caller check fails closed).
+// Env: SHARD, SWEEP_BUDGET_S, STATE_DIR, RPC_URLS, REGISTRY, FACTORY, BASE_WOKB / BASE_USDT0 (local tests only), BLOCK, LIMIT, DUST_OKB, DUST_USDT, STATE_FILE, REPORTS_DIR, RATE_MS, FORK_RPC,
 //      FORK_UPSTREAM, STATIC_ONLY, ESTIMATE_PAIRS (950), COUNT_ALL (count every live pair for the estimate).
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
@@ -80,6 +82,7 @@ export function makeTransport(urls) {
  */
 export async function listPairs(client, {
   block, factory = POTATOSWAP_FACTORY, limit = 0, dustOkb, dustUsdt, stats = {}, log = () => {}, wokb = WOKB, usdt0 = USDT0,
+  shard = null,
 }) {
   const n = await pairCount(client, factory, block, log);
   stats.allPairs = n;
@@ -108,6 +111,7 @@ export async function listPairs(client, {
       const baseReserve = baseIs0 ? r.result[0] : r.result[1];
       const tokenReserve = baseIs0 ? r.result[1] : r.result[0];
       if (baseReserve < (base === wokb ? dustOkb : dustUsdt) || tokenReserve === 0n) continue;
+      if (shard && idx[k] % shard.n !== shard.i) continue; // SHARD=i/N: pair index mod N
       out.push({ index: idx[k], pair: getAddress(pairs[k]), token: baseIs0 ? t1 : t0, base, baseReserve, tokenReserve });
       if (limit && out.length >= limit) return out;
     }
@@ -175,7 +179,10 @@ export async function runBackfill({ env = process.env, baseDir, log = console.er
   const factory = getAddress(env.FACTORY ?? POTATOSWAP_FACTORY);
   const forkRpc = env.FORK_RPC || undefined;
   const mode = send ? 'send' : 'dry';
-  const stateFile = env.STATE_FILE ?? path.join(baseDir, 'state', `backfill-${mode}.json`);
+  const shard = parseShard(env.SHARD);
+  const stateFile = env.STATE_FILE
+    || path.join(env.STATE_DIR || path.join(baseDir, 'state'), `backfill-${mode}${shard ? `-shard${shard.i}of${shard.n}` : ''}.json`);
+  const simOpts = { budgetMs: sweepBudgetMs(env) };
   const reportsDir = env.REPORTS_DIR ?? path.join(baseDir, 'reports');
   const rateMs = Number(env.RATE_MS ?? 250);
   const limit = Number(env.LIMIT ?? 0);
@@ -213,7 +220,7 @@ export async function runBackfill({ env = process.env, baseDir, log = console.er
   const dustOkb = parseEther(env.DUST_OKB ?? '0.01');
   const dustUsdt = parseUnits(env.DUST_USDT ?? '1', 6);
   const t0 = Date.now();
-  const candidates = await listPairs(client, { block, factory, limit, dustOkb, dustUsdt, stats, log, wokb, usdt0 });
+  const candidates = await listPairs(client, { block, factory, limit, dustOkb, dustUsdt, stats, log, wokb, usdt0, shard });
   log(`${candidates.length} qualifying pairs among the newest ${stats.looked} of ${stats.allPairs}`);
 
   const counts = {};
@@ -228,7 +235,7 @@ export async function runBackfill({ env = process.env, baseDir, log = console.er
     let res;
     try {
       res = await withRetry(() => processToken(c.token, c.pair, block, {
-        client, walletClient, registry, reportsDir, send, forkRpc, requireLiquidity: true,
+        client, walletClient, registry, reportsDir, send, forkRpc, simOpts, requireLiquidity: true,
         log: (m) => { if (!/^(attest|dry-run) /.test(m)) log(m); }, // the per-token line below says it
       }), { label: c.token, log, tries: 4 });
     } catch (e) {
@@ -257,7 +264,7 @@ export async function runBackfill({ env = process.env, baseDir, log = console.er
     liveCount = (await listPairs(client, { block, factory, limit: 0, dustOkb, dustUsdt, log, wokb, usdt0 })).length;
   } else if (!limit) liveCount = candidates.length;
   const summary = {
-    mode, block: block.toString(), rpcs: urls, allPairs: stats.allPairs, looked: stats.looked,
+    mode, block: block.toString(), shard: shard ? `${shard.i}/${shard.n}` : null, sweepBudgetS: simOpts.budgetMs / 1000, rpcs: urls, allPairs: stats.allPairs, looked: stats.looked,
     candidates: candidates.length, counts, flags: flagsSeen, elapsedMs: Date.now() - t0,
     avgMsPerToken: rows.length ? Math.round(rows.reduce((a, r) => a + r.ms, 0) / rows.length) : 0,
     stateFile, reportsDir,
@@ -271,6 +278,24 @@ export async function runBackfill({ env = process.env, baseDir, log = console.er
   print(JSON.stringify(summary, null, 1));
   if (!send) log('dry-run: nothing was sent (SEND=1 to attest)');
   return summary;
+}
+
+/** SHARD=i/N (0 <= i < N): this process only takes pairs whose factory index is i mod N. */
+export function parseShard(v) {
+  if (!v) return null;
+  const m = /^(\d+)\/(\d+)$/.exec(v);
+  const i = m ? Number(m[1]) : NaN;
+  const n = m ? Number(m[2]) : NaN;
+  if (!m || !(n >= 1) || !(i >= 0 && i < n)) throw new Error(`SHARD must be i/N with 0 <= i < N (got ${v})`);
+  return { i, n };
+}
+
+/** SWEEP_BUDGET_S (default 180): wall-clock budget of one token's simulation, in seconds. */
+export function sweepBudgetMs(env = process.env) {
+  if (env.SWEEP_BUDGET_S === undefined || env.SWEEP_BUDGET_S === '') return 180_000;
+  const s = Number(env.SWEEP_BUDGET_S);
+  if (!(s > 0)) throw new Error(`SWEEP_BUDGET_S must be a positive number of seconds (got ${env.SWEEP_BUDGET_S})`);
+  return Math.round(s * 1000);
 }
 
 function resumeNote(state) {

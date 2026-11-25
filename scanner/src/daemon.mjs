@@ -258,6 +258,7 @@ export async function runDaemon({ client, walletClient, env = process.env, baseD
     startBlock: env.START_BLOCK,
     send: env.SEND === '1',
     forkRpc: env.FORK_RPC || undefined,
+    simOpts: { budgetMs: env.SWEEP_BUDGET_S ? Math.round(Number(env.SWEEP_BUDGET_S) * 1000) : undefined },
     forkUpstream: env.FORK_RPC ? (env.FORK_UPSTREAM ?? env.RPC_URL ?? 'https://rpc.xlayer.tech') : undefined,
   };
   if (!opts.registry) throw new Error('REGISTRY is required');

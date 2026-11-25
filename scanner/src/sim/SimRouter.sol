@@ -124,9 +124,14 @@ contract SimRouter {
     {
         (bool ok, bool t0, uint256 rT, uint256 rQ) = _reserves(pair, token);
         if (!ok) return (1, 0, 0);
+        // the tax is measured against the pre-sell reserves (what the user expects to get) ...
         expected = _out(amount, rT, rQ, feeBps);
         (bool s, bytes memory r) = token.call(abi.encodeWithSelector(TRANSFER_FROM, user, pair, amount));
         if (!_okTransfer(s, r)) return (2, expected, 0);
+        // ... but the swap is priced on the POST-transfer reserves: a token may swap its collected tax into the pair
+        // inside the transfer (Flap "swap-back"), which moves the reserves (same rule as ExitProofRouter)
+        (ok, t0, rT, rQ) = _reserves(pair, token);
+        if (!ok) return (1, expected, 0);
         (bool okT, uint256 tb) = _bal(token, pair);
         if (!okT || tb <= rT) return (3, expected, 0);
         uint256 out = _out(tb - rT, rT, rQ, feeBps);
