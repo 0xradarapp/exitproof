@@ -43,11 +43,15 @@ const state = {
   gen: 0, // bumps on every network switch; background loops stop when it changes
   stats: null, statsLatest: null, statsErr: null, statsTimer: null, statsBackoff: 0,
   pairs: null, pairsErr: null, pairsTimer: null,
-  x: 0b01_0000_0001, xCache: new Map(), xTimer: null, xResult: null,
+  x: (1 << 9) | 1, xCache: new Map(), xTimer: null, xResult: null, // explorer input: balanced, sold back = allow
 };
 const S = () => STRINGS[state.lang];
 const net = () => state.cfg.networks[state.netKey];
 const loc = () => LOCALE[state.lang];
+const SEP = { en: [', ', ', '], tr: [', ', ', '], zh: ['、', '，'] }; // [list items, clauses]
+const list = (a) => a.join(SEP[state.lang][0]);
+const comma = () => SEP[state.lang][1];
+const stop = () => (state.lang === 'zh' ? '。' : '. ');
 const short = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '');
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const lsGet = (k) => { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } };
@@ -245,7 +249,7 @@ function render() {
         <p class="plate-title">${esc(L.cannotTitle)}</p>
         <p class="plate-why">${esc(errorText(r.name, state.lang))}</p>
       </div>
-      <p class="plate-sub">${name}${tokenRef}. ${esc(L.cannotLead)}</p>`;
+      <p class="plate-sub">${name}${tokenRef}${stop()}${esc(L.cannotLead)}</p>`;
     $('#buybox').hidden = true;
     return;
   }
@@ -256,10 +260,10 @@ function render() {
   const rows = factRows(r.facts, state.lang);
   const hop = r.buyOut > 0n && r.delivered < r.buyOut ? Number((r.buyOut - r.delivered) * 10_000n / r.buyOut) / 100 : 0;
   const stations = [
-    { label: L.step_buy, value: L.yes, text: `${fmtUnits(r.delivered, dec)} ${r.meta?.symbol ?? ''}`, cls: '' },
+    { label: L.step_buy, value: L.yes, text: `${fmtUnits(r.buyOut, dec)} ${r.meta?.symbol ?? ''}`, cls: '' },
     ...rows.map((x) => ({ label: x.label, value: x.value, text: x.key === 'buyTax' && hop > 0 ? `${x.text} ${fill(L.hopLoss, { pct: `${hop.toLocaleString(loc())}%` })}` : x.text, cls: x.bad ? 'bad' : x.warn ? 'warn' : '' })),
     {
-      label: L.step_circuit, value: allow ? L.circuitAllow : `${L.circuitDeny}, ${fill(L.reasonPrefix, { n: r.reason }).toLowerCase()}`,
+      label: L.step_circuit, value: allow ? L.circuitAllow : `${L.circuitDeny}${comma()}${fill(L.reasonPrefix, { n: r.reason }).toLowerCase()}`,
       text: fill(allow ? L.fact_circuit_allow : L.fact_circuit_deny, { mode: modeName }), cls: allow ? '' : vs === 'policy' ? 'warn' : 'bad',
     },
   ];
@@ -267,10 +271,10 @@ function render() {
   const why = allow ? esc(fill(L.allowBody, { mode: modeName }))
     : `<span class="plate-code">${esc(fill(L.reasonPrefix, { n: r.reason }))}</span>${esc(reasonText(r.reason, r.mode, state.lang))}`;
   let sub = '';
-  if (vs === 'deny') sub = `. ${esc(L.denyBody)}`;
+  if (vs === 'deny') sub = `${stop()}${esc(L.denyBody)}`;
   if (vs === 'policy') {
-    sub = `. ${esc(fill(L.policyBody, { mode: modeName }))}`;
-    if (r.mode !== 'permissive' && policy(withMode(r.facts, 'permissive')).allow) sub += ` ${esc(L.policyLooser)}`;
+    sub = `${stop()}${esc(fill(L.policyBody, { mode: modeName }))}`;
+    if (r.mode !== 'permissive' && policy(withMode(r.facts, 'permissive')).allow) sub += `${state.lang === 'zh' ? '' : ' '}${esc(L.policyLooser)}`;
   }
   out.innerHTML = `
     <div class="plate ${vs}" role="status">
@@ -340,7 +344,7 @@ function renderLocal() {
   ul.innerHTML = list.slice(0, 8).map((x) => {
     const vs = x.error !== null ? 'deny' : verdictState(x.allow, x.reason);
     const verdict = x.error !== null ? L.cannotTitle : vs === 'allow' ? L.allowTitle
-      : `${vs === 'policy' ? L.policyTitle : L.denyTitle}, ${fill(L.reasonPrefix, { n: x.reason }).toLowerCase()}`;
+      : `${vs === 'policy' ? L.policyTitle : L.denyTitle}${comma()}${fill(L.reasonPrefix, { n: x.reason }).toLowerCase()}`;
     const t = new Date(x.at).toLocaleTimeString(loc(), { hour: '2-digit', minute: '2-digit' });
     return `<li><span class="tag ${vs === 'allow' ? '' : vs === 'policy' ? 'warn' : 'bad'}">${esc(verdict)}</span>
       <span>${esc(cleanText(x.symbol) ?? '')} <span class="hex">${esc(short(x.token))}</span></span>
@@ -490,7 +494,7 @@ function renderStats() {
     }
     const danger = x.bits.some((k) => k !== 'privileged');
     return `<li><span class="tag ${danger ? 'bad' : x.bits.length ? 'warn' : ''}">${esc(L.feedAttested)}</span>
-      <span>${esc(sym)}: ${esc(x.bits.length ? x.bits.map((k) => L.flags[k]).join(', ') : L.feedNoFlags)}</span>
+      <span>${esc(sym)}: ${esc(x.bits.length ? list(x.bits.map((k) => L.flags[k])) : L.feedNoFlags)}</span>
       <span class="meta">${esc(block)}</span></li>`;
   }).join('');
 }
@@ -533,6 +537,7 @@ async function loadPairs(gen) {
     const fl = n.registry ? dec1(REGISTRY, 'flagsOf', res[2 * j + 1])?.[0] : null;
     return { ...p, okb: rv ? BigInt(rv[p.okb0 ? 0 : 1]) : null, flags: fl ? { scanned: fl.scanned, privileged: fl.privileged, upgradeable: fl.upgradeable, dangerSetter: fl.dangerSetter, ownerCanTrap: fl.ownerCanTrap } : null };
   });
+  state.pairs = state.pairs.filter((p) => p.okb !== 0n); // drained or never-funded pools are noise
   state.pairsErr = null;
   renderPairs();
 }
@@ -561,7 +566,7 @@ function renderPairs() {
     if (f?.scanned) {
       const bad = ['privileged', 'upgradeable', 'dangerSetter', 'ownerCanTrap'].filter((k) => f[k]);
       cls = isFlagged(f) ? 'bad' : bad.length ? 'warn' : '';
-      text = bad.length ? fill(L.pairFlagged, { flags: bad.map((k) => L.flags[k]).join(', ') }) : L.pairScanned;
+      text = bad.length ? fill(L.pairFlagged, { flags: list(bad.map((k) => L.flags[k])) }) : L.pairScanned;
     }
     const sym = symOf(p.token) ?? short(p.token);
     return `<li class="pair"><span class="pair-main"><span class="pair-sym">${esc(sym)}</span> ${addrLink(p.token)}
@@ -594,7 +599,7 @@ function renderExplorer() {
   [...$('#xmode').options].forEach((o) => { o.textContent = o.value === '3' ? `${MODE_LABEL[state.lang].strict} (3)` : MODE_LABEL[state.lang][['strict', 'balanced', 'permissive'][Number(o.value)]]; });
   $('#xdecoded').textContent = `${T[1].label} ${T[1].value} · ${T[2].label} ${T[2].value}`;
   const local = policy(x);
-  const fmtV = (v) => (v.allow ? `${L.circuitAllow}` : `${L.circuitDeny}, ${fill(L.reasonPrefix, { n: v.reason }).toLowerCase()}`);
+  const fmtV = (v) => (v.allow ? `${L.circuitAllow}` : `${L.circuitDeny}${comma()}${fill(L.reasonPrefix, { n: v.reason }).toLowerCase()}`);
   const hex = `0x${x.toString(16).padStart(3, '0')}`;
   const bytes = `0x${(x & 0xff).toString(16).padStart(2, '0')}${(x >> 8).toString(16).padStart(2, '0')}`;
   const ch = state.xResult;
