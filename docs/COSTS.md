@@ -1,13 +1,15 @@
 # ExitProof costs
 
-Gas amounts and fork spend were **measured** on an anvil fork of X Layer mainnet at block 76,861,306 (2026-11-25),
-using the same scripts that run on mainnet. Everything marked *(estimate)* is derived from those measurements: mainnet
+Gas amounts and fork spend were **measured** on an anvil fork of X Layer mainnet at block 76,861,306, using the same
+scripts that run on mainnet (`scripts/rehearse.sh`, last run 2026-11-26 at commit `2ed1b9f`, with the final router and
+registry). Everything marked *(estimate)* is derived from those measurements: mainnet
 OKB figures (measured gas × the mainnet gas price read that day), attestation and DeWEB storage costs, the budget, and
 the USD values. Prices are as of 2026-11-25: **OKB ≈ $81**, **BEM ≈ $7.86**.
 
 ## Fork gas price vs mainnet gas price
 
-The fork ran at about **1.02 gwei**, anvil's base fee. Mainnet `eth_gasPrice` returned **0.02 gwei** on 2026-11-25.
+The fork ran at about **1.01 gwei**, anvil's base fee. Mainnet `eth_gasPrice` returned **0.02 gwei** on 2026-11-25
+and again on 2026-11-26.
 So the gas part of the OKB figures below is roughly 50× too high for mainnet. The protocol fees (TAPEOUT_FEE, BEM)
 are the same on both.
 
@@ -29,31 +31,41 @@ are the same on both.
 
 | Step | Gas |
 |---|---:|
-| deploy RiskRegistry | 461,780 |
-| setAttester(deployer, true) | 47,781 |
-| deploy ExitProofRouter | 2,088,103 |
-| **Total** | **2,597,664** |
+| deploy RiskRegistry | 521,746 |
+| setAttester(deployer, true) | 47,782 |
+| deploy ExitProofRouter | 2,259,048 |
+| **Total** | **2,828,576** |
 
-- Measured on the fork: **0.002617 OKB**.
-- At mainnet gas: about **0.000052 OKB** (well under $0.01) *(estimate)*.
+- Measured on the fork: **0.002849 OKB**.
+- At mainnet gas: about **0.000057 OKB** (well under $0.01) *(estimate)*.
+- `deploy.mjs` also re-runs the 2048 evals on the processor through Multicall3 before it plans anything. Those are
+  `eth_call`s and cost nothing.
 
 ## Per buy (paid by the buyer)
 
 | | Gas | At 0.02 gwei |
 |---|---:|---:|
-| First buy of a codehash (scan + ProbeHolder), real processor + PotatoSwap | ≈756k | ≈0.000015 OKB |
-| Later buys (scan cached) | ≈503k | ≈0.00001 OKB |
-| First buy of a ~24 KB token (worst-case fill), offline / with the real eval | 4.82M / ≈4.99M (estimate) | ≈0.0001 OKB |
-| Worst blocked case (24 KB probe-cap token) | 7.62M | ≈0.00015 OKB |
+| First buy of a codehash (scan + probe holder + delivery), fixture token, real processor + PotatoSwap | 699,388 | ≈0.000014 OKB |
+| Later buys (scan cached), fixture token | 446,126 | ≈0.0000089 OKB |
+| First buy of a real Flap launchpad token (羊屎蛋, 3% tax, swaps its tax on sells), fork of block 76,876,829 | 555,642 | ≈0.000011 OKB |
+| A buy of a real honeypot (OKS) sent anyway: reverts `Blocked(1)`, gas only | 2,445,681 | ≈0.000049 OKB |
+| First buy of a ~24 KB token (worst-case fill), offline / with the real eval | 4.74M / ≈4.9M (estimate) | ≈0.0001 OKB |
+| Worst blocked case (24 KB token that also burns the probe cap) | 7.69M | ≈0.00015 OKB |
 | `inspect` (free check, `eth_call`) | – | 0 |
 
 - **Router fee:** 10 bps of the buy amount (0.00001 OKB on a 0.01 OKB buy). The PotatoSwap pool fee of 25 bps comes on top.
-- **Gas limit:** don't cap it. A typical buy needs at least **3.5M available** but uses only about 0.5–0.8M; the rest is headroom the probe needs. The first buy of a near-24 KB token can need about 5M, so the web app and CLI fall back to 8M. The large-token figures come from the stress suite (commit `2cd45cf`).
+- **Gas limit:** don't cap it. A typical buy needs at least **3.5M available** but uses only about 0.45–1M; the rest is headroom the probe needs. The first buy of a near-24 KB token can need about 5M, so the web app and CLI fall back to 8M. The large-token figures come from the stress suite (contracts fix wave, commit `bf3588e`).
+- **What a deny costs:** only the gas of the reverted transaction. Since the final fix wave the delivery to the buyer is measured before the verdict, so a blocked buy costs about 70k more gas than before (the honeypot row above).
 
-## Scanner attestations (operator, estimate)
+## Scanner attestations (operator)
 
-`RiskRegistry.attest` writes one struct and a report URI per codehash, roughly 50–80k gas, which is about 0.0000015 OKB
-at 0.02 gwei. Attesting every new PotatoSwap pair at about 100 pairs a day costs well under 0.001 OKB a day.
+`RiskRegistry.attest` writes one entry per token (flags, the codehash it saw, a report URI). A first attestation
+measured **79,041 gas** on anvil (the scanner budgets 80,000), which is about 0.0000016 OKB at 0.02 gwei *(estimate)*.
+
+- **Launch-day backfill** of the existing pairs, about 950 with a live pool: 950 × 80k gas ≈ **0.0015 OKB**
+  *(estimate)*. The cost is time, not money: the fork simulation takes about 69 s per token, so about 18 hours for
+  all of them on one fork (MORNING.md step 4b).
+- **Daemon:** attesting every new PotatoSwap pair at about 100 pairs a day costs well under 0.001 OKB a day.
 
 ## DeWEB (`scripts/build-deweb.mjs` + `scripts/publish-deweb.mjs`; mainnet figures are estimates)
 
@@ -73,6 +85,8 @@ Gas, **measured** on a fork of block 76,869,339 (publish of `dist/deweb/`: 12 fi
 | **Total (38 txs)** | **154,038,564** |
 
 - At 0.02 gwei this is about 0.00308 OKB of gas, so the publish costs about **0.0831 OKB (≈ $6.73)** and 0 BEM *(estimate)*.
+- The current build is 720,053 bytes (the three-state UI, the circuit explorer and 中文 were added after this
+  measurement). At about 224 gas per byte that is about 10M more upload gas, about 0.0002 OKB *(estimate)*.
 - A re-publish of changed files pays only the upload gas for those files; the container fee is paid once.
 
 ## Mainnet budget recommendation (estimate)
@@ -82,13 +96,13 @@ Gas, **measured** on a fork of block 76,869,339 (publish of `dist/deweb/`: 12 fi
 | Tape-out fee + gas | 0.0015 | 0.11 |
 | Registry + router | 0.0001 | – |
 | Demo buys (a few × 0.01 OKB) + gas | 0.03 | – |
-| Attestations for the demo and the daemon's first days | 0.001 | – |
+| Attestations: launch-day backfill (≈950) + the daemon's first days | 0.003 | – |
 | DeWEB: container fee + upload gas (optional) | 0.0831 | – |
 | Headroom (gas spikes, a retry) | 0.02 | 0.01 |
 | **Total without DeWEB** | **≈0.05** | **0.12** |
 | **Total with DeWEB** | **≈0.14** | **0.12** |
 
-On 2026-11-25 the deployer `0x2ef6…c92c` held 0.01802 OKB and 0 BEM.
+On 2026-11-25 the deployer `0x2ef6…c92c` held 0.01802 OKB and 0 BEM. The totals above already include the backfill.
 
 - **Before the tape-out:** top up to **at least 0.05 OKB**, and buy **at least 0.12 BEM**: swap about 0.015 OKB on the BEM/WOKB pool, or bridge BEM from BSC through tapeout.net. `tapeout.mjs` checks both balances before sending anything.
 - **Before DeWEB:** add about 0.09 OKB (0.0831 plus headroom).

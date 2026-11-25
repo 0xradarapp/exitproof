@@ -1,7 +1,8 @@
 # ExitProof operations
 
-This page covers two jobs that happen after the contracts are live: running the scanner daemon on a server, and
-publishing the web app to DeWEB/TapeKit (scripts/build-deweb.mjs + scripts/publish-deweb.mjs, rehearsed on a fork). Neither has been run on mainnet yet.
+This page covers the jobs that happen after the contracts are live: running the scanner daemon on a server, the
+launch-day backfill of the existing pairs, and publishing the web app to DeWEB/TapeKit (scripts/build-deweb.mjs +
+scripts/publish-deweb.mjs, rehearsed on a fork). None of them has been run on mainnet yet.
 
 ## Scanner daemon on a Linux server
 
@@ -9,22 +10,29 @@ The daemon watches PotatoSwap `PairCreated` events in 100-block windows (the pub
 blocks). For every new token it does four things:
 
 1. runs the static scan;
-2. resets a **local** anvil fork to the pair's block and runs the owner-power simulation;
-3. ORs the result with what the registry already holds (the daemon never lowers a flag);
-4. calls `RiskRegistry.attest`.
+2. resets a **local** anvil fork to the pair's block and runs the simulation: a buy and sell through a router stand-in
+   (approve + `transferFrom`, the user as `tx.origin`), delayed sells at +1 block, +60 s, +1 h and +1 d, the owner's
+   dangerous setters, and a bounded sweep of unknown setters;
+3. compares the result with the registry's entry for that token: it attests when there is no entry, when the entry is
+   for another codehash (the code changed), when a flag rises, or when the entry is from an older scanner version. It
+   never lowers a flag for the same codehash;
+4. calls `RiskRegistry.attest(token, codehash, flags, reportURI)` and writes `scanner/reports/<token>.json`.
 
-Progress is kept in `scanner/state/daemon.json`, so a restart resumes where it stopped.
+A token whose pair exists before it has code or liquidity is kept pending and scanned at its first liquidity (its
+pair's `Sync`, or a re-check every 600 blocks); it is never dropped. A simulation or scan that keeps failing is
+attested fail-closed. Progress is kept in `scanner/state/daemon.json`, so a restart resumes where it stopped.
 
 ### Environment
 
 | Var | Meaning |
 |---|---|
-| `RPC_URL` | X Layer RPC for reads and for sending attestations. Default `https://rpc.xlayer.tech`. It is also the upstream that the fork is reset from. |
+| `RPC_URL` | X Layer RPC for reads and for sending attestations. Default `https://rpc.xlayer.tech`. It is also the upstream that the fork is reset from (`FORK_UPSTREAM` overrides that). |
 | `REGISTRY` | RiskRegistry address, from `deployments/xlayer.json` |
-| `ATTESTER_KEY` | Private key of an attester. `deploy.mjs` makes the deployer an attester; a separate low-balance key is better, added with `setAttester(key, true)` from the registry owner. |
-| `FORK_RPC` | A **local** anvil node, for example `http://127.0.0.1:8547`. The daemon calls `anvil_reset` on it for every pair, so never point it at a node you use for anything else. Without it, `ownerCanTrap` is not computed. |
-| `START_BLOCK` | First block to scan on the first run. Use the router's deploy block, or a recent block. |
+| `ATTESTER_KEY_FILE` | Path to a file holding the attester's private key, mode `600` (a file readable by group or others is refused). `ATTESTER_KEY` in the environment also works; a key on the command line is refused. `deploy.mjs` makes the deployer an attester; a separate low-balance key is better, added with `setAttester(key, true)` from the registry owner. |
+| `FORK_RPC` | A **local** anvil node, for example `http://127.0.0.1:8547`. The daemon calls `anvil_reset` on it for every pair, so never point it at a node you use for anything else. **Always set it.** Without it attestations are static only, and a static "clean" entry can turn strict mode's "not scanned" block into an allow for a token whose trap only the simulation sees. |
+| `START_BLOCK` | First block to scan on the first run. Use the router's deploy block (`deployBlock` in `deployments/xlayer.json`). |
 | `SEND=1` | Actually send attestations. Without it the daemon is a dry run. |
+| `CONFIRM_MAINNET=yes` | Required with `SEND=1` on X Layer mainnet; without it the daemon prints a banner and refuses to send. An RPC that claims to be anvil counts as a fork only when its URL is loopback. |
 | `POLL_MS` | Poll interval, default 10000 |
 | `STATE_FILE` | Optional override for `scanner/state/daemon.json`. The daemon always writes its reports to `scanner/reports/`. |
 
@@ -43,16 +51,19 @@ mkdir -p scanner/state scanner/reports
 The two `mkdir` directories must exist before the service starts, because the unit below makes the rest of the
 filesystem read-only (`ProtectSystem=strict`).
 
-Keep the secrets in a root-owned file that only the service user can read: `/etc/exitproof/scanner.env`, mode `0640`,
-group `exitproof`.
+Keep the attester key in a file that only the service user can read: `/home/exitproof/.attester.key`, owned by
+`exitproof`, mode `0600` (about 0.01 OKB on that key covers thousands of attestations). The rest of the settings go
+in `/etc/exitproof/scanner.env`. systemd does not strip comments after a value, so keep comments on their own lines.
 
 ```ini
+# REGISTRY: deployments/xlayer.json -> registry; START_BLOCK: deployments/xlayer.json -> deployBlock
 RPC_URL=https://rpc.xlayer.tech
-REGISTRY=0x...            # deployments/xlayer.json → registry
-ATTESTER_KEY=0x...        # attester key, low balance (~0.01 OKB covers thousands of attestations)
+REGISTRY=0x...
+ATTESTER_KEY_FILE=/home/exitproof/.attester.key
 FORK_RPC=http://127.0.0.1:8547
-START_BLOCK=...           # router deploy block
+START_BLOCK=...
 SEND=1
+CONFIRM_MAINNET=yes
 ```
 
 `/etc/systemd/system/exitproof-fork.service`. This is the local fork the simulator uses. It is not pinned, because the
@@ -65,7 +76,7 @@ After=network-online.target
 
 [Service]
 User=exitproof
-ExecStart=/home/exitproof/.foundry/bin/anvil --fork-url https://rpc.xlayer.tech --chain-id 196 \
+ExecStart=/home/exitproof/.foundry/bin/anvil --fork-url https://xlayerrpc.okx.com --chain-id 196 \
   --host 127.0.0.1 --port 8547 --silent --retries 10 --fork-retry-backoff 2000
 Restart=always
 RestartSec=5
@@ -92,6 +103,7 @@ RestartSec=15
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=-/home/exitproof/exitproof/scanner/state -/home/exitproof/exitproof/scanner/reports
+ReadOnlyPaths=/home/exitproof/.attester.key
 PrivateTmp=true
 
 [Install]
@@ -108,9 +120,34 @@ Notes:
 
 - **Bind anvil to 127.0.0.1 only.** Its RPC can impersonate any account and reset state.
 - **Do a dry run first.** Run once without `SEND=1` and read the reports in `scanner/reports/`, then enable sending.
-- **One-off attestations:** `REGISTRY=… ATTESTER_KEY=… SEND=1 node scanner/src/cli.mjs attest <token> [pair]`. With `FORK_RPC` set and a pair given, the attestation includes the simulation. `--force` is the only way to lower a flag.
-- **Known daemon limits** (scanner/README.md): no confirmation depth (X Layer has a central sequencer), and when several clones share a codehash, the last scanned one overwrites the report file. A simulation that keeps failing is attested as `ownerCanTrap` after 5 attempts, so it fails closed.
-- **Spend:** one attestation is about 50–80k gas, a fraction of a cent at X Layer gas prices. Watch the attester's balance.
+- **One-off attestations:** `REGISTRY=… ATTESTER_KEY_FILE=… FORK_RPC=… SEND=1 CONFIRM_MAINNET=yes node scanner/src/cli.mjs attest <token> <pair>`. Give the pair so the attestation includes the simulation. `--force` is the only way to lower a flag (for example for a launch-pending token that was attested `baseline-sell-failed` before trading opened).
+- **One key, one sender.** The daemon and a backfill must not send with the same attester key at the same time; their transactions would race for nonces. Run the backfill first, or give one of them its own attester key.
+- **Known daemon limits** (scanner/README.md): no confirmation depth (X Layer has a central sequencer). A simulation that keeps failing is attested as `ownerCanTrap` after 5 attempts, so it fails closed. The unknown-setter sweep is bounded by a 180 s budget per token; a slow fork can make it incomplete, which also fails closed (`unknown-sweep-incomplete`).
+- **Reports:** `node scanner/src/publish-reports.mjs` bundles `scanner/reports/*.json` into a static directory with an `index.json`; set `REPORT_BASE_URL` to its published URL and new attestations point their `reportURI` there.
+- **Spend:** a first attestation is about 79k gas, a fraction of a cent at X Layer gas prices. Watch the attester's balance.
+
+## Launch-day backfill
+
+The daemon only follows new pairs. `node scanner/src/cli.mjs backfill` scans and attests the pairs that already exist,
+newest first, at one pinned block, and records each finished token in `scanner/state/backfill-<dry|send>.json`, so a
+re-run resumes. With `SEND=1` it refuses to run without `FORK_RPC` (unless `ALLOW_STATIC_ONLY=1`) and, on mainnet,
+without `CONFIRM_MAINNET=yes`.
+
+- **Cost:** about 950 live pairs × 80k gas ≈ 0.0015 OKB at 0.02 gwei.
+- **Time:** about 69 s per token with the simulation on a cold fork, so about 18 hours for all of them on one fork.
+  The command has no sharding or parallel mode. Run it in batches with `LIMIT` (300 is about 6 hours); a later run
+  with a larger `LIMIT` skips the finished tokens. Partial coverage is fine: the newest pairs come first, and they are
+  the ones people buy.
+- **Where:** the Linux server, next to its own anvil fork. `FORK_UPSTREAM` re-pins that fork to the backfill's block.
+
+```bash
+cd ~/exitproof
+LIMIT=5 FORK_RPC=http://127.0.0.1:8547 FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=0x... node scanner/src/cli.mjs backfill
+LIMIT=300 FORK_RPC=http://127.0.0.1:8547 FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=0x... ATTESTER_KEY_FILE=$HOME/.attester.key SEND=1 CONFIRM_MAINNET=yes nohup node scanner/src/cli.mjs backfill > backfill.log 2>&1 &
+```
+
+The first line is a dry run of the 5 newest pairs; the second is a live batch in the background. MORNING.md step 4b
+has the same steps as copy-paste blocks run from the Mac over ssh.
 
 ## Publishing web/ to DeWEB / TapeKit
 
@@ -130,9 +167,12 @@ Contracts (X Layer; `publish-deweb.mjs` checks how they are wired and which impl
 
 On 2026-11-25: `FEE()` = 0.08 OKB, `monthlyFee()` = 0, gas price 0.02 gwei, and no BEM is involved.
 
-**1. Build.** This writes `dist/deweb/` and prints each file, its size, its sha256 and the total. The output has 12 files
-and 673,977 bytes. `index.html` has the CSS, `verdict.js` + `app.js` and the mainnet config inlined, and its CSP is
-hash-based. `vendor/ethers.min.js` is ethers 6.13.4, byte-identical to the npm tarball (sha384 checked). The 8 woff2
+**1. Build.** First run `node cli/exitproof.mjs stats --network xlayer --write`: it counts the usage totals from the
+deploy block and stores `deployBlock` and a `statsSnapshot` in `web/config.json`, so a fresh browser starts from that
+snapshot instead of paging the logs since the deploy. Re-run it before every rebuild. The build then writes
+`dist/deweb/` and prints each file, its size, its sha256 and the total. The output has 12 files and 720,053 bytes.
+`index.html` has the CSS, `verdict.js` + `app.js` and the mainnet config inlined, and its CSP is hash-based. Its
+`connect-src` lists both mainnet RPC hosts, `rpc.xlayer.tech` and the fallback `xlayerrpc.okx.com`. `vendor/ethers.min.js` is ethers 6.13.4, byte-identical to the npm tarball (sha384 checked). The 8 woff2
 fonts and the two license files are also in the output. The build fails on any off-chain `src`/`href`/`url()` (TapeKit's
 "100% on-chain" rule), on any unresolved or absolute reference, and on a loopback RPC. The config comes from
 `deployments/xlayer.json` when that file exists. Otherwise the page shows its "mainnet deployment pending" state, so
@@ -141,6 +181,7 @@ router/registry/processor/circuitId it embedded, and each file's sha256. `publis
 embedded values are empty or differ from `deployments/<network>.json`, and any file changed after the build.
 
 ```zsh
+node cli/exitproof.mjs stats --network xlayer --write
 node scripts/build-deweb.mjs
 ```
 
@@ -148,7 +189,7 @@ node scripts/build-deweb.mjs
 plan and the exact OKB, and sends nothing.
 
 ```zsh
-DEPLOYER_KEY="$(k)" node scripts/publish-deweb.mjs
+DEPLOYER_KEY="$(k)" MONTHS=3 node scripts/publish-deweb.mjs
 ```
 
 **3. Send.** The script stops at a banner unless `CONFIRM_MAINNET=yes` is set. It runs these steps in order:
@@ -158,8 +199,9 @@ DEPLOYER_KEY="$(k)" node scripts/publish-deweb.mjs
 3. upload with `putFile`/`appendChunk` in 24,000-byte chunks, assets first and `index.html` last, reading every file
    back and comparing its SHA-256;
 4. `setFallback("index.html")`;
-5. `bind(name, container, MONTHS)`. MONTHS defaults to 1, the protocol minimum. With `monthlyFee()` at 0, renewing is
-   free: run again with `MONTHS=n`. Watch `paidUntil` so the name stays live through judging;
+5. `bind(name, container, MONTHS)`. MONTHS defaults to 1, the protocol minimum; use `MONTHS=3` for the first publish so
+   the name stays live through judging. With `monthlyFee()` at 0, renewing is free: run again with `MONTHS=n`. Watch
+   `paidUntil`;
 6. resolve the name the way the TapeKit kernel does.
 
 If it stops, run the same command again. It skips verified files and continues a half-uploaded file at the next chunk.
@@ -176,7 +218,7 @@ If a cap is exceeded it stops without sending anything. `FEE_CAP_OKB=<n>` replac
 Opener's runtime code hash is pinned (it is not a proxy), and the banner shows the hash and its ERC-1967 slot.
 
 ```zsh
-DEPLOYER_KEY="$(k)" SEND=1 CONFIRM_MAINNET=yes node scripts/publish-deweb.mjs
+DEPLOYER_KEY="$(k)" MONTHS=3 SEND=1 CONFIRM_MAINNET=yes node scripts/publish-deweb.mjs
 ```
 
 Progress and every tx are recorded in `deployments/deweb-xlayer.json`. The script ends with
@@ -195,7 +237,8 @@ export RPC_URL=http://127.0.0.1:8573 DEPLOYER_KEY=0x5de4111afa1a4b94908f83103eb1
 SEND=1 node scripts/tapeout.mjs && SEND=1 node scripts/deploy.mjs && DEPLOYMENT=fork node scripts/build-deweb.mjs && node scripts/publish-deweb.mjs && SEND=1 node scripts/publish-deweb.mjs
 ```
 
-Measured on a fork of block 76,869,339 (2026-11-25):
+Measured on a fork of block 76,869,339 (2026-11-25, with the 673,977-byte build of that day; the current build is
+720,053 bytes, about 10M more upload gas):
 
 - 38 txs: open 167,256 gas; 35 upload txs (a full 24,000-byte chunk is 5,366,591 gas, about 224 gas/byte); `setFallback` 114,238; `bind` 185,482.
 - Total: **154,038,564 gas**. At 0.02 gwei that is 0.00308 OKB, so the whole publish costs **≈0.0831 OKB** (0.08 open fee + gas) and 0 BEM.
