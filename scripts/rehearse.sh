@@ -100,10 +100,43 @@ before=$(shasum deployments/fork.json web/config.json)
 DEPLOYER_KEY="$DEPLOYER_KEY" node scripts/deploy.mjs
 [ "$before" = "$(shasum deployments/fork.json web/config.json)" ] || fail "deploy.mjs dry run wrote files"
 echo "dry run wrote nothing ✓"
+
+echo "-- interrupted deploy: kill deploy.mjs after the RiskRegistry send, before its receipt"
+N0=$(cast nonce "$DEPLOYER" --rpc-url "$RPC")
+cast rpc evm_setAutomine false --rpc-url "$RPC" >/dev/null
+DEPLOYER_KEY="$DEPLOYER_KEY" SEND=1 node scripts/deploy.mjs >"$WORK/deploy-killed.log" 2>&1 &
+DPID=$!
+pend() { node -e 'const d=require("./deployments/fork.json");const p=(d.pending||{}).registry;console.log(p&&p.tx?p.address:"")'; }
+for _ in $(seq 1 120); do [ -n "$(pend)" ] && break; sleep 1; done
+PENDING_REG=$(pend)
+[ -n "$PENDING_REG" ] || { cat "$WORK/deploy-killed.log"; fail "deploy.mjs did not record a registry tx"; }
+kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null || true
+echo "   killed with registry tx recorded and unmined; predicted registry $PENDING_REG (code: $(cast code "$PENDING_REG" --rpc-url "$RPC"))"
+echo "-- re-run while that tx is still pending: must refuse and send nothing"
+RERUN=$(DEPLOYER_KEY="$DEPLOYER_KEY" SEND=1 node scripts/deploy.mjs 2>&1 || true)
+grep -E "Resume|STOPPED" <<<"$RERUN" || true
+grep -q "used or pending" <<<"$RERUN" || fail "re-run with a pending registry tx did not refuse"
+[ "$(cast rpc txpool_status --rpc-url "$RPC" | node -p 'parseInt(JSON.parse(require("fs").readFileSync(0,"utf8")).pending)')" = 1 ] \
+  || fail "a second transaction was sent while the first was pending"
+echo "   refused, still exactly 1 pending tx ✓"
+cast rpc evm_mine --rpc-url "$RPC" >/dev/null
+cast rpc evm_setAutomine true --rpc-url "$RPC" >/dev/null
+echo "-- mined it; drop the recorded tx hash so the resume must find the registry by its predicted address + bytecode"
+REG_TX=$(node -p 'require("./deployments/fork.json").pending.registry.tx')
+node -e 'const fs=require("fs");const f="deployments/fork.json";const d=JSON.parse(fs.readFileSync(f));delete d.pending.registry.tx;fs.writeFileSync(f,JSON.stringify(d,null,2)+"\n")'
 DEPLOYER_KEY="$DEPLOYER_KEY" SEND=1 node scripts/deploy.mjs
-DEPLOYER_KEY="$DEPLOYER_KEY" SEND=1 node scripts/deploy.mjs | grep -q "Already deployed" || fail "deploy.mjs re-run is not idempotent"
-echo "re-run: already deployed, nothing sent ✓"
+# bookkeeping for the cost summary only: the resume above found the registry by address, so it never saw the receipt
+REG_GAS=$(cast receipt "$REG_TX" gasUsed --rpc-url "$RPC")
+node -e 'const fs=require("fs");const f="deployments/fork.json";const d=JSON.parse(fs.readFileSync(f));d.gas["deploy RiskRegistry"]=process.argv[1];fs.writeFileSync(f,JSON.stringify(d,null,2)+"\n")' "$REG_GAS"
 REGISTRY=$(node -p "require('./deployments/fork.json').registry")
+N1=$(cast nonce "$DEPLOYER" --rpc-url "$RPC")
+[ "$(cast to-check-sum-address "$REGISTRY")" = "$(cast to-check-sum-address "$PENDING_REG")" ] || fail "registry $REGISTRY is not the interrupted one $PENDING_REG"
+[ "$N1" = $((N0 + 3)) ] || fail "deployer nonce went $N0 -> $N1, expected exactly 3 txs (registry, setAttester, router)"
+echo "   resumed: adopted registry $REGISTRY, nonce $N0 -> $N1 (registry + setAttester + router; no second registry) ✓"
+AGAIN=$(DEPLOYER_KEY="$DEPLOYER_KEY" SEND=1 node scripts/deploy.mjs)
+grep -q "Already deployed" <<<"$AGAIN" || fail "deploy.mjs re-run is not idempotent"
+[ "$(cast nonce "$DEPLOYER" --rpc-url "$RPC")" = "$N1" ] || fail "idempotent re-run sent a transaction"
+echo "re-run: already deployed, nothing sent ✓"
 
 step "3/6 demo-fork.mjs (fixture tokens + PotatoSwap pairs + one allowed buy)"
 # the fixtures need 30 OKB of pool liquidity; top up only now, after tape-out and deploy costs were measured
@@ -146,7 +179,7 @@ printf '%s' "$BUY" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end"
 BUY_GAS=$(printf '%s' "$BUY" | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).gasUsed')
 echo "  blocked buy refused before sending:"
 NOBUY=$(EXITPROOF_KEY="$BUYER_KEY" node cli/exitproof.mjs buy "$(tok BlacklistOnBuy)" --amount 0.01 --network fork --yes || true)
-printf '%s' "$NOBUY" | grep -q '"sent": false' || { printf '%s\n' "$NOBUY"; fail "BlacklistOnBuy buy was not refused"; }
+case "$NOBUY" in *'"sent": false'*) ;; *) false ;; esac || { printf '%s\n' "$NOBUY"; fail "BlacklistOnBuy buy was not refused"; }
 echo "  BlacklistOnBuy: sent=false ✓"
 
 step "6/6 cost summary"

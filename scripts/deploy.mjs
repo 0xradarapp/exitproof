@@ -20,13 +20,14 @@
 //      tapeout.mjs), RPC_URL (default https://rpc.xlayer.tech), SEND=1, CONFIRM_MAINNET=yes (mainnet only),
 //      FEE_RECIPIENT (default: the deployer). Fee is 10 bps; factories = [PotatoSwap] with fee [25].
 //
-// Re-running is safe: a router that is already recorded and has code is never deployed again, and a recorded
-// registry owned by the deployer is reused.
+// Re-running is safe. Before each deploy the nonce and predicted address are recorded, and the tx hash right after
+// sending. A re-run first resolves that record (receipt, or code at the predicted address checked against this build)
+// and never sends while a recorded transaction may still land. Every deploy uses its recorded nonce explicitly.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  createWalletClient, http, getAddress, encodeDeployData, encodeAbiParameters, formatEther, getContractAddress, parseAbi
+  createWalletClient, http, getAddress, encodeDeployData, encodeAbiParameters, formatEther, getContractAddress, parseAbi, keccak256
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { ROOT, loadConstants, xlayerChain, detectNetwork, deploymentFile } from './lib/net.mjs';
@@ -60,7 +61,7 @@ function artifact(file, name) {
   const p = path.join(ROOT, 'out', file, name + '.json');
   if (!fs.existsSync(p)) throw new Error('missing ' + path.relative(ROOT, p) + ': run forge build first');
   const j = JSON.parse(fs.readFileSync(p, 'utf8'));
-  return { abi: j.abi, bytecode: j.bytecode.object };
+  return { abi: j.abi, bytecode: j.bytecode.object, deployed: j.deployedBytecode.object };
 }
 
 async function main() {
@@ -78,12 +79,15 @@ async function main() {
   // ---- 1. the circuit must exist, be ours, and be verified
   if (!fs.existsSync(STATE_FILE)) throw new Error(rel + ' does not exist: run scripts/tapeout.mjs (SEND=1) on this network first');
   const dep = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  if (!dep.processor || !dep.circuitId) throw new Error(rel + ' has no processor/circuitId: finish scripts/tapeout.mjs first');
+  const missing = (v) => v === undefined || v === null || v === '';
+  if (missing(dep.processor) || missing(dep.circuitId)) throw new Error(rel + ' has no processor/circuitId: finish scripts/tapeout.mjs first');
   if (!dep.verified || dep.verified.evals !== '2048/2048') throw new Error(rel + ' circuit #' + dep.circuitId + ' is not verified 2048/2048: re-run scripts/tapeout.mjs');
   if (!dep.deployer) throw new Error(rel + ' has no deployer field');
   const deployer = account ? account.address : getAddress(dep.deployer);
   if (getAddress(dep.deployer) !== deployer) throw new Error(rel + ' belongs to ' + dep.deployer + ', not ' + deployer);
   if (!account) console.log('Note           no DEPLOYER_KEY: dry run as the recorded deployer ' + deployer);
+  // State is written only when sending. In a dry run every change stays in memory.
+  const save = () => { if (SEND) fs.writeFileSync(STATE_FILE, JSON.stringify(dep, null, 2) + '\n'); };
 
   const C = JSON.parse(fs.readFileSync(path.join(ROOT, 'circuit', 'netlist.json'), 'utf8'));
   const processor = getAddress(dep.processor);
@@ -104,32 +108,129 @@ async function main() {
     const c = await pub.getCode({ address: a });
     if (!c || c === '0x') throw new Error(label + ' ' + a + ' has no code on this node');
   }
-  const feeRecipient = getAddress(process.env.FEE_RECIPIENT || deployer);
+  const feeRecipient = getAddress(dep.feeRecipient || process.env.FEE_RECIPIENT || deployer);
+  if (dep.feeRecipient && process.env.FEE_RECIPIENT && getAddress(process.env.FEE_RECIPIENT) !== feeRecipient) {
+    throw new Error(rel + ' already fixes feeRecipient ' + dep.feeRecipient + ' for a pending/finished deploy; FEE_RECIPIENT differs');
+  }
   const Registry = artifact('RiskRegistry.sol', 'RiskRegistry');
   const Router = artifact('ExitProofRouter.sol', 'ExitProofRouter');
-
-  // ---- what already exists (resume)
   const hasCode = async (a) => { const c = await pub.getCode({ address: a }); return !!c && c !== '0x'; };
-  if (dep.router) {
-    if (await hasCode(dep.router)) {
-      console.log('Already deployed: router ' + dep.router + ' · registry ' + dep.registry + ' (recorded in ' + rel + '). Nothing to do.');
-      printVerify(network, dep);
+  const nonces = async () => {
+    const [latest, pending] = await Promise.all([
+      pub.getTransactionCount({ address: deployer, blockTag: 'latest' }),
+      pub.getTransactionCount({ address: deployer, blockTag: 'pending' })
+    ]);
+    return { latest, pending };
+  };
+  // Receipt lookup that survives flaky RPCs (CloudFront 403s, timeouts). null = not found after all attempts.
+  async function receiptOf(hash, attempts = 6) {
+    for (let i = 0; i < attempts; i++) {
+      try { return await pub.getTransactionReceipt({ hash }); } catch { /* not mined yet, or RPC error */ }
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+    return null;
+  }
+  async function waitMined(label, hash) {
+    let r = null;
+    for (let i = 0; i < 5 && !r; i++) {
+      try { r = await pub.waitForTransactionReceipt({ hash, timeout: 120_000, retryCount: 10 }); } catch (e) {
+        console.log('    waiting    ' + label + ' receipt: ' + (e.shortMessage || e.message).split('\n')[0] + ' (retrying)');
+      }
+    }
+    if (!r) throw new Error(label + ' tx ' + hash + ' has no receipt yet. It is recorded in ' + rel + '; re-run later, nothing will be sent twice');
+    return r;
+  }
+
+  // Bytecode checks for adopting a contract found at a recorded address.
+  const keccakHex = (h) => keccak256(h.toLowerCase());
+  async function verifyRegistry(a) {
+    const rt = await pub.getCode({ address: a });
+    if (!rt || keccakHex(rt) !== keccakHex(Registry.deployed)) throw new Error('code at ' + a + ' is not this build of RiskRegistry; refusing to adopt it');
+    const owner = getAddress(await pub.readContract({ address: a, abi: Registry.abi, functionName: 'owner' }));
+    if (owner !== deployer) throw new Error('registry ' + a + ' is owned by ' + owner + ', not ' + deployer);
+  }
+  async function verifyRouter(a, registry) {
+    const rt = await pub.getCode({ address: a });
+    // immutables change bytes, not length
+    if (!rt || rt.length !== Router.deployed.length) throw new Error('code at ' + a + ' is not this build of ExitProofRouter (length differs); refusing to adopt it');
+    const rd = (fn) => pub.readContract({ address: a, abi: Router.abi, functionName: fn });
+    const [p, c, r, w, f, b] = await Promise.all(['processor', 'circuitId', 'registry', 'wokb', 'feeRecipient', 'feeBps'].map(rd));
+    if (getAddress(p) !== processor || c !== circuitId || getAddress(r) !== getAddress(registry) || getAddress(w) !== K.wokb ||
+      getAddress(f) !== feeRecipient || Number(b) !== FEE_BPS) throw new Error('router ' + a + ' immutables differ from the expected constructor args');
+  }
+
+  // ---- resume: resolve a deploy that was sent (or maybe sent) by an interrupted run. Never sends.
+  dep.pending = dep.pending || {};
+  async function resolvePending(name, verify) {
+    const p = dep.pending[name];
+    if (!p) return;
+    console.log('Resume         ' + name + ': recorded nonce ' + p.nonce + ' → ' + p.address + (p.tx ? ' · tx ' + p.tx : ' · no tx hash recorded'));
+    let address = null;
+    if (p.tx) {
+      const r = await receiptOf(p.tx);
+      if (r && r.status === 'success') {
+        address = getAddress(r.contractAddress);
+        dep.gas = dep.gas || {};
+        dep.gas['deploy ' + (name === 'registry' ? 'RiskRegistry' : 'ExitProofRouter')] = r.gasUsed.toString();
+      }
+      else if (r) {
+        delete dep.pending[name]; save();
+        throw new Error(name + ' tx ' + p.tx + ' reverted on chain (nonce consumed). Cleared it; re-run to deploy again');
+      }
+    }
+    if (!address && await hasCode(p.address)) address = getAddress(p.address);
+    if (!address) {
+      const n = await nonces();
+      if (n.pending > p.nonce || n.latest > p.nonce) {
+        throw new Error('nonce ' + p.nonce + ' is used or pending but ' + p.address + ' has no code yet: wait for that transaction (check the explorer), then re-run. Nothing was sent');
+      }
+      console.log('               nonce ' + p.nonce + ' was never used: the earlier send did not reach the chain; it will be sent again with the same nonce');
+      delete dep.pending[name]; save();
       return;
     }
-    throw new Error(rel + ' lists router ' + dep.router + ' but it has no code on this node (stale state; fresh anvil?)');
+    await verify(address);
+    dep[name] = address;
+    if (p.tx) dep[name + 'Tx'] = p.tx;
+    delete dep.pending[name]; save();
+    console.log('  ✓ adopted    ' + name + ' ' + address + ' (verified against this build)');
+  }
+  await resolvePending('registry', verifyRegistry);
+  if (dep.registry) await resolvePending('router', (a) => verifyRouter(a, dep.registry));
+  else if (dep.pending.router) throw new Error(rel + ' has a pending router but no registry: inspect it by hand');
+
+  const writeConfig = () => {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+    const net = cfg.networks && cfg.networks[network];
+    if (!net) { console.log('Note           web/config.json has no "' + network + '" network; not changed'); return false; }
+    const want = { router: dep.router, registry: dep.registry, processor, circuitId: circuitId.toString() };
+    if (Object.keys(want).every((k) => net[k] === want[k])) return false;
+    if (!SEND) { console.log('Note           web/config.json networks.' + network + ' is out of date (a SEND=1 run re-syncs it)'); return false; }
+    Object.assign(net, want); // buyEnabled untouched
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n');
+    console.log('Wrote          web/config.json (networks.' + network + ')');
+    return true;
+  };
+
+  // ---- what already exists
+  if (dep.router) {
+    if (!(await hasCode(dep.router))) throw new Error(rel + ' lists router ' + dep.router + ' but it has no code on this node (stale state; fresh anvil?)');
+    await verifyRouter(dep.router, dep.registry);
+    console.log('Already deployed: router ' + dep.router + ' · registry ' + dep.registry + ' (recorded in ' + rel + '). Nothing to send.');
+    writeConfig();
+    printVerify(network, dep);
+    return;
   }
   let registry = null;
   if (dep.registry) {
     if (!(await hasCode(dep.registry))) throw new Error(rel + ' lists registry ' + dep.registry + ' with no code on this node (stale state)');
-    const owner = getAddress(await pub.readContract({ address: dep.registry, abi: Registry.abi, functionName: 'owner' }));
-    if (owner !== deployer) throw new Error('recorded registry ' + dep.registry + ' is owned by ' + owner + ', not ' + deployer);
+    await verifyRegistry(dep.registry);
     registry = getAddress(dep.registry);
   }
 
   // ---- 2. plan: exact constructor args + estimated OKB
-  const [nonce, balance, gasPrice] = await Promise.all([
-    pub.getTransactionCount({ address: deployer }), pub.getBalance({ address: deployer }), pub.getGasPrice()
-  ]);
+  const [n0, balance, gasPrice] = await Promise.all([nonces(), pub.getBalance({ address: deployer }), pub.getGasPrice()]);
+  if (n0.pending !== n0.latest) throw new Error('deployer has a pending transaction (nonce ' + n0.latest + '..' + (n0.pending - 1) + '): wait for it, then re-run');
+  const nonce = n0.latest;
   const predictedRegistry = registry || getContractAddress({ from: deployer, nonce: BigInt(nonce) });
   const routerArgs = [processor, circuitId, predictedRegistry, K.wokb, feeRecipient, FEE_BPS, FACTORIES, FACTORY_FEES];
   const regData = encodeDeployData({ abi: Registry.abi, bytecode: Registry.bytecode, args: [] });
@@ -178,69 +279,72 @@ async function main() {
   }
   console.log('\nSENDING' + (MAINNET ? ' on MAINNET' : ' on the fork') + '.\n');
 
-  // ---- 3. send (each step simulated first; state saved after each step)
+  // ---- 3. send. Each deploy: record {nonce, predicted address} → simulate → send with that exact nonce →
+  //         record the tx hash → wait. An interrupted run is resolved by resolvePending() above, never re-sent blindly.
   const wallet = createWalletClient({ chain: xlayerChain(RPC_URL, K), transport: http(RPC_URL), account });
-  const save = () => fs.writeFileSync(STATE_FILE, JSON.stringify(dep, null, 2) + '\n');
   const okb0 = balance;
   dep.gas = dep.gas || {};
-  async function deploy(label, art, args) {
+  dep.feeRecipient = feeRecipient;
+  if (!dep.deployStartOkb) dep.deployStartOkb = balance.toString(); // spend is measured across resumed runs
+  async function deploy(name, label, art, args) {
+    const n = await nonces();
+    if (n.pending !== n.latest) throw new Error('deployer has a pending transaction: wait for it, then re-run (nothing sent for ' + label + ')');
+    const address = getContractAddress({ from: deployer, nonce: BigInt(n.latest) });
     const data = encodeDeployData({ abi: art.abi, bytecode: art.bytecode, args });
     await pub.call({ account: account.address, data });
-    console.log('  ✓ simulated  deploy ' + label);
-    const hash = await wallet.deployContract({ abi: art.abi, bytecode: art.bytecode, args });
+    console.log('  ✓ simulated  deploy ' + label + ' → ' + address + ' (nonce ' + n.latest + ')');
+    dep.pending[name] = { nonce: n.latest, address };
+    save();
+    const hash = await wallet.deployContract({ abi: art.abi, bytecode: art.bytecode, args, nonce: n.latest });
+    dep.pending[name].tx = hash;
+    save();
     console.log('    sent       ' + hash);
-    const r = await pub.waitForTransactionReceipt({ hash });
-    if (r.status !== 'success' || !r.contractAddress) throw new Error(label + ' deploy failed: ' + hash);
+    const r = await waitMined(label, hash);
+    if (r.status !== 'success' || !r.contractAddress) {
+      delete dep.pending[name]; save();
+      throw new Error(label + ' deploy reverted: ' + hash);
+    }
     console.log('    mined      ' + r.contractAddress + ' · block ' + r.blockNumber + ' · gas ' + r.gasUsed);
     dep.gas['deploy ' + label] = r.gasUsed.toString();
-    return { address: getAddress(r.contractAddress), hash };
-  }
-  if (!registry) {
-    const reg = await deploy('RiskRegistry', Registry, []);
-    registry = reg.address;
-    Object.assign(dep, { registry, registryTx: reg.hash });
+    dep[name] = getAddress(r.contractAddress);
+    dep[name + 'Tx'] = hash;
+    delete dep.pending[name];
     save();
+    return dep[name];
   }
-  if (!attesterSet) {
+  if (!registry) registry = await deploy('registry', 'RiskRegistry', Registry, []);
+  if (!(await pub.readContract({ address: registry, abi: Registry.abi, functionName: 'isAttester', args: [deployer] }))) {
+    // idempotent: a second setAttester(deployer, true) after an interrupted run changes nothing
     const { request } = await pub.simulateContract({ account, address: registry, abi: Registry.abi, functionName: 'setAttester', args: [deployer, true] });
     console.log('  ✓ simulated  setAttester(' + deployer + ', true)');
     const hash = await wallet.writeContract(request);
-    const r = await pub.waitForTransactionReceipt({ hash });
+    dep.attesterTx = hash; save();
+    const r = await waitMined('setAttester', hash);
     if (r.status !== 'success') throw new Error('setAttester reverted: ' + hash);
     console.log('    mined      setAttester · gas ' + r.gasUsed);
-    Object.assign(dep, { attester: deployer, attesterTx: hash });
+    dep.attester = deployer;
     dep.gas.setAttester = r.gasUsed.toString();
     save();
   }
   const finalArgs = [processor, circuitId, registry, K.wokb, feeRecipient, FEE_BPS, FACTORIES, FACTORY_FEES];
-  const router = await deploy('ExitProofRouter', Router, finalArgs);
+  const router = await deploy('router', 'ExitProofRouter', Router, finalArgs);
 
   // ---- 4. read back, record
-  const rd = (fn) => pub.readContract({ address: router.address, abi: Router.abi, functionName: fn });
-  const [p, c, r, w, f, b] = await Promise.all(['processor', 'circuitId', 'registry', 'wokb', 'feeRecipient', 'feeBps'].map(rd));
-  if (getAddress(p) !== processor || c !== circuitId || getAddress(r) !== registry || getAddress(w) !== K.wokb ||
-    getAddress(f) !== feeRecipient || Number(b) !== FEE_BPS) throw new Error('router immutables mismatch');
+  await verifyRouter(router, registry);
   if (!(await pub.readContract({ address: registry, abi: Registry.abi, functionName: 'isAttester', args: [deployer] }))) throw new Error('deployer is not an attester');
   console.log('  ✓ router immutables read back · deployer is attester');
   const okb1 = await pub.getBalance({ address: deployer });
   Object.assign(dep, {
-    router: router.address, routerTx: router.hash, wokb: K.wokb, factory: K.potatoFactory, factoryFeeBps: FACTORY_FEES[0],
+    wokb: K.wokb, factory: K.potatoFactory, factoryFeeBps: FACTORY_FEES[0], attester: deployer,
     feeRecipient, feeBps: FEE_BPS, routerConstructorArgs: encodeAbiParameters(ROUTER_CTOR, finalArgs),
-    deploySpentOkb: formatEther(okb0 - okb1)
+    deploySpentOkb: formatEther(BigInt(dep.deployStartOkb) - okb1)
   });
+  delete dep.pending;
   save();
-
-  const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-  const net = cfg.networks && cfg.networks[network];
-  if (net) {
-    Object.assign(net, { router: router.address, registry, processor, circuitId: circuitId.toString() }); // buyEnabled untouched
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + '\n');
-    console.log('Wrote          ' + rel + ' and web/config.json (networks.' + network + ')');
-  } else {
-    console.log('Wrote          ' + rel + ' (web/config.json has no "' + network + '" network; not changed)');
-  }
-  console.log('Spent          ' + dep.deploySpentOkb + ' OKB');
-  console.log('\nROUTER=' + router.address + ' REGISTRY=' + registry);
+  console.log('Wrote          ' + rel);
+  writeConfig();
+  console.log('Spent          ' + dep.deploySpentOkb + ' OKB (since the first deploy run; this run ' + formatEther(okb0 - okb1) + ')');
+  console.log('\nROUTER=' + router + ' REGISTRY=' + registry);
   printVerify(network, dep);
 }
 

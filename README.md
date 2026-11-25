@@ -16,11 +16,11 @@ transaction reverts and your OKB stays where it was.
 | **TapeOut processor** | `TBD (mainnet pending)`: ExitProof's own processor "ExitProof Guard" (EXITP), created by `scripts/tapeout.mjs` |
 | **Circuit ID** | `TBD (mainnet pending)`: the policy chip. 54 NAND, 11 inputs, 4 outputs. It decides allow/deny and a reason code on every guarded buy. |
 | **Contracts** | ExitProofRouter `TBD (mainnet pending)` · RiskRegistry `TBD (mainnet pending)` · trades on PotatoSwap V2 (factory [`0x630D…7fcF`](https://www.oklink.com/xlayer/address/0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF), 25 bps) with WOKB `0xe538…9b2b` |
-| **TapeOut features used** | **Circuits:** every `buyETH`, `buy` and `inspect` call runs `processor.eval(circuitId, facts)` inside the transaction. The router has no other allow/deny logic, and Solidity only adds money checks (minOut, deadline, fee cap). **Own processor + tape-out:** createCPU, NAND mint and tapeout, all scripted and rehearsed (`scripts/tapeout.mjs`). **DeWEB/TapeKit:** planned for the static app ([docs/OPERATIONS.md](docs/OPERATIONS.md)). |
+| **TapeOut features used** | **Circuits:** every `buyETH`, `buy` and `inspect` call runs `processor.eval(circuitId, facts)` inside the transaction. The router has no other allow/deny logic, and Solidity only adds money checks (minOut, deadline, fee cap). **Own processor + tape-out:** createCPU, NAND mint and tapeout, all scripted and rehearsed (`scripts/tapeout.mjs`). **DeWEB/TapeKit:** the app is static with no build step; the on-chain DeWEB publish is pending (ethers gets vendored first, see [docs/OPERATIONS.md](docs/OPERATIONS.md)). |
 | **Business** | 10 bps on routed buys, with an immutable cap of 30 bps. Paid scanner API and bulk attestations for launchpads and wallets. An "ExitProof verified" launch badge. See [Revenue](#revenue) and [SUBMISSION.md](SUBMISSION.md). |
 | **Usage** | Allowed buys emit `Checked`; scanner verdicts emit `Attested`. The web feed reads both from chain. Blocked buys revert, so they never show up as events, and we don't claim on-chain "blocked" counts. |
 | **Verified source** | `TBD (mainnet pending)`. `scripts/deploy.mjs` prints the exact `forge verify-contract … --verifier sourcify --chain 196` and OKLink commands after deploying. |
-| **Assurance** | Circuit checked on all 2048 inputs off chain and again on a real TapeOut processor (fork of mainnet) · 63 offline Foundry tests + 29 fork tests on real PotatoSwap pairs and the real processor · 80+ scanner tests · adversarial reviews after every task, with the bypasses they found fixed ([Security review history](#security-review-history)) · one-command fork rehearsal of the whole mainnet flow (`scripts/rehearse.sh`) |
+| **Assurance** | Circuit checked on all 2048 inputs off chain and again on a real TapeOut processor (fork of mainnet) · test counts at commit `5fb8343`: 92 offline Foundry tests (unit, fuzz, invariant, gas), 30 fork tests on real PotatoSwap pairs and the real processor (including a 32-buy fork stress run), 81 scanner tests, 2 CLI tests · adversarial reviews after every task, with the bypasses they found fixed ([Security review history](#security-review-history)) · one-command fork rehearsal of the whole mainnet flow (`scripts/rehearse.sh`) |
 | **AI agents** | [`agent/SKILL.md`](agent/SKILL.md): an OKX Agentic Wallet skill. `cli/exitproof.mjs check` gives a JSON verdict; `tx` prepares a `buyETH` call for `onchainos wallet contract-call`. Agents get a check they can read by machine, and the same check is enforced on chain when they buy. |
 | **Built during the event** | All of it. First commit 2026-11-25. |
 
@@ -111,7 +111,7 @@ admins), live calls to non-literal targets, BALANCE/SELFBALANCE/EXTCODE* reads o
 the token `privileged`. Strict mode therefore has an allowlist guarantee. Balanced mode uses `dangerSetter`, which is
 based on a list of dangerous selectors, plus live SELFDESTRUCT. A dispatcher the scanner does not recognize fails
 closed. EIP-1167 and ERC-7511 clones are resolved to their implementation. Details and residual risks are in
-[scanner/README.md](scanner/README.md).
+[scanner/README.md](scanner/README.md). A scan census of live PotatoSwap tokens is in [docs/CENSUS.md](docs/CENSUS.md).
 
 The daemon (`node scanner/src/cli.mjs daemon`) watches PotatoSwap `PairCreated` in 100-block windows and attests each
 new token. That is how strict and balanced modes work for fresh launches.
@@ -119,7 +119,7 @@ new token. That is how strict and balanced modes work for fresh launches.
 ## Security review history
 
 Each task went through an adversarial review before it was accepted. These are the real bypasses the reviews found,
-and every one of them was fixed and covered by a test:
+and every one of them was fixed and covered by a test or a recorded manual check:
 
 | Found | Fix |
 |---|---|
@@ -133,7 +133,7 @@ and every one of them was fixed and covered by a test:
 | **Owner-probe dirty word, bucket saturation, simulate throw blocking attestation, flag downgrade** | Fail closed: owner dirty word = active, tax buckets saturate, static flags always attested and a simulate error ⇒ `ownerCanTrap`, the daemon never lowers a flag |
 | **Web/CLI: a fork router with a mainnet wallet** (same chain id 196) | `buyEnabled` per network, plus `getCode(router)` and chainId on the wallet's own provider before every send; minOut is taken from the simulated delivered amount |
 
-The review diffs and reports live in the build workspace. The test names in `test/` and `scanner/test/` match each fix.
+The review diffs and reports live in the build workspace. Most fixes have a named test in `test/` or `scanner/test/`; the web/CLI wallet gates were checked by hand in a browser and on the fork CLI.
 
 ## Honest limitations
 
@@ -144,22 +144,32 @@ The review diffs and reports live in the build workspace. The test names in `tes
 - **Logic inside allowlisted functions.** The allowlist proves which functions a token exposes, not what they do. A `transfer()` that changes behaviour by block number, timestamp or an internal counter passes the static rules; only the live probe and the simulation catch what is visible at that moment.
 - **Non-solc dispatchers fail closed.** Vyper, jump tables and hand-written dispatchers are marked `privileged` + `dangerSetter`, so honest tokens written that way are blocked in balanced and strict modes.
 - **Attester trust.** Registry flags are as good as the attester and the scanner version. The scanner is open source and deterministic, so anyone can re-run it on a codehash. The registry owner can add or remove attesters (this only affects flags, never funds; ownership transfer is single-step).
-- **TapeOut itself.** The TapeOut factory and processors are upgradeable and unaudited (SnipeShield's README notes the same). An upgrade that changes `eval` changes ExitProof's verdicts. The router rejects malformed output (`BadEval` unless `allow ⇔ reason == 0`), but it cannot tell a dishonest "allow" from an honest one.
+- **TapeOut itself.** SnipeShield's README notes that TapeOut's factory "isn't sealed yet": its owner can still upgrade how circuits are evaluated. We know of no public audit of TapeOut. An upgrade that changes `eval` changes ExitProof's verdicts. The router rejects malformed output (`BadEval` unless `allow ⇔ reason == 0`), but it cannot tell a dishonest "allow" from an honest one.
+- **False "upgradeable" on unscanned tokens.** The on-chain scan is linear. About 4% of honest tokens have metadata hash bytes that look like a JUMPDEST next to a DELEGATECALL/CALLCODE/SELFDESTRUCT byte, so they read as upgradeable. Until the scanner attests them, balanced mode blocks them with reason 4. For a scanned token the registry replaces the on-chain result.
+- **Off-chain scanner and CBOR metadata.** The scanner can decode the solc metadata trailer as code. In rare cases this gives a strict-mode false positive, which fails closed.
+- **The simulation can be evaded.** `simulate` uses a fixed holder address, jumps the clock by 3600 s and assumes a pool fee of at most 1%. A token that keys on any of those can hide an owner trap from it.
+- **Tax rounding.** On the sell leg, a tax 1 bps under a bucket line (499, 1499 or 4999 bps) is reported one bucket higher. Rounding goes the conservative way, and the buy leg is exact (stress report, finding F2).
+- **Donated tokens stay in the router.** Tokens sent to the router directly are stuck, by design: there is no admin and no sweep function.
+- **The browser-wallet buy path has not been tested with a real wallet.** The same calldata, minOut and gas logic were exercised through the CLI on the fork, and the web check path was tested in Chrome.
+- **First buy of a large token.** The on-chain scan costs about 100–180 gas per byte. The first buy of a token near the 24 KB size limit can cost up to about 4.8M gas offline (about 5M with the real eval). The worst blocked case measured is 7.62M (a 24 KB probe-cap token). This is paid once per codehash; later buys use the cache.
 - **Scope.** PotatoSwap V2 only, a single hop, OKB/WOKB as the quote asset. No V3, no price oracle, no MEV protection beyond `minOut`.
 
 ## Gas
 
 | | gas |
 |---|---|
-| `buyETH`, first buyer of a codehash (with the bytecode scan), unit tests | ≈585k |
-| `buyETH`, cached scan, unit tests | ≈341k |
-| On the fork, real processor + real PotatoSwap: first buy (demo) / cached (CLI) | ≈756k / ≈503k |
+| Fork rehearsal, real processor + PotatoSwap: first buy of a small token (with the scan) | 755,825 |
+| Fork rehearsal: later buy, scan cached | 502,678 |
+| First buy of a ~24 KB token (worst-case fill), offline / with the real eval (estimate) | 4.82M / ≈4.99M |
+| Worst blocked case: 24 KB probe-cap token | 7.62M |
 | One `processor.eval` from a contract | ≈137k |
 
-**The wallet must allow a gas limit of at least 3.5M.** The probe needs about 3.1M gas *available* (its sub-call gets
-63/64 of what is left), even though a buy only *uses* 0.5–0.8M. The web app and CLI use `estimateGas × 1.2`, and fall
-back to 4M only when the estimate fails without a revert reason. Don't hard-code a lower limit, or the probe runs out
-of gas and the buy is denied.
+**Don't cap the wallet's gas limit.** The probe needs about 3.1M gas *available* (its sub-call gets 63/64 of what is
+left), even though a typical buy only *uses* 0.5–0.8M. So a typical buy needs a limit of at least 3.5M, and the first
+buy of a near-24 KB token needs up to about 5M. Leave about 8M of headroom: the web app and CLI use `estimateGas × 1.2`,
+and fall back to 8M when the estimate fails without a revert reason. With a lower hard-coded limit, the probe runs out
+of gas and the buy is denied, which fails closed. Measurements are in the build workspace's stress report (commit
+`2cd45cf`); the X Layer block gas limit is 210M.
 
 ## Costs
 
@@ -196,32 +206,47 @@ Full breakdown and a mainnet budget: [docs/COSTS.md](docs/COSTS.md).
 
 Requirements: Foundry (forge, anvil, cast), Node ≥ 22, and Python 3 (Yosys only if you want to rebuild the circuit).
 
+Test counts below were measured at commit `5fb8343`.
+
 ```bash
 npm ci && (cd scanner && npm ci)
-forge test                                            # 63 offline tests (the fork suite skips itself)
-XLAYER_RPC=https://rpc.xlayer.tech forge test --match-path 'test/fork/*'   # 29 fork tests, pinned block 76861306
-python3 -m unittest circuit/test_circuit.py           # circuit: all 2048 inputs vs spec.py
-node --test scanner/test                              # scanner, 80+ tests (needs anvil and forge build)
-bash scripts/rehearse.sh                              # whole mainnet flow on a fresh fork → "REHEARSAL OK"
+forge test
+XLAYER_RPC=https://rpc.xlayer.tech forge test --match-path 'test/fork/*'
+python3 -m unittest circuit/test_circuit.py
+node --test scanner/test
+node --test cli/test
+bash scripts/rehearse.sh
 ```
 
-`scripts/rehearse.sh` starts anvil on a fork of mainnet block 76,861,306 and runs every step in order:
+1. `forge test`: 92 offline tests pass. The 2 fork suites skip themselves when `XLAYER_RPC` is unset.
+2. The fork suites: 30 tests at the pinned block 76,861,306, including the 32-buy stress run.
+3. The circuit test: all 2048 inputs against `spec.py`.
+4. The scanner: 81 tests. It needs anvil and `forge build`.
+5. The CLI: 2 tests.
+6. `scripts/rehearse.sh`: the whole mainnet flow on a fresh fork, ending in `REHEARSAL OK`.
+
+`scripts/rehearse.sh` works in a throw-away copy of the repo, so it never changes your files. It starts anvil on a
+fork of mainnet block 76,861,306 and runs every step in order:
 
 1. funds anvil account #2 (accounts #0, #1 and #5 have EIP-7702 code on X Layer)
 2. `tapeout.mjs`: create the processor, mint NAND, tape out, verify 2048/2048
-3. `deploy.mjs`: a dry run, then a send through the same code path as mainnet
+3. `deploy.mjs`:
+   - a dry run that must write nothing;
+   - an interrupted send: it is killed after the registry tx is sent and before it is mined, and a re-run while that tx is pending must refuse;
+   - the resume, which adopts that registry and must not deploy a second one;
+   - an idempotent re-run.
 4. `demo-fork.mjs`: fixture tokens with real PotatoSwap pairs
 5. CLI verdicts for the clean, blacklist, 99% sell tax, second-hop trap, fee and time-bomb tokens; the time bomb is checked before and after a scanner attestation
 6. one CLI buy, and one refused buy
 
-It prints a cost summary and `REHEARSAL OK`, then kills anvil and restores the committed artifacts (`KEEP=1` keeps the
-new ones). Use `PORT=` if 8549 is busy.
+It prints a cost summary and `REHEARSAL OK`, then kills anvil. With `KEEP=1` it copies the fresh fork artifacts back
+into the repo. Set `PORT=` if 8549 is busy. Set `FORK_URL=https://xlayerrpc.okx.com` if rpc.xlayer.tech rate-limits you.
 
-Web app against the fork: `KEEP=1 bash scripts/rehearse.sh` writes fresh addresses, but the rehearsal stops anvil when
-it exits. To keep a fork running, start anvil yourself on port 8549 (`anvil --fork-url https://rpc.xlayer.tech
---fork-block-number 76861306 --chain-id 196 --port 8549`) and run the same steps by hand: `tapeout.mjs`, `deploy.mjs`
-and `demo-fork.mjs` with `RPC_URL=http://127.0.0.1:8549 SEND=1`. Then serve the app with `cd web && python3 -m
-http.server 8765` and open `http://127.0.0.1:8765/?token=<address>&mode=balanced&check=1`.
+Web app against the fork: the rehearsal stops anvil when it exits, so start anvil yourself on port 8549 (`anvil
+--fork-url https://rpc.xlayer.tech --fork-block-number 76861306 --chain-id 196 --port 8549`). Then run `tapeout.mjs`,
+`deploy.mjs` and `demo-fork.mjs` with `RPC_URL=http://127.0.0.1:8549 SEND=1` and `DEPLOYER_KEY` set to anvil account
+#2. Serve the app with `cd web && python3 -m http.server 8765` and open
+`http://127.0.0.1:8765/?token=<address>&mode=balanced&check=1`.
 
 CLI: `node cli/exitproof.mjs check <token> --mode balanced --network fork` (exit code 0 = allow, 1 = blocked).
 The CLI's default network is `xlayer` (mainnet); `--network fork` is only for local demos. On the fork, `buy` works only
@@ -229,12 +254,9 @@ through a loopback RPC, and `tx` (the agent path) is refused because the fork ha
 
 ### Mainnet (operator)
 
-```bash
-DEPLOYER_KEY=0x… node scripts/tapeout.mjs                              # dry run: plan + exact BEM/OKB
-DEPLOYER_KEY=0x… SEND=1 CONFIRM_MAINNET=yes node scripts/tapeout.mjs   # writes deployments/xlayer.json
-DEPLOYER_KEY=0x… node scripts/deploy.mjs                               # dry run: constructor args + estimated OKB
-DEPLOYER_KEY=0x… SEND=1 CONFIRM_MAINNET=yes node scripts/deploy.mjs    # router + registry, web/config.json updated
-```
+The step-by-step go-live, with the key read from `.env`, is in [MORNING.md](MORNING.md). In short: run
+`scripts/tapeout.mjs` as a dry run, then with `SEND=1 CONFIRM_MAINNET=yes`. That writes `deployments/xlayer.json`. Then
+do the same with `scripts/deploy.mjs`, which deploys the router and registry and updates `web/config.json`.
 
 Both scripts detect the network by probing the node, never from a flag. They refuse wallets with EIP-7702 code,
 simulate every transaction before sending it, write nothing in a dry run, and stop at a banner unless
@@ -257,7 +279,7 @@ TapeOut devresine bırakır. Devre "hayır" derse işlemin tamamı geri alınır
 - **Devre:** Yosys ile 54 NAND'a sentezlendi. 2048 girdinin tamamı hem çevrimdışı hem de gerçek bir TapeOut işlemcisi üzerinde (mainnet fork) doğrulandı.
 - **Üç savunma katmanı:** zincir üstü satış denemesi ve bytecode taraması; scanner'ın codehash'e göre yazdığı RiskRegistry; fork üzerinde owner yetkilerinin simülasyonu (`ownerCanTrap`).
 - **Güvenlik:** her görev çekişmeli bir incelemeden geçti. Bulunan atlatma yolları (sahte CBOR trailer, PUSH taşması, ikinci adım kara listesi, gizli owner, bakiye kill-switch'i, sabit admin) düzeltildi ve testle sabitlendi.
-- **Sınırlar:** tx.origin'e veya router'a özel davranan token'lar, ProbeHolder'ın kontrat olarak tanınabilmesi, gas penceresi izi, alım sonrası owner işlemleri, izinli fonksiyonların içindeki mantık, attester güveni, TapeOut'un kendisinin yükseltilebilir ve denetlenmemiş olması.
-- **Gas:** ilk alım ≈585k, önbellekli ≈341k (birim test); cüzdanın gas limiti en az 3.5M olmalı.
+- **Sınırlar:** taranmamış dürüst token'ların ≈%4'ünde sahte "upgradeable" (sebep 4), tx.origin'e veya router'a özel davranan token'lar, ProbeHolder'ın kontrat olarak tanınabilmesi, gas penceresi izi, alım sonrası owner işlemleri, izinli fonksiyonların içindeki mantık, attester güveni, simülasyonun atlatılabilmesi, gerçek bir tarayıcı cüzdanıyla test edilmemiş alım yolu, TapeOut factory'sinin henüz mühürlenmemiş olması.
+- **Gas:** fork üzerinde ilk alım ≈756k, önbellekli ≈503k. 24 KB'lık bir token'ın ilk alımı ≈5M'a çıkabilir. Cüzdanın gas limitini düşürme (≈8M pay bırak).
 - **Gelir:** yönlendirilen alımlardan 10 bps (değiştirilemez üst sınır 30 bps), launchpad ve cüzdanlar için ücretli scanner API'si ve toplu attestation, "ExitProof verified" rozeti.
 - **Çalıştırma:** `forge test`, `bash scripts/rehearse.sh` (sonunda `REHEARSAL OK`).

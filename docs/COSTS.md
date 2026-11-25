@@ -1,7 +1,9 @@
 # ExitProof costs
 
-Every number on this page was measured on an anvil fork of X Layer mainnet at block 76,861,306 (2026-11-25), using
-the same scripts that run on mainnet. Prices are as of 2026-11-25: **OKB ≈ $81**, **BEM ≈ $7.86**.
+Gas amounts and fork spend were **measured** on an anvil fork of X Layer mainnet at block 76,861,306 (2026-11-25),
+using the same scripts that run on mainnet. Everything marked *(estimate)* is derived from those measurements: mainnet
+OKB figures (measured gas × the mainnet gas price read that day), attestation and DeWEB storage costs, the budget, and
+the USD values. Prices are as of 2026-11-25: **OKB ≈ $81**, **BEM ≈ $7.86**.
 
 ## Fork gas price vs mainnet gas price
 
@@ -21,7 +23,7 @@ are the same on both.
 | **Total** | **1,611,660** | **0.11 BEM + 0.0013 OKB** |
 
 - Measured on the fork: **0.002934 OKB + 0.11 BEM**, which is 0.0013 OKB of fee plus about 0.00163 OKB of gas at 1.02 gwei.
-- At mainnet gas (0.02 gwei), the gas is about 0.000032 OKB, so the total is about **0.00133 OKB + 0.11 BEM ≈ $0.11 + $0.86 ≈ $0.97**.
+- At mainnet gas (0.02 gwei), the gas is about 0.000032 OKB, so the total is about **0.00133 OKB + 0.11 BEM ≈ $0.11 + $0.86 ≈ $0.97** *(estimate)*.
 
 ## Registry + router (`scripts/deploy.mjs`)
 
@@ -33,7 +35,7 @@ are the same on both.
 | **Total** | **2,597,664** |
 
 - Measured on the fork: **0.002617 OKB**.
-- At mainnet gas: about **0.000052 OKB** (well under $0.01).
+- At mainnet gas: about **0.000052 OKB** (well under $0.01) *(estimate)*.
 
 ## Per buy (paid by the buyer)
 
@@ -41,18 +43,19 @@ are the same on both.
 |---|---:|---:|
 | First buy of a codehash (scan + ProbeHolder), real processor + PotatoSwap | ≈756k | ≈0.000015 OKB |
 | Later buys (scan cached) | ≈503k | ≈0.00001 OKB |
-| Unit tests with the mock processor: first / cached | ≈585k / ≈341k | – |
+| First buy of a ~24 KB token (worst-case fill), offline / with the real eval | 4.82M / ≈4.99M (estimate) | ≈0.0001 OKB |
+| Worst blocked case (24 KB probe-cap token) | 7.62M | ≈0.00015 OKB |
 | `inspect` (free check, `eth_call`) | – | 0 |
 
 - **Router fee:** 10 bps of the buy amount (0.00001 OKB on a 0.01 OKB buy). The PotatoSwap pool fee of 25 bps comes on top.
-- **Gas limit:** the wallet must allow at least **3.5M**. Only about 0.5–0.8M is used; the rest is headroom that the probe needs to have available.
+- **Gas limit:** don't cap it. A typical buy needs at least **3.5M available** but uses only about 0.5–0.8M; the rest is headroom the probe needs. The first buy of a near-24 KB token can need about 5M, so the web app and CLI fall back to 8M. The large-token figures come from the stress suite (commit `2cd45cf`).
 
-## Scanner attestations (operator)
+## Scanner attestations (operator, estimate)
 
 `RiskRegistry.attest` writes one struct and a report URI per codehash, roughly 50–80k gas, which is about 0.0000015 OKB
 at 0.02 gwei. Attesting every new PotatoSwap pair at about 100 pairs a day costs well under 0.001 OKB a day.
 
-## DeWEB (optional, see OPERATIONS.md)
+## DeWEB (optional, see OPERATIONS.md; storage is an estimate)
 
 Read from mainnet on 2026-11-25:
 
@@ -60,7 +63,7 @@ Read from mainnet on 2026-11-25:
 - **`.tape` name:** `monthlyFee()` on DomainBinding is **0**.
 - **Storage:** about 720 gas per byte, plus about 120k gas per 24 KB chunk. A single-file build with ethers and the fonts inlined is about 650 KB. That is about 470M gas, or about **0.01 OKB** at 0.02 gwei.
 
-## Mainnet budget recommendation
+## Mainnet budget recommendation (estimate)
 
 | Item | OKB | BEM |
 |---|---:|---:|

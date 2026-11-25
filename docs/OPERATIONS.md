@@ -26,7 +26,7 @@ Progress is kept in `scanner/state/daemon.json`, so a restart resumes where it s
 | `START_BLOCK` | First block to scan on the first run. Use the router's deploy block, or a recent block. |
 | `SEND=1` | Actually send attestations. Without it the daemon is a dry run. |
 | `POLL_MS` | Poll interval, default 10000 |
-| `STATE_FILE`, `REPORTS_DIR` | Optional overrides for `scanner/state/daemon.json` and `scanner/reports/` |
+| `STATE_FILE` | Optional override for `scanner/state/daemon.json`. The daemon always writes its reports to `scanner/reports/`. |
 
 ### Setup (Ubuntu 24.04)
 
@@ -37,7 +37,11 @@ sudo -iu exitproof
 curl -L https://foundry.paradigm.xyz | bash && ~/.foundry/bin/foundryup   # anvil
 # Node >= 22 (e.g. from NodeSource), then:
 git clone <repo> exitproof && cd exitproof && npm ci && (cd scanner && npm ci)
+mkdir -p scanner/state scanner/reports
 ```
+
+The two `mkdir` directories must exist before the service starts, because the unit below makes the rest of the
+filesystem read-only (`ProtectSystem=strict`).
 
 Keep the secrets in a root-owned file that only the service user can read: `/etc/exitproof/scanner.env`, mode `0640`,
 group `exitproof`.
@@ -87,7 +91,7 @@ Restart=always
 RestartSec=15
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/home/exitproof/exitproof/scanner/state /home/exitproof/exitproof/scanner/reports
+ReadWritePaths=-/home/exitproof/exitproof/scanner/state -/home/exitproof/exitproof/scanner/reports
 PrivateTmp=true
 
 [Install]
@@ -143,7 +147,7 @@ Read on 2026-11-25: `FEE()` = **0.08 OKB**, `monthlyFee()` = **0**, `cpuCount()`
 9. **Rehearse first** on an anvil fork with the same script (`RPC_URL=http://127.0.0.1:8549 SEND=1`), as Latch's `preflight-deweb.sh` does, then dry-run against mainnet to print the exact fees.
 
 The cost is about 0.08 OKB for the container plus about 0.01 OKB of storage gas for a file of about 650 KB (see
-[COSTS.md](COSTS.md#deweb-optional-see-operationsmd)). After publishing, put the `.tape` name and the gateway URL in
+[COSTS.md](COSTS.md#deweb-optional-see-operationsmd-storage-is-an-estimate)). After publishing, put the `.tape` name and the gateway URL in
 the README judges table.
 
 Latch's code is GPL-2.0, and ExitProof is MIT. Write our own publisher from the steps above instead of copying theirs.
