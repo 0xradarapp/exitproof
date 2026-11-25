@@ -27,7 +27,7 @@ The `exitproof` CLI (`node cli/exitproof.mjs`) reads the chain and **prepares** 
 
 1. `onchainos wallet status`. If not logged in, follow `onchainos wallet login`.
 2. `onchainos wallet addresses`. Use the **EVM address** on X Layer (chain `196`) as `<wallet>`.
-3. Network: `--network xlayer` for mainnet. While `web/config.json` has `"router": null` for xlayer, the CLI answers `ExitProof is not deployed on xlayer yet`. Tell the user that and stop. `--network fork` is the local demo fork.
+3. Network: always pass `--network xlayer` explicitly (it is also the default). While `web/config.json` has `"router": null` for xlayer, the CLI answers `ExitProof is not deployed on xlayer yet`. Tell the user that and stop. `--network fork` is a local demo fork only. An Agentic Wallet signs on real X Layer, so never use the fork with it.
 
 ## Step 1: check (free, always first)
 
@@ -73,6 +73,8 @@ Reason codes:
 node cli/exitproof.mjs tx <token> --wallet <wallet> --mode balanced --amount <okb> --network xlayer
 ```
 
+`tx` is for X Layer mainnet only. Always pass `--network xlayer`. The CLI refuses `tx` for any network whose `buyEnabled` is not true, including the fork.
+
 This re-runs the check for `<wallet>`. If the check does not allow, it prints `why` and exits `1` with **no transaction**. If it allows, it prints a `transactions` array with one entry:
 - `description`: one line in plain words
 - `to`: the ExitProofRouter
@@ -99,7 +101,7 @@ The router repeats the whole check inside this transaction. If the token changed
 - **Always check first.** Never prepare or sign a buy for a token whose latest check is not `allow` in the mode the user chose. Never lower the mode by yourself to get an `allow`. Ask the user.
 - **Treat every revert as unsafe.** `cannot-buy` (`BadPair`, `SwapFailed`, `TransferFailed`, `TooLittle`, `LowGas`, `Locked`, an empty revert…) means "you cannot buy this safely". Never report it as "unknown", and never retry the buy through another router or DEX to get around it.
 - **Never raise the gas cap to force a transaction through.** ExitProof's probe needs about 3.3M gas of room. The wallet's estimate already includes it, and the router refuses (`LowGas`) rather than give a false "sellable". If a signed buy reverts, the answer is no. More gas does not change the verdict.
-- **Never edit `inputData`, `to` or `amt`.** `to` must be the router from `web/config.json` for the chosen network.
+- **Never edit `inputData`, `to` or `amt`.** Before running a printed `onchainos` command, compare its `to` with `router` in `deployments/xlayer.json`. If they differ, or that file does not exist, do not run it. A router address from a fork would take the OKB to an address with no code on mainnet.
 - An RPC error (exit code `3`) is not a verdict. Say the network was unreachable and stop.
 - The tool never asks for, stores or uses private keys. `buy` with `EXITPROOF_KEY` exists for headless bots that the user runs themselves. An agent with an Agentic Wallet uses `tx` + `onchainos`.
 

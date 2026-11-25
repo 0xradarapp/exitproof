@@ -1,5 +1,5 @@
 {
-  "defaultNetwork": "fork",
+  "defaultNetwork": "xlayer",
   "networks": {
     "fork": {
       "label": "Local fork",

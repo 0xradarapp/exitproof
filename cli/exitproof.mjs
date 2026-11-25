@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // ExitProof CLI.
-//   node cli/exitproof.mjs check <token> [--mode strict|balanced|permissive] [--amount 0.01] [--network fork|xlayer]
+//   node cli/exitproof.mjs check <token> [--mode strict|balanced|permissive] [--amount 0.01] [--network xlayer|fork]
+//   (default network: xlayer; the local demo fork needs --network fork)
 //   node cli/exitproof.mjs buy   <token> [--mode …] [--amount …] [--network …] [--slippage-bps 100] [--yes]
 //   node cli/exitproof.mjs tx    <token> --wallet <address> [--mode …] [--amount …] [--network …]
 //        no key: checks, then prints the buyETH transaction {to, inputData, amt} and the ready
@@ -47,7 +48,7 @@ function die(msg, code = 2) {
 
 function parseArgs(argv) {
   const [cmd, token, ...rest] = argv;
-  const o = { cmd, token, mode: 'balanced', amount: '0.01', network: CONFIG.defaultNetwork || 'fork', slippageBps: 100, yes: false, wallet: null };
+  const o = { cmd, token, mode: 'balanced', amount: '0.01', network: CONFIG.defaultNetwork || 'xlayer', slippageBps: 100, yes: false, wallet: null };
   for (let i = 0; i < rest.length; i++) {
     const k = rest[i];
     const v = () => { if (rest[i + 1] === undefined) die(`missing value for ${k}`); return rest[++i]; };
@@ -119,7 +120,7 @@ function verdictFromReport(args, o, extra) {
 async function setup(o) {
   const net = CONFIG.networks[o.network];
   if (!net) die(`unknown network ${o.network} (config has ${Object.keys(CONFIG.networks).join(', ')})`);
-  if (!net.router) die(`ExitProof is not deployed on ${o.network} yet (mainnet deployment pending); use --network fork`);
+  if (!net.router) die(`ExitProof is not deployed on ${o.network} yet (mainnet deployment pending)${o.cmd === 'tx' ? '' : '; the local demo fork is --network fork'}`);
   const rpc = process.env.RPC_URL || net.rpc;
   const chain = defineChain({ id: net.chainId, name: net.label, nativeCurrency: { name: 'OKB', symbol: 'OKB', decimals: 18 }, rpcUrls: { default: { http: [rpc] } } });
   const pub = createPublicClient({ chain, transport: http(rpc, { timeout: 60_000 }) });
@@ -228,7 +229,14 @@ async function gasFor(o, ctx, account, args) {
   }
 }
 
+const isLoopback = (url) => {
+  try { return /^(127\.|localhost$|\[::1\]$)/.test(new URL(url).hostname); } catch { return false; }
+};
+
 async function txFor(o, ctx) {
+  // `tx` hands a ready `onchainos … --chain 196` command to an agent wallet on REAL X Layer: never for a network whose
+  // router only exists on a local fork (same chain id 196, so the wallet could not tell and the OKB would be lost)
+  if (ctx.net.buyEnabled !== true) die(`tx is disabled for network "${o.network}" (buyEnabled is not true in web/config.json); agents use --network xlayer`);
   const { v, args, data } = await prepareBuy(o, ctx, o.wallet);
   const amt = o.value.toString();
   console.log(JSON.stringify({
@@ -248,6 +256,8 @@ async function buy(o, ctx) {
   let account;
   try { account = privateKeyToAccount(key); } catch { die('invalid EXITPROOF_KEY'); }
   const { net, pub, chain, rpc } = ctx;
+  // the key signs against ctx.rpc itself, so a fork router is safe only when that RPC really is the local fork
+  if (net.buyEnabled !== true && !isLoopback(rpc)) die(`buy is disabled for network "${o.network}" unless its RPC is loopback (got ${rpc})`);
   const { v, args } = await prepareBuy(o, ctx, account.address);
   const gas = await gasFor(o, ctx, account, args);
   const tx = { to: net.router, function: 'buyETH', args: args.map(String), valueOKB: o.amount, gas: gas.toString(), from: account.address };
