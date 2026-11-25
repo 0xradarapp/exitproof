@@ -9,10 +9,15 @@ contract RiskRegistryTest is Test {
     address owner = address(0xA11CE);
     address attester = address(0xA77E57);
     address rando = address(0xBAD);
+    address token = address(0x70CE);
     bytes32 constant H = keccak256("code");
 
-    event Attested(bytes32 indexed codehash, RiskRegistry.Flags f, string reportURI, address attester);
+    event Attested(
+        address indexed token, bytes32 indexed codehash, RiskRegistry.Flags f, string reportURI, address attester
+    );
     event AttesterSet(address indexed attester, bool allowed);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     function setUp() public {
         vm.prank(owner);
@@ -27,23 +32,31 @@ contract RiskRegistryTest is Test {
 
     function test_ownerIsDeployer() public view {
         assertEq(reg.owner(), owner);
+        assertEq(reg.pendingOwner(), address(0));
     }
 
     function test_attestByNonAttesterReverts() public {
         vm.prank(rando);
         vm.expectRevert(RiskRegistry.NotAttester.selector);
-        reg.attest(H, _flags(), "ipfs://x");
+        reg.attest(token, H, _flags(), "ipfs://x");
+    }
+
+    function test_attestZeroTokenReverts() public {
+        vm.prank(attester);
+        vm.expectRevert(RiskRegistry.ZeroAddress.selector);
+        reg.attest(address(0), H, _flags(), "ipfs://x");
     }
 
     function test_flagsRoundTripAndScannedForced() public {
         RiskRegistry.Flags memory f = _flags();
-        vm.expectEmit(true, false, false, true);
         RiskRegistry.Flags memory fe = f;
         fe.scanned = true;
-        emit Attested(H, fe, "ipfs://x", attester);
+        vm.expectEmit(true, true, false, true, address(reg));
+        emit Attested(token, H, fe, "ipfs://x", attester);
         vm.prank(attester);
-        reg.attest(H, f, "ipfs://x");
-        RiskRegistry.Flags memory g = reg.flagsOf(H);
+        reg.attest(token, H, f, "ipfs://x");
+        (RiskRegistry.Flags memory g, bytes32 h) = reg.flagsOf(token);
+        assertEq(h, H, "codehash stored");
         assertTrue(g.scanned);
         assertTrue(g.privileged);
         assertFalse(g.upgradeable);
@@ -52,10 +65,33 @@ contract RiskRegistryTest is Test {
         assertEq(g.scannerVersion, 7);
     }
 
+    /// @notice F-06: entries are per token address. Another address (e.g. a second instance of the same bytecode) sees
+    ///         nothing, and attesting it does not touch the first entry.
+    function test_keyedByAddress_notByCodehash() public {
+        address other = address(0x0711E2);
+        vm.prank(attester);
+        reg.attest(token, H, _flags(), "a");
+        (RiskRegistry.Flags memory g, bytes32 h) = reg.flagsOf(other);
+        assertFalse(g.scanned, "same codehash, other address: unscanned");
+        assertEq(h, bytes32(0));
+        vm.prank(attester);
+        reg.attest(other, H, RiskRegistry.Flags(true, false, false, false, false, 7), "b");
+        (g,) = reg.flagsOf(token);
+        assertTrue(g.privileged && g.dangerSetter, "first entry untouched");
+        // overwrite of the same token records the new codehash
+        vm.prank(attester);
+        reg.attest(token, keccak256("v2"), RiskRegistry.Flags(false, false, false, false, false, 8), "c");
+        (g, h) = reg.flagsOf(token);
+        assertEq(h, keccak256("v2"));
+        assertTrue(g.scanned);
+        assertFalse(g.privileged);
+    }
+
     function test_unattestedIsZero() public view {
-        RiskRegistry.Flags memory g = reg.flagsOf(H);
+        (RiskRegistry.Flags memory g, bytes32 h) = reg.flagsOf(token);
         assertFalse(g.scanned);
         assertEq(g.scannerVersion, 0);
+        assertEq(h, bytes32(0));
     }
 
     function test_setAttesterOnlyOwner() public {
@@ -71,10 +107,11 @@ contract RiskRegistryTest is Test {
         reg.setAttester(attester, false);
         vm.prank(attester);
         vm.expectRevert(RiskRegistry.NotAttester.selector);
-        reg.attest(H, _flags(), "");
+        reg.attest(token, H, _flags(), "");
     }
 
-    function test_transferOwnership() public {
+    /// @notice F-12: two-step ownership. Nominating does not move ownership; only the nominee can accept.
+    function test_twoStepOwnership() public {
         vm.prank(rando);
         vm.expectRevert(RiskRegistry.NotOwner.selector);
         reg.transferOwnership(rando);
@@ -84,10 +121,36 @@ contract RiskRegistryTest is Test {
         reg.transferOwnership(address(0));
 
         vm.prank(owner);
+        vm.expectEmit(true, true, false, false, address(reg));
+        emit OwnershipTransferStarted(owner, rando);
         reg.transferOwnership(rando);
-        assertEq(reg.owner(), rando);
+        assertEq(reg.owner(), owner, "still the old owner");
+        assertEq(reg.pendingOwner(), rando);
+
+        // a typo / wrong address can be replaced before acceptance
+        address next = address(0x4E57);
+        vm.prank(owner);
+        reg.transferOwnership(next);
+        vm.prank(rando);
+        vm.expectRevert(RiskRegistry.NotPendingOwner.selector);
+        reg.acceptOwnership();
+
+        vm.prank(next);
+        vm.expectEmit(true, true, false, false, address(reg));
+        emit OwnershipTransferred(owner, next);
+        reg.acceptOwnership();
+        assertEq(reg.owner(), next);
+        assertEq(reg.pendingOwner(), address(0));
+
         vm.prank(owner);
         vm.expectRevert(RiskRegistry.NotOwner.selector);
         reg.setAttester(owner, true);
+        vm.prank(next);
+        reg.setAttester(owner, true);
+        assertTrue(reg.isAttester(owner));
+        // acceptance is one-shot
+        vm.prank(next);
+        vm.expectRevert(RiskRegistry.NotPendingOwner.selector);
+        reg.acceptOwnership();
     }
 }

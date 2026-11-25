@@ -146,7 +146,7 @@ contract InspectFuzzTest is FuzzBase {
         assertFalse(ok, "inspect returned");
         (bytes4 sel, bytes memory rest) = _strip(ret);
         if (sel == ExitProofRouter.Report.selector) {
-            (, bool allow, uint8 reason,,) = abi.decode(rest, (uint16, bool, uint8, uint256, uint256));
+            (, bool allow, uint8 reason,,,) = abi.decode(rest, (uint16, bool, uint8, uint256, uint256, uint256));
             assertEq(allow, reason == 0, "allow <=> reason 0");
             assertTrue(q.mode <= 3 && q.tokenIn == address(wokb) && q.amt != 0, "Report only on a valid request");
         }

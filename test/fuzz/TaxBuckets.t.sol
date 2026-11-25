@@ -7,8 +7,13 @@ import {ExitProofRouter} from "../../contracts/ExitProofRouter.sol";
 import {BytecodeScan} from "../../contracts/lib/BytecodeScan.sol";
 
 /// @notice Parametric transfer-tax fuzzing: the router's tax buckets equal an independent model of the documented
-///         math (two-hop buy-side attribution, ceil rounding, sell measured with getAmountIn), and allow/deny equals
-///         the spec policy for every mode.
+///         math, and allow/deny equals the spec policy for every mode:
+///         - buy side: the worst delivery loss over pair -> router -> probe holder AND pair -> router -> buyer (the
+///           delivery hop is measured at the buyer before the circuit decides, F-01);
+///         - sell side: the holder's balance vs the getAmountIn token-equivalent of the output, priced on the post-buy
+///           (pre-transfer) reserves; the swap itself is priced on the post-transfer reserves (equal here: this token
+///           does not move reserves inside transfer; the swap-back fixtures cover that);
+///         - ceil rounding of the loss in bps.
 contract TaxBucketsFuzzTest is FuzzBase {
     FuzzTaxToken internal t; // unscanned
     FuzzTaxTokenS internal ts; // registry-attested clean
@@ -25,6 +30,9 @@ contract TaxBucketsFuzzTest is FuzzBase {
         uint256 buyTax;
         uint256 delivered; // router -> buyer
     }
+
+    /// @dev Delivery-only skim on the buyer (`user`), in bps; 0 = off. Set per test.
+    uint256 internal victimBps;
 
     function setUp() public {
         _baseSetUp(ROUTER_FEE);
@@ -65,9 +73,13 @@ contract TaxBucketsFuzzTest is FuzzBase {
             m.sellOk = m.sellOut != 0;
             if (m.sellOk) m.sellTax = Spec.bucket(m.held, Spec.amountIn(m.sellOut, rT2, rW2, POOL_FEE));
             if (!m.sellOk) m.sellOut = 0;
-            m.delivered = _tax(m.received, h); // router -> buyer is a wallet hop too
+            // router -> buyer is a wallet hop too, skimmed at victimBps instead when the buyer is the victim
+            m.delivered = _tax(m.received, victimBps != 0 ? victimBps : h);
         }
-        m.buyTax = Spec.bucket(m.expected, m.held != 0 ? m.held : m.received);
+        // the buyer's bucket: the worst of the probe hop (if observed) and the real delivery
+        uint256 got = m.held != 0 ? m.held : m.received;
+        if (m.delivered < got) got = m.delivered;
+        m.buyTax = Spec.bucket(m.expected, got);
     }
 
     function _facts(Model memory m, bool scanned, uint8 mode) internal pure returns (uint256) {
@@ -84,6 +96,8 @@ contract TaxBucketsFuzzTest is FuzzBase {
         address pair = scanned ? pairS : pairT;
         // forge-lint: disable-next-line(unsafe-typecast)
         tok.setTax(uint16(b), uint16(s), uint16(h));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        tok.setVictim(victimBps != 0 ? user : address(0), uint16(victimBps));
         m = _model(address(tok), pair, amt, b, s, h);
         if (m.expected == 0) {
             // dust: nothing to buy -> the router refuses up front, it never reports
@@ -100,6 +114,7 @@ contract TaxBucketsFuzzTest is FuzzBase {
         assertEq(uint256(r.facts), x, "facts");
         assertEq(r.buyOut, m.received, "buyOut");
         assertEq(r.sellOut, m.sellOut, "sellOut");
+        assertEq(r.delivered, m.delivered, "Report.delivered");
         (bool allow, uint8 reason) = Spec.policy(x);
         assertEq(r.allow, allow, "allow");
         assertEq(r.reason, reason, "reason");
@@ -124,9 +139,8 @@ contract TaxBucketsFuzzTest is FuzzBase {
                 assertEq(rr, reason, "Blocked reason");
                 assertEq(uint256(ff), x, "Blocked facts");
             } else {
-                // allowed by policy but nothing deliverable (100% hop tax) -> TooLittle
-                assertEq(sel, ExitProofRouter.TooLittle.selector, "unexpected revert");
-                assertTrue(allow && m.delivered == 0, "TooLittle only when nothing is delivered");
+                // nothing delivered is buy-tax bucket 3, which every mode denies: there is no allowed-but-empty buy
+                revert("unexpected revert (not Blocked)");
             }
             assertEq(user.balance, nat0, "deny moved native");
             assertEq(FuzzTaxToken(tok).balanceOf(user), bal0, "deny moved token");
@@ -172,6 +186,24 @@ contract TaxBucketsFuzzTest is FuzzBase {
             assertGe(m.buyTax, Spec.bucketOfBps(lo), "buy bucket >= floor(true loss)");
             assertLe(m.buyTax, Spec.bucketOfBps(hi + 1), "buy bucket <= ceil(true loss)+1");
         }
+    }
+
+    /// @notice F-01 in the model: a skim on the router -> buyer hop only (the probe holder is not skimmed). The buy bucket
+    ///         follows the delivered amount, and a deny reverts everything.
+    /// forge-config: default.fuzz.runs = 2000
+    function testFuzz_deliveryHop_buyAttribution(uint256 b, uint256 s, uint256 h, uint256 v, uint8 mode) public {
+        b = bound(b, 0, 9999);
+        s = bound(s, 0, 10000);
+        h = bound(h, 0, 9999);
+        v = bound(v, 1, 10000);
+        mode = uint8(bound(mode, 0, 3));
+        victimBps = v;
+        (Model memory m,) = _check(false, b, s, h, mode, 1 ether, true);
+        // the buyer's true loss is 1 - (1-b)(1-max(h, v)); the bucket never under-reports it
+        uint256 worst = v > h ? v : h;
+        uint256 lossBps = (1e8 - (10000 - b) * (10000 - worst)) / 1e4;
+        assertGe(m.buyTax, Spec.bucketOfBps(lossBps), "buy bucket >= floor(true delivery loss)");
+        if (v >= 5000) assertEq(m.buyTax, 3, "a >=50% delivery skim is bucket 3");
     }
 
     /// @notice Same, with random pool depth and buy size (dust .. 50% of the WOKB reserve): exact model match only.

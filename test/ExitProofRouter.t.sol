@@ -47,6 +47,7 @@ contract ExitProofRouterTest is Test {
         uint8 reason;
         uint256 buyOut;
         uint256 sellOut;
+        uint256 delivered;
     }
 
     function setUp() public {
@@ -103,8 +104,8 @@ contract ExitProofRouterTest is Test {
         } catch (bytes memory err) {
             (bytes4 sel, bytes memory rest) = _strip(err);
             assertTrue(sel == ExitProofRouter.Report.selector, "not Report");
-            (r.facts, r.allow, r.reason, r.buyOut, r.sellOut) =
-                abi.decode(rest, (uint16, bool, uint8, uint256, uint256));
+            (r.facts, r.allow, r.reason, r.buyOut, r.sellOut, r.delivered) =
+                abi.decode(rest, (uint16, bool, uint8, uint256, uint256, uint256));
         }
     }
 
@@ -125,7 +126,7 @@ contract ExitProofRouterTest is Test {
     }
 
     function _attest(address t, bool privileged, bool upg, bool danger) internal {
-        reg.attest(t.codehash, RiskRegistry.Flags(true, privileged, upg, danger, false, 1), "ipfs://r");
+        reg.attest(t, t.codehash, RiskRegistry.Flags(true, privileged, upg, danger, false, 1), "ipfs://r");
     }
 
     function _assertNoDust(address t) internal view {
@@ -286,9 +287,10 @@ contract ExitProofRouterTest is Test {
         assertEq(_f(r.facts, 3, 2), 1, "buyTax bucket 1");
         assertEq(_f(r.facts, 1, 2), 1, "sellTax bucket 1");
         uint256 out = _buy(address(t), 1 ether, PERMISSIVE);
-        // forwarding router -> user is itself taxed 5%: out is what the user actually received
+        // forwarding router -> user is itself taxed 5%: out is what the user actually received, and inspect said so
         assertEq(t.balanceOf(user), out);
         assertApproxEqRel(out, r.buyOut * 95 / 100, 1e12);
+        assertEq(out, r.delivered, "Report.delivered == what the buy delivers");
         _assertNoDust(address(t));
         // strict: sell tax is checked before buy tax (spec reason order) -> 2
         (uint8 reason,) = _blocked(address(t), 1 ether, STRICT);
@@ -332,8 +334,8 @@ contract ExitProofRouterTest is Test {
             revert("inspect returned");
         } catch (bytes memory err) {
             (, bytes memory rest) = _strip(err);
-            (r.facts, r.allow, r.reason, r.buyOut, r.sellOut) =
-                abi.decode(rest, (uint16, bool, uint8, uint256, uint256));
+            (r.facts, r.allow, r.reason, r.buyOut, r.sellOut, r.delivered) =
+                abi.decode(rest, (uint16, bool, uint8, uint256, uint256, uint256));
         }
     }
 
@@ -396,16 +398,15 @@ contract ExitProofRouterTest is Test {
     function test_secondHopTrap_blocked_reason1() public {
         // Reviewer PoC: the trap ignores pair hops and blacklists the receiver of any other transfer, so a probe
         // that sells straight from the router passes and the buyer is trapped by the router -> buyer forward.
-        // The probe now mirrors the real path: router -> fresh holder -> pair.
+        // The probe mirrors the real path: router -> fresh code-less holder -> (transferFrom by the router) -> pair.
         SecondHopTrap t = new SecondHopTrap(SUPPLY);
         _list(address(t), true);
         (uint8 reason, uint16 facts) = _blocked(address(t), 1 ether, PERMISSIVE);
         assertEq(reason, 1);
         assertEq(_f(facts, 0, 1), 0);
-        // RESIDUAL LIMITATION (documented): the probe holder is a freshly deployed contract, so a token that treats
-        // EOA receivers differently from contract receivers on the second hop (extcodesize / code checks), keys on
-        // the remaining gas window, the router address, tx.origin or a later block can still pass the probe and
-        // trap the buyer afterwards.
+        // RESIDUAL LIMITATION (documented): the probe holder has no code (like an EOA), but it is never tx.origin and
+        // the spender is this router, so a token that keys on tx.origin, the spender address, the remaining gas window
+        // or a later block can still pass the probe and trap the buyer afterwards.
     }
 
     function test_lyingBalance_saturates_not_panics() public {
@@ -416,7 +417,7 @@ contract ExitProofRouterTest is Test {
         assertEq(_f(facts, 1, 2), 3);
     }
 
-    function test_probe_gas_with_helper_deploy() public {
+    function test_probe_gas_codeless_holder() public {
         CleanToken t = new CleanToken(SUPPLY);
         address pair = _list(address(t), false);
         // forge-lint: disable-next-line(erc20-unchecked-transfer)
@@ -433,7 +434,7 @@ contract ExitProofRouterTest is Test {
             assertTrue(ok);
             assertEq(held, 1000e18, "clean hop loses nothing");
             assertGt(out, 0);
-            emit log_named_uint("probeSell gas (incl. helper CREATE2)", used);
+            emit log_named_uint("probeSell gas (code-less CREATE2 holder, transferFrom sale)", used);
             assertLt(used, router.PROBE_GAS());
         }
         assertEq(t.balanceOf(address(router)), 1000e18, "probe rolled back");
@@ -502,6 +503,7 @@ contract ExitProofRouterTest is Test {
         assertEq(r.reason, 0);
         assertGt(r.buyOut, 0);
         assertGt(r.sellOut, 0);
+        assertEq(r.delivered, r.buyOut, "clean token: delivered == bought");
         assertLt(r.sellOut, 1 ether, "round trip loses fees");
         (uint112 s0, uint112 s1,) = MockV2Pair(pair).getReserves();
         assertEq(s0, r0);

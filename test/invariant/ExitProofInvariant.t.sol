@@ -11,6 +11,7 @@ import {MockWOKB, MockV2Factory, MockV2Pair} from "../mocks/V2.sol";
 import {Spec, IERC20X} from "../fuzz/FuzzBase.sol";
 import {FuzzTaxToken, HeavyHookToken} from "../fuzz/FuzzTokens.sol";
 import "../fixtures/Tokens.sol";
+import {DeliverySkim, TransferFromTrap, ApproveNoop, SwapBackTaxToken} from "../fixtures/AuditTokens.sol";
 
 /// @notice Random actors buy (native and WOKB paths) and inspect across clean and malicious tokens while the attester
 ///         randomly rewrites registry flags, an owner flips a time bomb and blocks advance. Violations are recorded as
@@ -18,7 +19,8 @@ import "../fixtures/Tokens.sol";
 contract ExitProofHandler is Test {
     error SimResult(bool sold);
 
-    bytes32 internal constant CHECKED_SIG = keccak256("Checked(address,bytes32,address,uint16,bool,uint8,uint256,uint256)");
+    bytes32 internal constant CHECKED_SIG =
+        keccak256("Checked(address,bytes32,address,uint16,bool,uint8,uint256,uint256)");
     uint16 internal constant POOL_FEE = 25;
 
     ExitProofRouter public router;
@@ -169,14 +171,15 @@ contract ExitProofHandler is Test {
     }
 
     function _send(Ctx memory c) internal returns (bool ok, bytes memory ret) {
-        vm.prank(c.a);
+        vm.prank(c.a, c.a); // an EOA buyer: msg.sender = tx.origin
         (ok, ret) = c.erc20
-            ? address(router).call(
-                abi.encodeCall(
-                    ExitProofRouter.buy,
-                    (address(factory), address(wokb), c.amt, c.t, c.minOut, c.mode, c.a, block.timestamp)
+            ? address(router)
+                .call(
+                    abi.encodeCall(
+                        ExitProofRouter.buy,
+                        (address(factory), address(wokb), c.amt, c.t, c.minOut, c.mode, c.a, block.timestamp)
+                    )
                 )
-            )
             : address(router).call{value: c.amt}(
                 abi.encodeCall(ExitProofRouter.buyETH, (address(factory), c.t, c.minOut, c.mode, c.a, block.timestamp))
             );
@@ -232,8 +235,8 @@ contract ExitProofHandler is Test {
         for (uint256 k = 0; k < logs.length; k++) {
             if (logs[k].emitter != address(router) || logs[k].topics[0] != CHECKED_SIG) continue;
             seen++;
-            bool topicsOk = logs[k].topics[1] == bytes32(uint256(uint160(t)))
-                && logs[k].topics[2] == t.codehash && logs[k].topics[3] == bytes32(uint256(uint160(a)));
+            bool topicsOk = logs[k].topics[1] == bytes32(uint256(uint160(t))) && logs[k].topics[2] == t.codehash
+                && logs[k].topics[3] == bytes32(uint256(uint160(a)));
             (bool bad, bool sellOk) = _badChecked(logs[k].data, t, mode, amt, out);
             if (!sellOk) {
                 vProbeFailBought++;
@@ -258,14 +261,20 @@ contract ExitProofHandler is Test {
         (uint16 facts, bool allow, uint8 reason, uint256 amountIn, uint256 o) =
             abi.decode(data, (uint16, bool, uint8, uint256, uint256));
         (bool pAllow, uint8 pReason) = Spec.policy(facts);
-        bool scanned = reg.flagsOf(t.codehash).scanned;
+        bool scanned = _scanned(t);
         sellOk = facts & 1 == 1;
         bad = !allow || reason != 0 || !pAllow || pReason != 0 || !sellOk || (facts >> 9) != mode
             || (((facts >> 8) & 1) == 1) == scanned || amountIn != amt || o != out;
     }
 
-    /// @dev Independent sellability oracle: the buyer itself sells exactly what it received, straight into the pair,
-    ///      inside a frame that always reverts (no state survives).
+    function _scanned(address t) internal view returns (bool) {
+        (RiskRegistry.Flags memory fl, bytes32 ah) = reg.flagsOf(t);
+        return fl.scanned && ah == t.codehash;
+    }
+
+    /// @dev Independent sellability oracle: the buyer sells exactly what it received the way a wallet does through a V2
+    ///      router (approve, then the spender pulls it into the pair with transferFrom, reserves read after that
+    ///      transfer), inside a frame that always reverts (no state survives).
     function _canSell(address a, uint256 i, uint256 amount) internal returns (bool sold) {
         try this.simSell(a, tokens[i], pairs[i], amount) {
             return false;
@@ -278,8 +287,11 @@ contract ExitProofHandler is Test {
 
     function simSell(address a, address t, address pair, uint256 amount) external {
         require(msg.sender == address(this), "self");
-        vm.prank(a);
-        (bool ok, bytes memory d) = t.call(abi.encodeWithSelector(IERC20X.transfer.selector, pair, amount));
+        vm.prank(a, a);
+        (bool ok, bytes memory d) = t.call(abi.encodeWithSelector(IERC20X.approve.selector, address(this), amount));
+        if (!ok || (d.length != 0 && !abi.decode(d, (bool)))) revert SimResult(false);
+        vm.prank(address(this), a); // the "router" pulls, inside the seller's transaction
+        (ok, d) = t.call(abi.encodeWithSignature("transferFrom(address,address,uint256)", a, pair, amount));
         if (!ok || (d.length != 0 && !abi.decode(d, (bool)))) revert SimResult(false);
         (bool tIs0, uint256 o) = _sellQuote(t, pair);
         if (o == 0) revert SimResult(false);
@@ -319,7 +331,7 @@ contract ExitProofHandler is Test {
         amt = bound(amt, 1e12, 30 ether);
         inspects++;
         World memory w0 = _world(a, i);
-        vm.prank(a);
+        vm.prank(a, a);
         (bool ok, bytes memory ret) = address(router).call{value: amt}(
             abi.encodeCall(ExitProofRouter.inspect, (address(factory), address(wokb), amt, tokens[i], modeSeed % 4))
         );
@@ -338,6 +350,7 @@ contract ExitProofHandler is Test {
         attests++;
         vm.prank(attester);
         reg.attest(
+            t,
             t.codehash,
             RiskRegistry.Flags(true, flags & 1 != 0, flags & 2 != 0, flags & 4 != 0, flags & 8 != 0, 1),
             "ipfs://inv"
@@ -422,6 +435,11 @@ contract ExitProofInvariantTest is StdInvariant, Test {
         FuzzTaxToken blocked = new FuzzTaxToken(SUPPLY);
         blocked.setSellBlocked(true);
         _add(address(blocked), true, true);
+        // final-audit fixtures (liquidity minted straight to a pre-created pair)
+        _addLaunched(type(SwapBackTaxToken).creationCode, abi.encode(300, 1_000e18, 1e18, makeAddr("tax")), false);
+        _addLaunched(type(DeliverySkim).creationCode, "", true); // never buyable: 99% delivery skim (bucket 3)
+        _addLaunched(type(TransferFromTrap).creationCode, "", true); // no router sell ever works
+        _addLaunched(type(ApproveNoop).creationCode, "", true); // no spender can ever move it
 
         targetContract(address(handler));
         bytes4[] memory sels = new bytes4[](6);
@@ -441,6 +459,21 @@ contract ExitProofInvariantTest is StdInvariant, Test {
             require(ok, "initPair");
         }
         require(IERC20X(t).transfer(pair, LIQ_TOKEN), "seed");
+        wokb.deposit{value: LIQ_WOKB}();
+        require(wokb.transfer(pair, LIQ_WOKB), "seed w");
+        MockV2Pair(pair).mint(address(this));
+        handler.addToken(t, pair, unsellable);
+    }
+
+    function _addLaunched(bytes memory creationCode, bytes memory extra, bool unsellable) internal {
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        address pair = factory.createPair(predicted, address(wokb));
+        bytes memory init = abi.encodePacked(creationCode, abi.encode(pair, LIQ_TOKEN, SUPPLY), extra);
+        address t;
+        assembly {
+            t := create(0, add(init, 32), mload(init))
+        }
+        require(t == predicted, "predict");
         wokb.deposit{value: LIQ_WOKB}();
         require(wokb.transfer(pair, LIQ_WOKB), "seed w");
         MockV2Pair(pair).mint(address(this));

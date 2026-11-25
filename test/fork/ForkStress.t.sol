@@ -18,6 +18,7 @@ import {IV2Factory} from "../../contracts/interfaces/IV2Factory.sol";
 import {Spec} from "../fuzz/FuzzBase.sol";
 import {FuzzTaxToken, HeavyHookToken} from "../fuzz/FuzzTokens.sol";
 import "../fixtures/Tokens.sol";
+import {DeliverySkim, TransferFromTrap, SwapBackTaxToken, ReserveGamer} from "../fixtures/AuditTokens.sol";
 
 interface IERC20S {
     function balanceOf(address) external view returns (uint256);
@@ -37,6 +38,11 @@ contract ForkStressTest is Test {
     uint256 constant LIQ_TOKEN = 100_000e18;
     uint256 constant LIQ_WOKB = 100e18;
     uint256 constant TX_BUDGET = 3_500_000;
+    /// @dev A blocked probe-cap token burns the whole 3M probe; since the delivery to the buyer and the registry's
+    ///      codehash read now happen before the verdict, that blocked tx costs ~3.56M with the real eval (was 3.49M).
+    ///      Nobody sends it (inspect / estimateGas deny first); pinned so a regression shows.
+    uint256 constant PROBE_CAP_BUDGET = 3_650_000;
+    uint256 budget = TX_BUDGET;
     uint8 constant S = 0;
     uint8 constant B = 1;
     uint8 constant P = 2;
@@ -161,7 +167,7 @@ contract ForkStressTest is Test {
             )
             : abi.encodeCall(ExitProofRouter.buyETH, (address(factory), c.t, 0, c.mode, c.u, block.timestamp));
         _cool(c.t);
-        vm.prank(c.u);
+        vm.prank(c.u, c.u); // an EOA buyer: msg.sender = tx.origin
         g = gasleft();
         (ok, ret) = address(router).call{value: c.erc20 ? 0 : c.amt}(data);
         g = g - gasleft() + 21_000 + _calldataGas(data);
@@ -217,19 +223,25 @@ contract ForkStressTest is Test {
         (bool ok, bytes memory ret, uint256 g) = _send(c);
         if (g > maxGas) maxGas = g;
         string memory verdict = ok ? _onOk(c, ret) : _onBlock(c, ret);
-        assertLt(g, TX_BUDGET, string(abi.encodePacked(name, ": gas over budget")));
+        assertLt(g, budget, string(abi.encodePacked(name, ": gas over budget")));
         _routerEmpty();
-        emit log(
-            string(
+        emit log(string(
                 abi.encodePacked(
-                    vm.toString(step), " | ", name, " | mode ", vm.toString(mode), " | ", verdict, " | gas ", vm.toString(g)
+                    vm.toString(step),
+                    " | ",
+                    name,
+                    " | mode ",
+                    vm.toString(mode),
+                    " | ",
+                    verdict,
+                    " | gas ",
+                    vm.toString(g)
                 )
-            )
-        );
+            ));
     }
 
     function _attest(address t, bool privileged, bool upg, bool danger) internal {
-        reg.attest(t.codehash, RiskRegistry.Flags(true, privileged, upg, danger, false, 1), "ipfs://stress");
+        reg.attest(t, t.codehash, RiskRegistry.Flags(true, privileged, upg, danger, false, 1), "ipfs://stress");
     }
 
     // fixtures (storage: the scenario is too long for the stack)
@@ -251,6 +263,10 @@ contract ForkStressTest is Test {
     address sfp;
     address rb;
     address fp;
+    address skim;
+    address tft;
+    address flap;
+    address donor;
 
     function _fixtures() internal {
         clean = _list(address(new CleanToken(SUPPLY)), false);
@@ -278,6 +294,28 @@ contract ForkStressTest is Test {
         sfp = _list(address(new ScanFalsePositiveToken(SUPPLY)), false);
         rb = _list(address(new ReturnBombToken(SUPPLY)), true);
         fp = _list(address(new ForgedProbeToken(SUPPLY)), true);
+        skim = _launch(type(DeliverySkim).creationCode, "");
+        _attest(skim, false, false, false);
+        tft = _launch(type(TransferFromTrap).creationCode, "");
+        _attest(tft, false, false, false);
+        flap = _launch(type(SwapBackTaxToken).creationCode, abi.encode(300, 1_000e18, 1e18, makeAddr("taxWallet")));
+        donor = _launch(type(ReserveGamer).creationCode, abi.encode(uint8(4), uint256(3), makeAddr("sink")));
+    }
+
+    /// @dev Real PotatoSwap pair created first; the fixture mints its liquidity straight to it.
+    function _launch(bytes memory creationCode, bytes memory extra) internal returns (address t) {
+        address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
+        address pair = factory.createPair(predicted, address(wokb));
+        bytes memory init = abi.encodePacked(creationCode, abi.encode(pair, LIQ_TOKEN, SUPPLY), extra);
+        assembly {
+            t := create(0, add(init, 32), mload(init))
+        }
+        require(t == predicted, "predict");
+        wokb.deposit{value: LIQ_WOKB}();
+        require(IERC20S(address(wokb)).transfer(pair, LIQ_WOKB), "seed w");
+        IV2PairFull(pair).mint(address(this));
+        pairOf[t] = pair;
+        listed.push(t);
     }
 
     function test_fork_stress_30_sequential_buys() public {
@@ -305,7 +343,9 @@ contract ForkStressTest is Test {
         _step("time bomb balanced", address(bomb), 1 ether, B, 6, false);
         bomb.setSellFee(2000);
         _step("time bomb armed 20%", address(bomb), 1 ether, P, 2, false);
+        budget = PROBE_CAP_BUDGET;
         _step("gas bomb (probe cap)", gb, 1 ether, P, 1, false);
+        budget = TX_BUDGET;
         _step("second-hop trap", hop, 1 ether, P, 1, false);
         _step("sell blocked", address(sb), 1 ether, P, 1, false);
         _step("heavy hook N=10", address(heavy), 1 ether, P, ALLOW, false);
@@ -320,6 +360,12 @@ contract ForkStressTest is Test {
         _step("forged probe", fp, 1 ether, P, 1, false);
         _attest(owned, true, false, true);
         _step("owned attested danger balanced", owned, 1 ether, B, 5, true);
+        // final-audit fixtures on real PotatoSwap pairs
+        _step("F-01 delivery skim strict (attested)", skim, 1 ether, S, 3, false);
+        _step("F-02 transferFrom trap strict (attested)", tft, 1 ether, S, 1, false);
+        _step("flap-like swap-back permissive", flap, 1 ether, P, ALLOW, false);
+        _step("flap-like swap-back WOKB path", flap, 1 ether, P, ALLOW, true);
+        _step("buy-hop donor (crash after buy)", donor, 1 ether, P, 2, false);
 
         emit log_named_uint("steps", step);
         emit log_named_uint("allowed", allowed);

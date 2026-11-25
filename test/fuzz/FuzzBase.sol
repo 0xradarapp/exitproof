@@ -99,6 +99,7 @@ abstract contract FuzzBase is Test {
         uint8 reason;
         uint256 buyOut;
         uint256 sellOut;
+        uint256 delivered;
     }
 
     function _baseSetUp(uint16 feeBps) internal {
@@ -155,13 +156,13 @@ abstract contract FuzzBase is Test {
         } catch (bytes memory err) {
             (bytes4 sel, bytes memory rest) = _strip(err);
             require(sel == ExitProofRouter.Report.selector, "not Report");
-            (r.facts, r.allow, r.reason, r.buyOut, r.sellOut) =
-                abi.decode(rest, (uint16, bool, uint8, uint256, uint256));
+            (r.facts, r.allow, r.reason, r.buyOut, r.sellOut, r.delivered) =
+                abi.decode(rest, (uint16, bool, uint8, uint256, uint256, uint256));
         }
     }
 
     function _attest(address t, bool privileged, bool upg, bool dangerSetter, bool ownerCanTrap) internal {
-        reg.attest(t.codehash, RiskRegistry.Flags(true, privileged, upg, dangerSetter, ownerCanTrap, 1), "ipfs://f");
+        reg.attest(t, t.codehash, RiskRegistry.Flags(true, privileged, upg, dangerSetter, ownerCanTrap, 1), "ipfs://f");
     }
 
     function _assertNoDust(address t) internal view {

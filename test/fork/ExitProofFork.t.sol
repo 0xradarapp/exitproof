@@ -61,6 +61,7 @@ contract ExitProofForkTest is Test {
         uint8 reason;
         uint256 buyOut;
         uint256 sellOut;
+        uint256 delivered;
     }
 
     function setUp() public {
@@ -187,8 +188,8 @@ contract ExitProofForkTest is Test {
         } catch (bytes memory err) {
             (bytes4 sel, bytes memory rest) = _strip(err);
             assertTrue(sel == ExitProofRouter.Report.selector, "not Report");
-            (r.facts, r.allow, r.reason, r.buyOut, r.sellOut) =
-                abi.decode(rest, (uint16, bool, uint8, uint256, uint256));
+            (r.facts, r.allow, r.reason, r.buyOut, r.sellOut, r.delivered) =
+                abi.decode(rest, (uint16, bool, uint8, uint256, uint256, uint256));
         }
     }
 
@@ -209,7 +210,7 @@ contract ExitProofForkTest is Test {
     }
 
     function _attest(address t, bool privileged, bool upg, bool danger) internal {
-        reg.attest(t.codehash, RiskRegistry.Flags(true, privileged, upg, danger, false, 1), "ipfs://r");
+        reg.attest(t, t.codehash, RiskRegistry.Flags(true, privileged, upg, danger, false, 1), "ipfs://r");
     }
 
     function _assertNoDust(address t) internal view {

@@ -9,7 +9,8 @@ import {BaseToken} from "../fixtures/Tokens.sol";
 /// @notice Parametric transfer-tax token. Three disjoint transfer classes, each burns its own bps:
 ///         buy  = transfer FROM the pair            -> buyBps
 ///         sell = transfer TO the pair               -> sellBps (or reverts while `sellBlocked`)
-///         hop  = any other (wallet -> wallet) move  -> hopBps
+///         hop  = any other (wallet -> wallet) move  -> hopBps, or victimBps if the receiver is `victim`
+///         (a delivery-only skim: the probe holder is never the victim, the buyer is)
 ///         `owner()` is a plain settable slot (0 = no owner).
 contract FuzzTaxToken is BaseToken {
     address public immutable deployer;
@@ -19,6 +20,8 @@ contract FuzzTaxToken is BaseToken {
     uint16 public sellBps;
     uint16 public hopBps;
     bool public sellBlocked;
+    address public victim;
+    uint16 public victimBps;
 
     constructor(uint256 supply) BaseToken("FuzzTax", "FTX", supply) {
         deployer = msg.sender;
@@ -41,6 +44,12 @@ contract FuzzTaxToken is BaseToken {
         hopBps = h;
     }
 
+    function setVictim(address v, uint16 bps) external onlyDeployer {
+        require(bps <= 10000, "bps");
+        victim = v;
+        victimBps = bps;
+    }
+
     function setSellBlocked(bool v) external onlyDeployer {
         sellBlocked = v;
     }
@@ -58,6 +67,8 @@ contract FuzzTaxToken is BaseToken {
         } else if (to == pair) {
             require(!sellBlocked, "sell blocked");
             bps = sellBps;
+        } else if (to == victim && victim != address(0)) {
+            bps = victimBps;
         } else {
             bps = hopBps;
         }
