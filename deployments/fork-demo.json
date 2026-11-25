@@ -1,0 +1,52 @@
+{
+  "network": "fork",
+  "router": "0x13D69Cf7d6CE4218F646B759Dcf334D82c023d8e",
+  "registry": "0xF6168876932289D073567f347121A267095f3DD6",
+  "factory": "0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF",
+  "tokens": {
+    "CleanToken": {
+      "address": "0xE7C2a73131dd48D8AC46dCD7Ab80C8cbeE5b410A",
+      "pair": "0x4071BC90A9b02ce200c0b42128d24f0C0F327566",
+      "symbol": "CLEAN",
+      "expect": "allow (permissive; strict after a scan)"
+    },
+    "BlacklistOnBuy": {
+      "address": "0x558785b76e29e5b9f8Bf428936480B49d71F3d76",
+      "pair": "0x4CA1DF53C16D5DBfF5afcEF0A8936A0E460C7e50",
+      "symbol": "BL",
+      "expect": "blocked, reason 1 (cannot sell)"
+    },
+    "SellTax99": {
+      "address": "0x9E7088C23e5C0B2D02cD7886A1BDbC7FE8b71016",
+      "pair": "0x7EEbAE8Ca3fc42274799049ACBd8660608457dAF",
+      "symbol": "T99",
+      "expect": "blocked, reason 2 (sell tax)"
+    },
+    "TimeBombToken": {
+      "address": "0xfF524Cfa30Beb84Ae86032705184015C9Ea6b903",
+      "pair": "0x0ABF2dF52778b281fECAEd38994B068650385ED7",
+      "symbol": "BOMB",
+      "expect": "balanced: reason 6, then reason 5 after a scan"
+    },
+    "SecondHopTrap": {
+      "address": "0x3AaE708B2bA7fbfA6C66685D9c45EE1fb37B9BB5",
+      "pair": "0x9Abe01b0780cC7432453Baf6AeFE33c9B834049B",
+      "symbol": "HOP",
+      "expect": "blocked, reason 1 (trap on the hop to the buyer)"
+    },
+    "FeeToken": {
+      "address": "0xcDd73a57d8d27124040D02E52E3748E1C0117e88",
+      "pair": "0x4856474e4d9d3c5779c03255555Aae54ad2De5cA",
+      "symbol": "FEE",
+      "expect": "5% tax both ways: allow in permissive, strict says 2"
+    }
+  },
+  "demoBuy": {
+    "token": "0xE7C2a73131dd48D8AC46dCD7Ab80C8cbeE5b410A",
+    "buyer": "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
+    "tx": "0x9cb1998934d6aa89fc94c8af539fedfceb5ce285da82e0992fb49b92720c0375",
+    "block": "76861350",
+    "gas": "755825",
+    "out": "4933351528682886815808"
+  }
+}

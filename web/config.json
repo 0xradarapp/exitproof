@@ -1,0 +1,65 @@
+{
+  "defaultNetwork": "fork",
+  "networks": {
+    "fork": {
+      "label": "Local fork",
+      "chainId": 196,
+      "rpc": "http://127.0.0.1:8549",
+      "explorer": null,
+      "router": "0x13D69Cf7d6CE4218F646B759Dcf334D82c023d8e",
+      "registry": "0xF6168876932289D073567f347121A267095f3DD6",
+      "processor": "0x215a67c3495BdAAaA9D7294399c9635582d6FfcB",
+      "circuitId": "1",
+      "wokb": "0xe538905cf8410324e03A5A23C1c177a474D59b2b",
+      "factory": "0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF",
+      "feeBps": 10,
+      "demoTokens": [
+        {
+          "name": "CleanToken",
+          "symbol": "CLEAN",
+          "address": "0xE7C2a73131dd48D8AC46dCD7Ab80C8cbeE5b410A"
+        },
+        {
+          "name": "BlacklistOnBuy",
+          "symbol": "BL",
+          "address": "0x558785b76e29e5b9f8Bf428936480B49d71F3d76"
+        },
+        {
+          "name": "SellTax99",
+          "symbol": "T99",
+          "address": "0x9E7088C23e5C0B2D02cD7886A1BDbC7FE8b71016"
+        },
+        {
+          "name": "TimeBombToken",
+          "symbol": "BOMB",
+          "address": "0xfF524Cfa30Beb84Ae86032705184015C9Ea6b903"
+        },
+        {
+          "name": "SecondHopTrap",
+          "symbol": "HOP",
+          "address": "0x3AaE708B2bA7fbfA6C66685D9c45EE1fb37B9BB5"
+        },
+        {
+          "name": "FeeToken",
+          "symbol": "FEE",
+          "address": "0xcDd73a57d8d27124040D02E52E3748E1C0117e88"
+        }
+      ],
+      "feedStartBlock": 76861306
+    },
+    "xlayer": {
+      "label": "X Layer",
+      "chainId": 196,
+      "rpc": "https://rpc.xlayer.tech",
+      "explorer": "https://www.oklink.com/xlayer",
+      "router": null,
+      "registry": null,
+      "processor": null,
+      "circuitId": null,
+      "wokb": "0xe538905cf8410324e03A5A23C1c177a474D59b2b",
+      "factory": "0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF",
+      "feeBps": 10,
+      "demoTokens": []
+    }
+  }
+}

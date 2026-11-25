@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ExitProof: don't buy what you can't sell</title>
+<meta name="description" content="ExitProof buys a token on X Layer and proves in the same transaction that you can sell all of it back. If you can't, the buy reverts.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Barlow:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+<!-- ethers v6.13.4 UMD (window.ethers), pinned with SRI -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ethers/6.13.4/ethers.umd.min.js"
+  integrity="sha384-6Zl0Pc8zjSz8KvmNeXRvUQgY4ryFb+BwDvKCmLYcBME0joAaru491tQgi9B7zsMM"
+  crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <!-- running figure heading for a door: the exit-sign pictogram -->
+    <symbol id="i-exit" viewBox="0 0 48 32">
+      <rect x="31" y="3" width="14" height="26" fill="none" stroke="currentColor" stroke-width="3"/>
+      <circle cx="16" cy="5.5" r="3.4" fill="currentColor"/>
+      <path d="M15 11 L11 20 M15 11 L22 14 L26 11 M15 11 L8 13 L5 17 M11 20 L17 23 L16 30 M11 20 L7 25 L1 25"
+        fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M35 16 h6 M38.5 12.5 L42 16 L38.5 19.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+    <!-- standing figure stopped at a barred door -->
+    <symbol id="i-stop" viewBox="0 0 48 32">
+      <rect x="31" y="3" width="14" height="26" fill="none" stroke="currentColor" stroke-width="3"/>
+      <path d="M28 6 L48 26" stroke="currentColor" stroke-width="3.4" stroke-linecap="round"/>
+      <circle cx="15" cy="5.5" r="3.4" fill="currentColor"/>
+      <path d="M15 11 L15 21 M15 12 L9 18 M15 12 L21 18 M15 21 L11 30 M15 21 L19 30"
+        fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </symbol>
+  </defs>
+</svg>
+
+<header class="bar">
+  <a class="mark" href="./" aria-label="ExitProof home">
+    <svg class="mark-icon" aria-hidden="true"><use href="#i-exit"/></svg>
+    <span>ExitProof</span>
+  </a>
+  <div class="bar-tools">
+    <label class="net">
+      <span data-i18n="network">Network</span>
+      <select id="net"></select>
+    </label>
+    <div class="lang" role="group" aria-label="Language">
+      <button type="button" data-lang="en" aria-pressed="true">EN</button>
+      <button type="button" data-lang="tr" aria-pressed="false">TR</button>
+    </div>
+    <button type="button" id="connect" class="btn-quiet" data-i18n="connect">Connect wallet</button>
+  </div>
+</header>
+
+<main class="page">
+  <section class="check" aria-labelledby="h1">
+    <h1 id="h1" data-i18n="tagline">Don't buy what you can't sell.</h1>
+    <p class="lede" data-i18n="lede"></p>
+
+    <p id="pending" class="notice" hidden data-i18n="pending"></p>
+
+    <form id="form" class="form" novalidate>
+      <label class="field">
+        <span class="field-label" data-i18n="tokenLabel">Token address</span>
+        <input id="token" name="token" type="text" inputmode="text" autocomplete="off" spellcheck="false"
+          placeholder="0x…" aria-describedby="token-hint">
+        <span id="token-hint" class="field-hint" data-i18n="tokenHint"></span>
+      </label>
+      <div id="demo" class="demo" hidden>
+        <span class="field-hint" data-i18n="demoTokens">Try a demo token</span>
+        <div id="demo-list" class="demo-list"></div>
+      </div>
+
+      <fieldset class="field modes">
+        <legend class="field-label" data-i18n="modeLabel">How careful</legend>
+        <div class="seg">
+          <label><input type="radio" name="mode" value="strict"><span data-i18n="mode_strict">Strict</span></label>
+          <label><input type="radio" name="mode" value="balanced" checked><span data-i18n="mode_balanced">Balanced</span></label>
+          <label><input type="radio" name="mode" value="permissive"><span data-i18n="mode_permissive">Permissive</span></label>
+        </div>
+        <span id="mode-hint" class="field-hint"></span>
+      </fieldset>
+
+      <div class="row">
+        <label class="field amount">
+          <span class="field-label" data-i18n="amountLabel">Amount (OKB)</span>
+          <input id="amount" name="amount" type="text" inputmode="decimal" value="0.01" autocomplete="off">
+        </label>
+        <button id="check" type="submit" class="btn-go" data-i18n="check">Check for free</button>
+      </div>
+      <p class="field-hint" data-i18n="checkNote"></p>
+    </form>
+
+    <div id="result" class="result" aria-live="polite"></div>
+
+    <section id="buybox" class="buybox" hidden aria-labelledby="buy-h">
+      <h2 id="buy-h" data-i18n="buyTitle">Buy through ExitProof</h2>
+      <p data-i18n="buyBody"></p>
+      <div class="row">
+        <label class="field slip">
+          <span class="field-label" data-i18n="slippage">Slippage</span>
+          <select id="slip"><option value="50">0.5%</option><option value="100" selected>1%</option><option value="300">3%</option></select>
+        </label>
+        <button id="buy" type="button" class="btn-go"></button>
+      </div>
+      <p id="buy-status" class="buy-status" aria-live="polite"></p>
+    </section>
+  </section>
+
+  <aside class="side">
+    <section class="how" aria-labelledby="how-h">
+      <h2 id="how-h" data-i18n="howTitle">How the check works</h2>
+      <ol>
+        <li data-i18n="how1"></li>
+        <li data-i18n="how2"></li>
+        <li data-i18n="how3"></li>
+        <li data-i18n="how4"></li>
+      </ol>
+    </section>
+
+    <section class="feed" aria-labelledby="feed-h">
+      <h2 id="feed-h" data-i18n="feedTitle">On chain right now</h2>
+      <p class="side-note" data-i18n="feedBody"></p>
+      <ul id="feed" class="list"></ul>
+    </section>
+
+    <section class="local" aria-labelledby="local-h">
+      <h2 id="local-h" data-i18n="localTitle">Checks you ran here</h2>
+      <ul id="local" class="list"></ul>
+    </section>
+  </aside>
+</main>
+
+<footer class="foot">
+  <p data-i18n="footer"></p>
+  <p id="contracts" class="contracts"></p>
+</footer>
+</body>
+</html>
