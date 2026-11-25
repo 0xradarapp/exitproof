@@ -15,11 +15,11 @@ const FLAGS = (r) => ({
   privileged: r.privileged, upgradeable: r.upgradeable, dangerSetter: r.dangerSetter, ownerCanTrap: r.ownerCanTrap,
 });
 
-test('CleanToken: all flags false, codehash = keccak(runtime), version 1', async () => {
+test('CleanToken: all flags false, codehash = keccak(runtime), version 5', async () => {
   const t = await deployToken(env, 'CleanToken');
   const r = await scan(env.pub, t.address);
   assert.deepEqual(FLAGS(r), { privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
-  assert.equal(r.scannerVersion, 4);
+  assert.equal(r.scannerVersion, 5);
   assert.equal(r.codehash, keccak256(await env.pub.getCode({ address: t.address })));
   assert.equal(r.evidence.owner, null);
   assert.ok(r.evidence.selectors.includes(selectorOf('transfer(address,uint256)')));
@@ -236,6 +236,8 @@ test('fixture audit: flags for every test/fixtures/Tokens.sol token under scanne
   //  - TradingDisabled / TimeBombToken / ProxyToken: flags unchanged; extra reasons only. ProxyToken's own
   //    fallback (delegatecall forwarder) is reported as fallback-logic.
   //  - CleanToken / OwnedCleanToken: unchanged.
+  // v5: CooldownToken (block.number) and TxOriginTrap (tx.origin + block.number) read block context on the
+  //  transfer path => extra reason 'block-context' (flags unchanged: both were already privileged).
   const expected = {
     CleanToken: [false, false, false, []],
     OwnedCleanToken: [true, false, false, ['caller-vs-storage', 'owner-getter']],
@@ -243,14 +245,14 @@ test('fixture audit: flags for every test/fixtures/Tokens.sol token under scanne
     BlacklistOnBuy: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
     SellTax99: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
     MaxTxToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
-    CooldownToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    CooldownToken: [true, false, false, ['block-context', 'caller-vs-literal', 'unknown-selector']],
     TradingDisabled: [true, false, true,
       ['caller-vs-literal', 'caller-vs-storage', 'dangerous-selector', 'owner-getter', 'unknown-selector']],
     TimeBombToken: [true, false, true,
       ['caller-vs-literal', 'caller-vs-storage', 'dangerous-selector', 'owner-getter', 'unknown-selector']],
     GasBombToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
     ReturnBombToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
-    TxOriginTrap: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    TxOriginTrap: [true, false, false, ['block-context', 'caller-vs-literal', 'unknown-selector']],
     ScanFalsePositiveToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
     ReentrantToken: [true, false, false, ['caller-vs-literal', 'external-call', 'unknown-selector']],
     ForgedProbeToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],

@@ -319,3 +319,222 @@ contract SelfBalToken is MiniERC20 {
         super._transfer(from, to, a);
     }
 }
+
+// ---- final-audit PoC fixtures (fable-security-audit, Appendix A/B), copied verbatim ----
+/// Audit PoC fixtures (fable-security-audit). Minimal ERC-20s whose whole external surface is on the scanner's
+/// SAFE list (name/symbol/decimals/totalSupply/balanceOf/allowance/transfer/transferFrom/approve/pair).
+abstract contract AuditERC20 {
+    string public name;
+    string public symbol;
+    uint8 public constant decimals = 18;
+    uint256 public totalSupply;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    address public immutable pair;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    /// @dev liquidity is minted straight to the (pre-created) pair, so no deployer exemption is needed.
+    constructor(string memory n, address pair_, uint256 liq, uint256 rest) {
+        name = n;
+        symbol = n;
+        pair = pair_;
+        totalSupply = liq + rest;
+        balanceOf[pair_] = liq;
+        balanceOf[msg.sender] = rest;
+        emit Transfer(address(0), pair_, liq);
+        emit Transfer(address(0), msg.sender, rest);
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        _beforeTransferFrom(from, to);
+        uint256 a = allowance[from][msg.sender];
+        if (a != type(uint256).max) {
+            require(a >= amount, "allowance");
+            allowance[from][msg.sender] = a - amount;
+        }
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    function _beforeTransferFrom(address from, address to) internal virtual {}
+
+    function _transfer(address from, address to, uint256 amount) internal virtual {
+        require(balanceOf[from] >= amount, "balance");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        emit Transfer(from, to, amount);
+    }
+}
+
+/// F-02: transfer() is honest, transferFrom() into the pair always fails. Every DEX-router sell uses transferFrom,
+/// so an EOA can never sell through PotatoSwap's router; the ExitProof probe (holder.transfer -> pair) passes.
+contract TransferFromTrap is AuditERC20 {
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("TFTRAP", p, liq, rest) {}
+
+    function _beforeTransferFrom(address, address to) internal view override {
+        require(to != pair, "no router sells");
+    }
+}
+
+/// F-03: a position can only be sold in the block in which it was received. No owner, no setter, no caller check,
+/// no knowledge of ExitProof. The same-transaction probe passes; one block later nobody can sell.
+contract SameBlockSellOnly is AuditERC20 {
+    mapping(address => uint256) private _lastIn;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("SBLOCK", p, liq, rest) {}
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair) require(_lastIn[from] == block.number, "too late");
+        _lastIn[to] = block.number;
+        super._transfer(from, to, amount);
+    }
+}
+
+/// Documented residual, ranked in the report: the seller must not be the transaction origin (blocks every EOA that
+/// sells directly or through a router; the ProbeHolder is never tx.origin).
+contract OriginSellerTrap is AuditERC20 {
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("ORIGIN", p, liq, rest) {}
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair) require(from != tx.origin, "eoa");
+        super._transfer(from, to, amount);
+    }
+}
+
+/// F-04a: hidden admin (no owner(), admin in a private slot) with an unlisted setter. Unscanned => balanced allows.
+contract HiddenAdminBomb is AuditERC20 {
+    address private _admin;
+    uint256 private _sellFeeBps;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("HIDDEN", p, liq, rest) {
+        _admin = msg.sender;
+    }
+
+    function setLaunchParam(uint256 v) external {
+        require(msg.sender == _admin, "na");
+        _sellFeeBps = v;
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair && _sellFeeBps != 0) {
+            uint256 fee = amount * _sellFeeBps / 10_000;
+            super._transfer(from, address(0xdead), fee);
+            amount -= fee;
+        }
+        super._transfer(from, to, amount);
+    }
+}
+
+/// F-04b: ordinary Ownable token whose fee setter simply has a name that is not on the scanner's DANGEROUS list.
+/// Scanned => privileged=1, dangerSetter=0, ownerCanTrap=0 => balanced allows with an active owner.
+contract RenamedSetterBomb is AuditERC20 {
+    address public owner;
+    uint256 private _sellFeeBps;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("RENAMED", p, liq, rest) {
+        owner = msg.sender;
+    }
+
+    function setSellFeeBps(uint256 v) external {
+        require(msg.sender == owner, "na");
+        _sellFeeBps = v;
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair && _sellFeeBps != 0) {
+            uint256 fee = amount * _sellFeeBps / 10_000;
+            super._transfer(from, address(0xdead), fee);
+            amount -= fee;
+        }
+        super._transfer(from, to, amount);
+    }
+}
+
+
+
+
+/// F-06: behaviour configured in STORAGE by the constructor (no immutables, so every instance has the same codehash).
+/// Instance A (sellUntil = max) is what the scanner sees; instance B (sellUntil = launch + 10 min) inherits A's
+/// codehash-keyed attestation.
+contract StorageConfigured {
+    string public name = "CFG";
+    string public symbol = "CFG";
+    uint8 public constant decimals = 18;
+    uint256 public totalSupply;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    address public pair;
+    uint256 private _sellUntil;
+
+    constructor(address pair_, uint256 liq, uint256 sellUntil_) {
+        pair = pair_;
+        _sellUntil = sellUntil_;
+        totalSupply = liq;
+        balanceOf[pair_] = liq;
+    }
+
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transfer(address to, uint256 a) external returns (bool) { _t(msg.sender, to, a); return true; }
+    function transferFrom(address f, address to, uint256 a) external returns (bool) {
+        allowance[f][msg.sender] -= a; _t(f, to, a); return true;
+    }
+    function _t(address f, address to, uint256 a) internal {
+        if (to == pair) require(block.timestamp <= _sellUntil, "closed");
+        balanceOf[f] -= a; balanceOf[to] += a;
+    }
+}
+
+/// F-03 variant: same-TRANSACTION sell only, via transient storage (TSTORE on receipt, TLOAD on sell).
+contract TransientSellOnly is AuditERC20 {
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("TSTORE", p, liq, rest) {}
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair) {
+            uint256 ok;
+            assembly { ok := tload(from) }
+            require(ok == 1, "tx");
+        }
+        assembly { tstore(to, 1) }
+        super._transfer(from, to, amount);
+    }
+}
+
+/// F-03 variant: sells are open only for 10 minutes after the seller received tokens (TIMESTAMP).
+contract SellWindowToken is AuditERC20 {
+    mapping(address => uint256) private _inAt;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("WINDOW", p, liq, rest) {}
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair) require(block.timestamp <= _inAt[from] + 600, "window");
+        _inAt[to] = block.timestamp;
+        super._transfer(from, to, amount);
+    }
+}
+
+/// F-02 variant: approve() returns true but stores nothing, so every router (transferFrom) sell fails.
+contract ApproveNoop is AuditERC20 {
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("NOAPPROVE", p, liq, rest) {}
+
+    function _beforeTransferFrom(address from, address) internal override {
+        allowance[from][msg.sender] = 0;
+    }
+}
+
+/// Honest control for the audit base: plain transfer/transferFrom, no owner, no block context.
+contract AuditPlain is AuditERC20 {
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("PLAIN", p, liq, rest) {}
+}

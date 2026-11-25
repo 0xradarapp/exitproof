@@ -1,38 +1,66 @@
-// L3 owner-power simulation. Runs ONLY against an anvil node (local or `anvil --fork-url`): it impersonates the
-// owner, calls every matched dangerous setter with worst-case arguments and re-tries a holder's full sell.
+// L3 sell + owner-power simulation (scanner v5). Runs ONLY against an anvil node (local or `anvil --fork-url`).
 // Everything happens between evm_snapshot / evm_revert; the node is always rewound to the initial snapshot.
 //
 // Procedure:
 //  1. Refuse unless web3_clientVersion contains "anvil".
-//  2. Static scan (scan.mjs) -> dangerous selectors (token + EIP-1967 implementation) and owner().
-//     Callers = owner(), deployer() (if the token exposes one), EIP-1967 admin slot: impersonated + funded.
-//  3. Holder: a fixed synthetic address buys ~1% of the quote reserve on `pair` (quote = the other pair token,
-//     funded via WETH-style deposit()). If the quote has no deposit(), fallback: the pair (impersonated) transfers
-//     1% of its token reserve to the holder and the pair is sync()ed.
-//  4. Baseline: holder sells its whole balance to the pair (transfer + swap, assuming a 1% pool fee so the K check
-//     passes on any <=1% fee fork). Quote received = `expected`. If the baseline fails, owner "unlock" calls present
-//     in the dispatcher (enableTrading/openTrading/startTrading/unpause/setTradingEnabled(true)/...,
-//     setAuthorizedBuyer(holder)) are applied cumulatively, re-buying if needed, until the baseline succeeds
-//     (launch-pending tokens are scanned at PairCreated time, before trading opens). If it still fails the token is
-//     untradeable now (the router's live probe catches that): no setter attempts, ownerCanTrap=false.
-//  5. For each dangerous setter (selector order) x argument variant x caller: snapshot, call setter (skip if it
-//     reverts), sell again, revert. trapped = sell reverts OR returns < 50% of `expected`.
-//     Arg variants per type: uintN -> 0, 99, 100, 10000, 2^N-1 (clamped); address -> pair, holder;
-//     bool -> true, false; address[] -> [holder, pair]. Full cartesian product if <= 32 combos, else
-//     index-aligned variants (all args take their k-th option). Signatures with other types are skipped.
-//  6. ownerCanTrap = any attempt trapped.
+//  2. Static scan (scan.mjs) at the fork block -> dangerous selectors, unknown selectors, owner().
+//     Callers (impersonated + funded): owner(), deployer() (if exposed), the EIP-1967 admin slot, `opts.callers`
+//     (the daemon passes the PairCreated sender) and up to 4 address-shaped words from storage slots 0..15 (a hidden
+//     admin kept in a plain slot).
+//  3. Actors are derived from the fork block hash and the token: holder = keccak(blockHash ++ token)[12:],
+//     router = keccak(that ++ "router")[12:]. Reproducible given the block, unpredictable before it (a token cannot
+//     whitelist the simulator). SimRouter (src/sim/SimRouter.sol) is installed at `router` with anvil_setCode: a V2
+//     router stand-in that sells with approve + transferFrom(user, pair) + swap, as a wallet user on PotatoSwap does.
+//  4. Position: the holder gets quote (WETH-style deposit(), else the pair transfers 3% of its quote reserve), approves
+//     the router and buys 1% (then 0.1%, 0.01%) of the quote reserve through it. Fallback: the pair transfers 1% of
+//     its token reserve to the holder (`acquiredVia: pair-transfer`).
+//  5. Sells (each in its own snapshot):
+//       immediate  = SimRouter.roundTrip: buy and sell back in ONE transaction (same block as receipt);
+//       delayed    = router sell of the whole position after +1 block, +60 s, +1 h, +1 day;
+//       transfer   = holder.transfer(pair) + swap (the old path) after +1 h.
+//     A sell "passes" when it executes and returns >= 50% of the no-tax V2 output for the amount sold.
+//     Baseline = the +1 h router sell (or +1 d if only that passes). If nothing passes, owner "unlock" calls present
+//     in the dispatcher (enableTrading/openTrading/.../setAuthorizedBuyer(holder)) are applied cumulatively and the
+//     sells re-measured.
+//  6. Signals (each makes the simulation verdict fail closed; all also set `privileged`, because balanced mode only
+//     denies ownerActive & danger and the router's ownerActive is `fl.privileged || owner() != 0`):
+//       delayed-sell-trap    immediate passes, some delayed sell fails           -> dangerSetter
+//       transferFrom-trap    transfer path passes, router (transferFrom) fails   -> ownerCanTrap
+//       baseline-sell-failed no sell passes at all, even after unlocks          -> ownerCanTrap
+//  7. Owner sweeps against the baseline state (snapshot, call, router sell, revert; trapped = sell fails or returns
+//     < 50% of the baseline):
+//       a. dangerous-list setters with typed worst-case args (uintN 0/99/100/10000/max, address pair/holder,
+//          bool, address[]), cartesian product <= 32 else index-aligned;
+//       b. F-04: every other dispatcher selector outside SAFE (ABI-less): four identical words for 0, max, 1, 10000,
+//          and [holder,1,1,1], [pair,1,1,1]. At most MAX_UNKNOWN_SELECTORS selectors and a wall-clock budget;
+//          an incomplete sweep with a privileged caller fails closed (`unknown-sweep-incomplete`).
+//     Any trapped attempt -> ownerCanTrap. An exception after a good baseline -> ownerCanTrap (simulate-error).
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
-  createPublicClient, http, encodeFunctionData, decodeFunctionResult, parseAbiItem, getAddress, toFunctionSelector,
+  createPublicClient, http, encodeFunctionData, decodeFunctionResult, decodeEventLog, parseAbi, parseAbiItem,
+  getAddress, toFunctionSelector, keccak256, concat, toHex, maxUint256,
 } from 'viem';
 import { scan } from './scan.mjs';
 import { isAddress20 } from './proxy.mjs';
+import { DANGEROUS } from './selectors.mjs';
 
-export const HOLDER = '0x000000000000000000000000000000000000E417';
-const TX_GAS = '0x2dc6c0'; // 3,000,000
+const DIR = path.dirname(fileURLToPath(import.meta.url));
+export const SIM_ROUTER = Object.freeze(JSON.parse(readFileSync(path.join(DIR, 'sim', 'sim-router.json'), 'utf8')));
+
+const TX_GAS = '0x7a1200'; // 8,000,000
 const FUND = '0x3635c9adc5dea00000'; // 1000 ether
 const ASSUMED_FEE_BPS = 100n;
 const MAX_COMBOS = 32;
-/** Owner "unlock" calls tried (in this order) when the baseline sell fails, e.g. trading not yet enabled. */
+export const DELAYS = Object.freeze([['+1block', 0], ['+60s', 60], ['+1h', 3600], ['+1d', 86400]]);
+export const MAX_UNKNOWN_SELECTORS = 40;
+export const UNKNOWN_PATTERNS = Object.freeze(['0', 'max', 'holder', 'pair', '1', '10000']);
+export const DEFAULT_BUDGET_MS = 180_000;
+const STORAGE_CALLER_SLOTS = 16;
+const MAX_STORAGE_CALLERS = 4;
+
+/** Owner "unlock" calls tried (in this order) when no sell passes, e.g. trading not yet enabled. */
 const UNLOCKS = [
   ['enableTrading()', () => []], ['openTrading()', () => []], ['startTrading()', () => []], ['unpause()', () => []],
   ['enableTrading(bool)', () => [true]], ['setTradingEnabled(bool)', () => [true]], ['setTrading(bool)', () => [true]],
@@ -40,18 +68,27 @@ const UNLOCKS = [
   ['setAuthorizedBuyer(address)', (c) => [c.holder]],
 ];
 
-const ERC20 = [
-  parseAbiItem('function balanceOf(address) view returns (uint256)'),
-  parseAbiItem('function transfer(address,uint256) returns (bool)'),
-  parseAbiItem('function deposit() payable'),
-];
-const PAIR = [
-  parseAbiItem('function token0() view returns (address)'),
-  parseAbiItem('function token1() view returns (address)'),
-  parseAbiItem('function getReserves() view returns (uint112,uint112,uint32)'),
-  parseAbiItem('function swap(uint256,uint256,address,bytes)'),
-  parseAbiItem('function sync()'),
-];
+const ERC20 = parseAbi([
+  'function balanceOf(address) view returns (uint256)',
+  'function transfer(address,uint256) returns (bool)',
+  'function approve(address,uint256) returns (bool)',
+  'function deposit() payable',
+]);
+const PAIR = parseAbi([
+  'function token0() view returns (address)',
+  'function token1() view returns (address)',
+  'function getReserves() view returns (uint112,uint112,uint32)',
+  'function swap(uint256,uint256,address,bytes)',
+  'function sync()',
+]);
+const ROUTER_ABI = parseAbi([
+  'function buy(address pair, address quote, address token, uint256 qIn, uint256 feeBps)',
+  'function sell(address pair, address quote, address token, uint256 amount, uint256 feeBps)',
+  'function roundTrip(address pair, address quote, address token, uint256 qIn, uint256 feeBps)',
+  'event Bought(bool ok, uint256 got)',
+  'event Sold(bool ok, uint8 stage, uint256 amount, uint256 expectedOut, uint256 actualOut)',
+]);
+const SELL_STAGES = ['ok', 'reserves', 'transferFrom', 'nothing-arrived', 'swap', 'no-quote-received'];
 const DEPLOYER = parseAbiItem('function deployer() view returns (address)');
 
 const amountOut = (amountIn, rIn, rOut) => {
@@ -59,6 +96,13 @@ const amountOut = (amountIn, rIn, rOut) => {
   const inFee = amountIn * (10000n - ASSUMED_FEE_BPS);
   return (inFee * rOut) / (rIn * 10000n + inFee);
 };
+
+/** Simulation actors for `token` at the block with hash `blockHash` (reproducible given the block). */
+export function deriveActors(blockHash, token) {
+  const h = keccak256(concat([blockHash, getAddress(token)]));
+  const r = keccak256(concat([h, toHex('router')]));
+  return { holder: getAddress(`0x${h.slice(-40)}`), router: getAddress(`0x${r.slice(-40)}`) };
+}
 
 function argOptions(type, ctx) {
   const m = /^uint(\d*)$/.exec(type);
@@ -89,7 +133,23 @@ export function argVariants(signature, ctx) {
   return Array.from({ length: k }, (_, i) => opts.map((o) => o[i % o.length]));
 }
 
+const word = (v) => BigInt(v).toString(16).padStart(64, '0');
+/** ABI-less worst-case calldata for an unknown selector: four 32-byte words (extra words are ignored by solc). */
+export function unknownCalldata(selector, pattern, ctx) {
+  const W = {
+    0: [0n, 0n, 0n, 0n], max: [maxUint256, maxUint256, maxUint256, maxUint256], 1: [1n, 1n, 1n, 1n],
+    10000: [10000n, 10000n, 10000n, 10000n], holder: [ctx.holder, 1n, 1n, 1n], pair: [ctx.pair, 1n, 1n, 1n],
+  }[pattern];
+  if (!W) throw new Error(`unknown pattern ${pattern}`);
+  return `${selector}${W.map(word).join('')}`;
+}
+
 const toJson = (v) => (typeof v === 'bigint' ? v.toString() : Array.isArray(v) ? v.map(toJson) : v);
+const passes = (r) => !!r && r.ok && r.expected > 0n && r.actual * 2n >= r.expected;
+const sellJson = (r) => (r ? {
+  ok: r.ok, stage: r.stage, passes: passes(r), amount: r.amount.toString(), expectedOut: r.expected.toString(),
+  actualOut: r.actual.toString(),
+} : null);
 
 export async function assertAnvil(client) {
   let v = '';
@@ -97,14 +157,34 @@ export async function assertAnvil(client) {
   if (!/anvil/i.test(v)) throw new Error(`simulate: refusing non-anvil RPC (web3_clientVersion=${v || 'n/a'})`);
 }
 
+/**
+ * Folds a simulation result into a scan result (mutates and returns `r`): flags are only ever raised.
+ */
+export function mergeSimulation(r, sim) {
+  r.ownerCanTrap = !!(r.ownerCanTrap || sim.ownerCanTrap);
+  r.dangerSetter = !!(r.dangerSetter || sim.dangerSetter);
+  r.privileged = !!(r.privileged || sim.privileged);
+  r.evidence.simulation = sim.evidence;
+  if (sim.timing) r.evidence.simulationTiming = sim.timing;
+  return r;
+}
+
+/**
+ * simulate(forkRpc, token, pair, opts) -> { ownerCanTrap, dangerSetter, privileged, signals, evidence, timing }
+ * opts: holder (override the derived holder; tests only), callers (extra privileged callers), budgetMs,
+ * maxUnknown, unknown (false = skip the F-04 sweep).
+ */
 export async function simulate(forkRpc, token, pairAddr, opts = {}) {
+  const t0 = Date.now();
   const client = createPublicClient({ transport: http(forkRpc) });
   await assertAnvil(client);
   const rpc = (method, params = []) => client.request({ method, params });
   token = getAddress(token);
   const pair = getAddress(pairAddr);
-  const holder = getAddress(opts.holder ?? HOLDER);
+  const budgetMs = opts.budgetMs ?? DEFAULT_BUDGET_MS;
+  const maxUnknown = opts.maxUnknown ?? MAX_UNKNOWN_SELECTORS;
   const impersonated = new Set();
+  const timing = {};
 
   const read = async (address, abi, functionName, args = []) => {
     const data = encodeFunctionData({ abi, functionName, args });
@@ -119,41 +199,73 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
     }
     await rpc('anvil_setBalance', [who, FUND]);
   };
-  const send = async (from, to, data, value = 0n) => {
+  /** Sends a tx from an impersonated account; returns the receipt or null (rejected / reverted / not mined). */
+  const sendTx = async (from, to, data, value = 0n) => {
     try {
       const hash = await rpc('eth_sendTransaction', [{
         from, to, data, gas: TX_GAS, value: `0x${value.toString(16)}`,
       }]);
-      for (let i = 0; i < 200; i++) {
+      for (let i = 0; i < 400; i++) {
         const r = await rpc('eth_getTransactionReceipt', [hash]);
-        if (r) return r.status === '0x1';
+        if (r) return r.status === '0x1' ? r : null;
         await new Promise((res) => setTimeout(res, 10));
       }
-      return false;
+      return null;
     } catch {
-      return false; // node-side rejection (e.g. revert surfaced at submission)
+      return null; // node-side rejection (e.g. revert surfaced at submission)
     }
   };
+  const send = async (...a) => (await sendTx(...a)) !== null;
   const snapshot = () => rpc('evm_snapshot');
   const revert = async (id) => {
     if (!(await rpc('evm_revert', [id]))) throw new Error(`simulate: evm_revert(${id}) failed`);
   };
+  const inSnapshot = async (fn) => {
+    const snap = await snapshot();
+    try { return await fn(); } finally { await revert(snap); }
+  };
+  const advance = async (secs) => {
+    if (secs > 0) await rpc('evm_increaseTime', [secs]);
+    await rpc('evm_mine');
+  };
 
   const initial = await snapshot();
   const run = async () => {
-    const s = await scan(client, token, { blockNumber: await client.getBlockNumber({ cacheTime: 0 }) });
-    const setters = s.evidence.dangerous;
+    const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
+    const block = await client.getBlock({ blockNumber });
+    const s = await scan(client, token, { blockNumber });
+    const actors = deriveActors(block.hash, token);
+    const holder = getAddress(opts.holder ?? actors.holder);
+    const { router } = actors;
+    await rpc('anvil_setCode', [router, SIM_ROUTER.runtime]);
 
+    const [t0a, t1a] = [await read(pair, PAIR, 'token0'), await read(pair, PAIR, 'token1')];
+    if (getAddress(t0a) !== token && getAddress(t1a) !== token) throw new Error('simulate: token not in pair');
+    const tokenIs0 = getAddress(t0a) === token;
+    const quote = getAddress(tokenIs0 ? t1a : t0a);
+
+    // ---- privileged callers ----
     const callers = [];
-    const addCaller = (a) => { if (isAddress20(a) && BigInt(a) !== 0n && !callers.includes(getAddress(a))) callers.push(getAddress(a)); };
+    const exclude = new Set([token, pair, quote, holder, router]);
+    const addCaller = (a) => {
+      if (!isAddress20(a) || BigInt(a) <= 0xffffn) return;
+      const g = getAddress(a);
+      if (!exclude.has(g) && !callers.includes(g)) callers.push(g);
+    };
     addCaller(s.evidence.owner);
     addCaller(await tryRead(token, [DEPLOYER], 'deployer'));
     addCaller(s.evidence.proxySlots.eip1967Admin);
+    for (const c of opts.callers ?? []) addCaller(c);
+    const storageCallers = [];
+    for (let i = 0; i < STORAGE_CALLER_SLOTS && storageCallers.length < MAX_STORAGE_CALLERS; i++) {
+      const w = BigInt(await client.getStorageAt({ address: token, slot: toHex(i, { size: 32 }), blockNumber }) ?? '0x0');
+      if (w >> 160n !== 0n || w < 1n << 120n) continue; // not address-shaped (amounts, flags, packed words)
+      const a = getAddress(`0x${w.toString(16).padStart(40, '0')}`);
+      if (exclude.has(a) || callers.includes(a)) continue;
+      storageCallers.push(a);
+      callers.push(a);
+    }
 
-    const [t0, t1] = [await read(pair, PAIR, 'token0'), await read(pair, PAIR, 'token1')];
-    if (getAddress(t0) !== token && getAddress(t1) !== token) throw new Error('simulate: token not in pair');
-    const tokenIs0 = getAddress(t0) === token;
-    const quote = getAddress(tokenIs0 ? t1 : t0);
     const reserves = async () => {
       const [r0, r1] = await read(pair, PAIR, 'getReserves');
       return tokenIs0 ? { rT: r0, rQ: r1 } : { rT: r1, rQ: r0 };
@@ -163,68 +275,122 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
     const swapData = (outT, outQ, to) => encodeFunctionData({
       abi: PAIR, functionName: 'swap', args: [tokenIs0 ? outT : outQ, tokenIs0 ? outQ : outT, to, '0x'],
     });
+    const routerLogs = (rc) => (rc?.logs ?? [])
+      .filter((l) => getAddress(l.address) === router)
+      .map((l) => { try { return decodeEventLog({ abi: ROUTER_ABI, data: l.data, topics: l.topics }); } catch { return null; } })
+      .filter(Boolean);
+    const soldOf = (rc) => {
+      const e = routerLogs(rc).find((x) => x.eventName === 'Sold');
+      if (!e) return { ok: false, stage: rc ? 'no-event' : 'reverted', amount: 0n, expected: 0n, actual: 0n };
+      return {
+        ok: e.args.ok, stage: SELL_STAGES[e.args.stage] ?? String(e.args.stage), amount: e.args.amount,
+        expected: e.args.expectedOut, actual: e.args.actualOut,
+      };
+    };
+    const approveRouter = (t) => send(holder, t, encodeFunctionData({ abi: ERC20, functionName: 'approve', args: [router, maxUint256] }));
 
-    // ---- acquire a holder position ----
     await impersonate(holder);
     for (const c of callers) await impersonate(c);
+
+    // ---- holder funding + position ----
+    const fundQuote = async () => {
+      const { rQ } = await reserves();
+      const amt = (rQ * 3n) / 100n;
+      if (amt === 0n) return 'none';
+      if (await send(holder, quote, encodeFunctionData({ abi: ERC20, functionName: 'deposit' }), amt)) return 'deposit';
+      await impersonate(pair);
+      const ok = await send(pair, quote, encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [holder, amt] }));
+      await send(holder, pair, encodeFunctionData({ abi: PAIR, functionName: 'sync' }));
+      return ok ? 'pair-transfer' : 'none';
+    };
+    const funding = await fundQuote();
+    await approveRouter(quote);
+    let qIn = 0n;
     const acquire = async () => {
       const { rT, rQ } = await reserves();
-      const qIn = rQ / 100n;
-      const funded = qIn > 0n
-        && await send(holder, quote, encodeFunctionData({ abi: ERC20, functionName: 'deposit' }), qIn)
-        && await send(holder, quote, encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [pair, qIn] }));
-      const out = amountOut(qIn, rQ, rT);
-      let via = 'buy';
-      if (!funded || out === 0n || !(await send(holder, pair, swapData(out, 0n, holder)))) {
-        via = 'pair-transfer';
-        await impersonate(pair);
-        await send(pair, token, encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [holder, rT / 100n] }));
-        await send(holder, pair, encodeFunctionData({ abi: PAIR, functionName: 'sync' }));
+      for (const div of [100n, 1000n, 10000n]) {
+        const q = rQ / div;
+        if (q === 0n) continue;
+        const rc = await sendTx(holder, router, encodeFunctionData({
+          abi: ROUTER_ABI, functionName: 'buy', args: [pair, quote, token, q, ASSUMED_FEE_BPS],
+        }));
+        const e = routerLogs(rc).find((x) => x.eventName === 'Bought');
+        if (e?.args.ok && e.args.got > 0n) { qIn = q; return `buy-1/${div}`; }
       }
-      await rpc('evm_increaseTime', [3600]);
-      await rpc('evm_mine');
-      return via;
+      await impersonate(pair);
+      await send(pair, token, encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [holder, rT / 100n] }));
+      await send(holder, pair, encodeFunctionData({ abi: PAIR, functionName: 'sync' }));
+      return 'pair-transfer';
     };
 
-    const sell = async () => {
+    const routerSell = async () => soldOf(await sendTx(holder, router, encodeFunctionData({
+      abi: ROUTER_ABI, functionName: 'sell', args: [pair, quote, token, 0n, ASSUMED_FEE_BPS],
+    })));
+    const transferSell = async () => {
       try {
-        return await sellOnce();
+        const amt = await bal(token, holder);
+        if (amt === 0n) return { ok: false, stage: 'no-position', amount: 0n, expected: 0n, actual: 0n };
+        const { rT, rQ } = await reserves();
+        const expected = amountOut(amt, rT, rQ);
+        const q0 = await bal(quote, holder);
+        const fail = (stage) => ({ ok: false, stage, amount: amt, expected, actual: 0n });
+        if (!(await send(holder, token, encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [pair, amt] })))) {
+          return fail('transfer');
+        }
+        const actualIn = (await bal(token, pair)) - rT;
+        const out = amountOut(actualIn, rT, rQ);
+        if (out <= 0n) return fail('nothing-arrived');
+        if (!(await send(holder, pair, swapData(0n, out, holder)))) return fail('swap');
+        return { ok: true, stage: 'ok', amount: amt, expected, actual: (await bal(quote, holder)) - q0 };
       } catch {
-        return { ok: false, out: 0n }; // e.g. balanceOf no longer decodes after a hostile upgrade
+        return { ok: false, stage: 'unreadable', amount: 0n, expected: 0n, actual: 0n };
       }
-    };
-    const sellOnce = async () => {
-      const amt = await bal(token, holder);
-      if (amt === 0n) return { ok: false, out: 0n };
-      const q0 = await bal(quote, holder);
-      if (!(await send(holder, token, encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [pair, amt] })))) {
-        return { ok: false, out: 0n };
-      }
-      const { rT, rQ } = await reserves();
-      const actualIn = (await bal(token, pair)) - rT;
-      const out = amountOut(actualIn, rT, rQ);
-      if (out === 0n || !(await send(holder, pair, swapData(0n, out, holder)))) return { ok: false, out: 0n };
-      return { ok: true, out: (await bal(quote, holder)) - q0 };
     };
 
-    const measure = async () => {
-      const snap = await snapshot();
-      const r = await sell();
-      await revert(snap);
-      return r;
+    /** Full sell measurement from the current state; leaves the chain advanced to the baseline time. */
+    const measureAll = async () => {
+      let via = null;
+      if (((await safeBal(token, holder)) ?? 0n) === 0n) via = await acquire();
+      await approveRouter(token);
+      const immediate = qIn > 0n
+        ? await inSnapshot(async () => soldOf(await sendTx(holder, router, encodeFunctionData({
+          abi: ROUTER_ABI, functionName: 'roundTrip', args: [pair, quote, token, qIn, ASSUMED_FEE_BPS],
+        }))))
+        : null; // could not buy through the router: no same-transaction measurement
+      const delayed = [];
+      for (const [label, secs] of DELAYS) {
+        delayed.push({ label, ...(await inSnapshot(async () => { await advance(secs); return routerSell(); })) });
+      }
+      // move to the baseline time: +1 h, or +1 d when only that one passes
+      const dl = Object.fromEntries(delayed.map((d) => [d.label, d]));
+      const at = !passes(dl['+1h']) && passes(dl['+1d']) ? '+1d' : '+1h';
+      await advance(at === '+1d' ? 86400 : 3600);
+      const transfer = await inSnapshot(transferSell);
+      return { via, immediate, delayed, transfer, baselineAt: at, baseline: dl[at] };
     };
 
     const evidence = {
-      callers, holder, quote, acquiredVia: await acquire(), position: '0', unlockedBy: [],
-      baselineSellOk: false, expectedOut: '0', attempts: [], skipped: [],
+      block: { number: blockNumber.toString(), hash: block.hash }, holder, holderDerived: !opts.holder, router,
+      routerRuntimeHash: keccak256(SIM_ROUTER.runtime), callers, storageCallers, quote, funding,
+      acquiredVia: null, position: '0', unlockedBy: [], baselineSellOk: false, baselineAt: null, expectedOut: '0',
+      immediate: null, delayed: [], transferSell: null, signals: [], attempts: [], skipped: [],
+      unknownAttempts: [], unknownSweep: null,
     };
-    let baseline = await measure();
+    const record = (m) => {
+      if (m.via) evidence.acquiredVia = m.via;
+      evidence.immediate = sellJson(m.immediate);
+      evidence.delayed = m.delayed.map((d) => ({ label: d.label, ...sellJson(d) }));
+      evidence.transferSell = sellJson(m.transfer);
+      evidence.baselineAt = m.baselineAt;
+    };
+    const anyPass = (m) => passes(m.immediate) || m.delayed.some(passes) || passes(m.transfer);
 
-    // Launch-pending tokens (trading disabled / paused / allow-listed buyer) are scanned at PairCreated time: let
-    // the owner unlock first so the trap attempts below run against the tradeable state. Unlock calls are
-    // cumulative (each successful one is kept) until the baseline sell succeeds.
-    if (!baseline.ok) {
-      const present = new Set(setters.map((d) => d.signature));
+    let m = await measureAll();
+    record(m);
+    // Launch-pending tokens (trading disabled / paused / allow-listed buyer): let the owner unlock first so the
+    // checks below run against the tradeable state. Unlock calls are cumulative.
+    if (!passes(m.baseline) && !anyPass(m)) {
+      const present = new Set(s.evidence.dangerous.map((d) => d.signature));
       for (const [signature, argsOf] of UNLOCKS) {
         if (!present.has(signature)) continue;
         const data = encodeFunctionData({
@@ -236,25 +402,40 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
         for (const caller of callers) if ((applied = await send(caller, token, data))) break;
         if (!applied) continue;
         evidence.unlockedBy.push(signature);
-        if ((await safeBal(token, holder)) === 0n) evidence.acquiredVia = await acquire();
-        baseline = await measure();
-        if (baseline.ok && baseline.out > 0n) break;
+        m = await measureAll();
+        record(m);
+        if (passes(m.baseline)) break;
       }
     }
+    timing.sellsMs = Date.now() - t0;
+
     const pos = await safeBal(token, holder);
     evidence.position = pos === null ? 'unreadable' : pos.toString();
-    evidence.baselineSellOk = baseline.ok;
-    evidence.expectedOut = baseline.out.toString();
-    if (!baseline.ok || baseline.out === 0n) {
-      if (evidence.position === '0') evidence.note = 'no holder position';
-      return { ownerCanTrap: false, evidence };
-    }
+    evidence.baselineSellOk = !!m.baseline?.ok;
+    evidence.expectedOut = (m.baseline?.actual ?? 0n).toString();
 
+    const out = { ownerCanTrap: false, dangerSetter: false, privileged: false, signals: evidence.signals, evidence, timing };
+    const signal = (name, flag) => {
+      evidence.signals.push(name);
+      out[flag] = true;
+      out.privileged = true;
+    };
+    if (passes(m.immediate) && m.delayed.some((d) => !passes(d))) signal('delayed-sell-trap', 'dangerSetter');
+    if (passes(m.transfer) && !passes(m.baseline)) signal('transferFrom-trap', 'ownerCanTrap');
+    if (!anyPass(m)) {
+      if (evidence.position === '0') evidence.note = 'no holder position';
+      signal('baseline-sell-failed', 'ownerCanTrap');
+    }
+    if (!passes(m.baseline)) return out; // no baseline to compare owner actions against
+
+    const baseline = m.baseline;
     const ctx = { pair, holder };
-    let trappedAny = false;
-    // After a good baseline, any failure to finish the owner-power sweep is treated as a trap (fail closed).
+    const trappedBy = (r) => !r.ok || r.actual * 2n < baseline.actual;
+    // After a good baseline, any failure to finish the owner-power sweeps is treated as a trap (fail closed).
     try {
-      for (const { signature } of setters) {
+      // ---- a. dangerous-list setters (typed args) ----
+      const ta = Date.now();
+      for (const { signature } of s.evidence.dangerous) {
         const variants = argVariants(signature, ctx);
         if (!variants) { evidence.skipped.push(signature); continue; }
         const abi = [parseAbiItem(`function ${signature}`)];
@@ -263,28 +444,81 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
           const data = encodeFunctionData({ abi, functionName: name, args });
           if (data.slice(0, 10) !== toFunctionSelector(signature)) throw new Error('selector mismatch');
           for (const caller of callers) {
-            const snap = await snapshot();
-            const setOk = await send(caller, token, data);
-            let attempt = null;
-            if (setOk) {
-              const r = await sell();
-              const trapped = !r.ok || r.out * 2n < baseline.out;
-              trappedAny ||= trapped;
-              attempt = { signature, args: toJson(args), caller, sellOk: r.ok, out: r.out.toString(), trapped };
-            }
-            await revert(snap);
+            const attempt = await inSnapshot(async () => {
+              if (!(await send(caller, token, data))) return null;
+              const r = await routerSell();
+              return { signature, args: toJson(args), caller, sellOk: r.ok, out: r.actual.toString(), trapped: trappedBy(r) };
+            });
             if (attempt) {
               evidence.attempts.push(attempt);
+              if (attempt.trapped) out.ownerCanTrap = true;
               break; // one successful caller per variant is enough
             }
           }
         }
       }
+      timing.dangerousMs = Date.now() - ta;
+
+      // ---- b. F-04: unknown selectors, ABI-less worst-case words ----
+      if (opts.unknown !== false) {
+        const tb = Date.now();
+        const dangerousSel = new Set(s.evidence.dangerous.map((d) => d.selector));
+        const unknown = s.evidence.unknownSelectors.filter((x) => !DANGEROUS[x] && !dangerousSel.has(x));
+        const todo = unknown.slice(0, maxUnknown);
+        const sweep = {
+          selectors: unknown.length, tried: 0, patterns: UNKNOWN_PATTERNS.length, calls: 0, complete: true,
+          truncatedBy: null, callers: callers.length, trapped: [],
+        };
+        evidence.unknownSweep = sweep;
+        if (unknown.length > maxUnknown) { sweep.complete = false; sweep.truncatedBy = `max-selectors(${maxUnknown})`; }
+        if (callers.length) {
+          outer: for (const selector of todo) {
+            sweep.tried++;
+            for (const pattern of UNKNOWN_PATTERNS) {
+              if (Date.now() - t0 > budgetMs) {
+                sweep.complete = false;
+                sweep.truncatedBy = `budget(${budgetMs}ms)`;
+                break outer;
+              }
+              const data = unknownCalldata(selector, pattern, ctx);
+              for (const caller of callers) {
+                sweep.calls++;
+                const attempt = await inSnapshot(async () => {
+                  if (!(await send(caller, token, data))) return null;
+                  const r = await routerSell();
+                  return { selector, pattern, caller, sellOk: r.ok, out: r.actual.toString(), trapped: trappedBy(r) };
+                });
+                if (!attempt) continue;
+                if (attempt.trapped) {
+                  evidence.unknownAttempts.push(attempt);
+                  if (!sweep.trapped.includes(selector)) sweep.trapped.push(selector);
+                  out.ownerCanTrap = true;
+                }
+                break; // first caller whose call succeeds
+              }
+            }
+          }
+          for (const sel of sweep.trapped) evidence.signals.push(`unknown-setter-trap:${sel}`);
+          if (!sweep.complete) {
+            evidence.signals.push('unknown-sweep-incomplete');
+            out.ownerCanTrap = true;
+          }
+        } else if (unknown.length) {
+          sweep.complete = false;
+          sweep.truncatedBy = 'no-privileged-caller';
+        }
+        timing.unknownMs = Date.now() - tb;
+      }
     } catch (e) {
       evidence.error = `simulate-error: ${e.shortMessage ?? e.message}`;
-      return { ownerCanTrap: true, evidence };
+      evidence.signals.push('simulate-error');
+      out.ownerCanTrap = true;
+      out.privileged = true;
+      return out;
     }
-    return { ownerCanTrap: trappedAny, evidence };
+    if (evidence.attempts.some((a) => a.trapped)) evidence.signals.push('dangerous-setter-trap');
+    out.privileged ||= out.ownerCanTrap;
+    return out;
   };
   let result;
   let thrown = null;
@@ -305,5 +539,7 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
   }
   if (thrown) throw thrown;
   if (restoreError) result.evidence.restoreError = restoreError;
+  timing.totalMs = Date.now() - t0;
+  result.timing = timing;
   return result;
 }

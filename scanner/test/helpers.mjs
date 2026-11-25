@@ -130,3 +130,26 @@ export async function deployScannerFixture(env, name, args = []) {
   return { address: r.contractAddress, abi: a.abi };
 }
 
+
+/**
+ * Audit-style launch (fable-security-audit Appendix B): create the pair for the predicted token address first,
+ * then (now or later via `finish()`) deploy the ScannerFixtures token that mints its liquidity straight to the pair,
+ * then add WOKB and sync. Returns { predicted, pair, finish, token }.
+ */
+export async function launchAudit(env, infra, name, { deployNow = true, liq = 100_000n * 10n ** 18n, rest = 900_000n * 10n ** 18n, okb = parseEther('10') } = {}) {
+  const { getContractAddress } = await import('viem');
+  const nonce = await env.pub.getTransactionCount({ address: env.account.address });
+  const predicted = getContractAddress({ from: env.account.address, nonce: BigInt(nonce + 1) });
+  await write(env, infra.factory, 'createPair', [predicted, infra.wokb.address]);
+  const pairAddr = await read(env, infra.factory, 'getPair', [predicted, infra.wokb.address]);
+  const pair = { address: pairAddr, abi: artifact('V2.sol', 'MockV2Pair').abi };
+  const finish = async () => {
+    const t = await deployScannerFixture(env, name, [pairAddr, liq, rest]);
+    if (t.address.toLowerCase() !== predicted.toLowerCase()) throw new Error('launchAudit: address prediction failed');
+    await write(env, infra.wokb, 'deposit', [], okb);
+    await write(env, infra.wokb, 'transfer', [pairAddr, okb]);
+    await write(env, pair, 'mint', [env.account.address]);
+    return t;
+  };
+  return { predicted, pair, finish, token: deployNow ? await finish() : null };
+}

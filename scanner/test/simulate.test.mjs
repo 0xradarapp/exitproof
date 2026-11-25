@@ -1,7 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { simulate } from '../src/simulate.mjs';
+import { simulate, deriveActors, SIM_ROUTER } from '../src/simulate.mjs';
 import {
   startAnvil, deployInfra, deployToken, listToken, read, deployScannerFixture, SUPPLY,
 } from './helpers.mjs';
@@ -35,7 +35,7 @@ test('TimeBombToken: owner can raise sell fee => ownerCanTrap; state restored af
 test('TimeBombToken evidence: real buy, fee 0 harmless, fee 10000 traps', async () => {
   const { token, pair } = await setup('TimeBombToken');
   const r = await simulate(env.rpc, token.address, pair.address);
-  assert.equal(r.evidence.acquiredVia, 'buy');
+  assert.match(r.evidence.acquiredVia, /^buy-/);
   const bySet = Object.fromEntries(r.evidence.attempts.map((a) => [a.args[0], a]));
   assert.equal(bySet['0'].trapped, false);
   assert.equal(bySet['10000'].trapped, true);
@@ -74,18 +74,24 @@ test('TradingDisabled: owner unlock (enableTrading) is applied first, then sette
   assert.equal(await read(env, token, 'tradingEnabled'), false);
 });
 
-test('BlacklistOnBuy: no owner, buyer trapped by code => baseline fails, no unlock, ownerCanTrap false', async () => {
+// v5 (F-03): a failing baseline is a trap signal, not "the live probe covers it". The live probe only sells in the
+// buy transaction; a token that cannot be sold at all from the simulator's position is reported, fail closed.
+test('BlacklistOnBuy: no owner, buyer trapped by code => no sell passes => baseline-sell-failed, ownerCanTrap', async () => {
   const { token, pair } = await setup('BlacklistOnBuy');
   const r = await simulate(env.rpc, token.address, pair.address);
   assert.equal(r.evidence.baselineSellOk, false);
   assert.deepEqual(r.evidence.unlockedBy, []);
-  assert.equal(r.ownerCanTrap, false);
+  assert.equal(r.ownerCanTrap, true);
+  assert.equal(r.privileged, true);
+  assert.ok(r.signals.includes('baseline-sell-failed'));
 });
 
 test('simulate is deterministic on the same state', async () => {
   const { token, pair } = await setup('TimeBombToken');
   const a = await simulate(env.rpc, token.address, pair.address);
   const b = await simulate(env.rpc, token.address, pair.address);
+  delete a.timing; // wall-clock only
+  delete b.timing;
   assert.deepEqual(a, b);
 });
 
@@ -111,8 +117,11 @@ test('simulate refuses a non-anvil RPC (never writes to a real chain)', async ()
   }
 });
 
-/** JSON-RPC proxy in front of anvil that fails every evm_snapshot once an evm_revert has been seen. */
-async function faultyProxy(upstream) {
+/**
+ * JSON-RPC proxy in front of anvil that fails every evm_snapshot once the first owner transaction has been seen
+ * (the owner sweeps only start after a good baseline).
+ */
+async function faultyProxy(upstream, owner) {
   let armed = false;
   const srv = http.createServer((req, res) => {
     let body = '';
@@ -124,7 +133,7 @@ async function faultyProxy(upstream) {
         res.end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'injected fault' } }));
         return;
       }
-      if (msg.method === 'evm_revert') armed = true;
+      if (msg.method === 'eth_sendTransaction' && msg.params[0].from.toLowerCase() === owner.toLowerCase()) armed = true;
       const r = await fetch(upstream, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
       res.end(await r.text());
     });
@@ -136,7 +145,7 @@ async function faultyProxy(upstream) {
 test('an exception after the baseline => ownerCanTrap=true with simulate-error evidence; chain restored', async () => {
   const { token, pair } = await setup('TimeBombToken');
   const block = await env.pub.getBlockNumber({ cacheTime: 0 });
-  const p = await faultyProxy(env.rpc);
+  const p = await faultyProxy(env.rpc, env.account.address);
   try {
     const r = await simulate(p.url, token.address, pair.address);
     assert.equal(r.evidence.baselineSellOk, true);
@@ -148,13 +157,31 @@ test('an exception after the baseline => ownerCanTrap=true with simulate-error e
   assert.equal(await env.pub.getBlockNumber({ cacheTime: 0 }), block);
 });
 
-test('balanceOf(holder) reverting does not throw out of simulate (pre-baseline: no trap claim)', async () => {
+test('balanceOf(holder) reverting does not throw out of simulate (fail closed: baseline-sell-failed)', async () => {
+  const token = await deployScannerFixture(env, 'HolderRevertToken', [SUPPLY]);
+  const pair = await listToken(env, infra, token);
+  // the fixture special-cases the v4 fixed simulator holder; pin it to exercise the unreadable-balance path
+  const r = await simulate(env.rpc, token.address, pair.address, { holder: '0x000000000000000000000000000000000000E417' });
+  assert.equal(r.ownerCanTrap, true);
+  assert.equal(r.evidence.baselineSellOk, false);
+  assert.equal(r.evidence.position, 'unreadable');
+  assert.ok(r.signals.includes('baseline-sell-failed'));
+});
+
+test('holder is derived from the block hash + token: the v4 fixed-holder whitelist no longer works', async () => {
   const token = await deployScannerFixture(env, 'HolderRevertToken', [SUPPLY]);
   const pair = await listToken(env, infra, token);
   const r = await simulate(env.rpc, token.address, pair.address);
-  assert.equal(r.ownerCanTrap, false);
-  assert.equal(r.evidence.baselineSellOk, false);
-  assert.equal(r.evidence.position, 'unreadable');
+  const block = await env.pub.getBlock();
+  const expect = deriveActors(block.hash, token.address);
+  assert.equal(r.evidence.holder, expect.holder);
+  assert.equal(r.evidence.router, expect.router);
+  assert.equal(r.evidence.block.hash, block.hash);
+  assert.equal(r.evidence.holderDerived, true);
+  assert.notEqual(r.evidence.holder.toLowerCase(), '0x000000000000000000000000000000000000e417');
+  assert.equal(r.evidence.baselineSellOk, true, 'balanceOf works for the derived holder');
+  // a different token at the same block gets a different holder
+  assert.notEqual(deriveActors(block.hash, pair.address).holder, expect.holder);
 });
 
 test('a failing final evm_revert does not replace the trap result', async () => {
@@ -186,3 +213,13 @@ test('a failing final evm_revert does not replace the trap result', async () => 
   }
 });
 
+
+test('SimRouter runtime in sim-router.json is reproducible from src/sim/SimRouter.sol (when solc 0.8.24 is installed)', async (t) => {
+  const { existsSync, readFileSync } = await import('node:fs');
+  const { compileSimRouter, SOLC } = await import('../src/sim/build.mjs');
+  const { keccak256, toHex } = await import('viem');
+  const source = readFileSync(new URL('../src/sim/SimRouter.sol', import.meta.url), 'utf8');
+  assert.equal(SIM_ROUTER.sourceHash, keccak256(toHex(source)), 'sim-router.json is stale: node scanner/src/sim/build.mjs');
+  if (!existsSync(SOLC)) { t.skip(`solc not found at ${SOLC}`); return; }
+  assert.equal(compileSimRouter().runtime, SIM_ROUTER.runtime);
+});

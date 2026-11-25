@@ -31,7 +31,7 @@ import { keccak256, hexToBytes, bytesToHex, getAddress } from 'viem';
 import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS, CORE_ERC20, SAFE } from './selectors.mjs';
 import { readProxySlots, UPGRADE_SLOTS, isAddress20 } from './proxy.mjs';
 
-export const SCANNER_VERSION = 4;
+export const SCANNER_VERSION = 5;
 const OWNER_CALL_GAS = 100_000n;
 
 const JUMP = 0x56, JUMPI = 0x57, JUMPDEST = 0x5b, PUSH0 = 0x5f, EQ = 0x14;
@@ -149,7 +149,7 @@ const sig = (st) => st.map((v) => (v === null ? '_' : typeof v === 'bigint' ? v.
  * detection pass) and whether any jump target stayed unresolved.
  */
 const MAX_CTX = 64;
-function computeEntries(ins) {
+function computeEntries(ins, seeds = [[0, []]]) {
   const idx = new Map(ins.map((x, k) => [x.pc, k]));
   const isDest = (v) => typeof v === 'bigint' && v <= 0xffffffffn && ins[idx.get(Number(v))]?.op === JUMPDEST;
   // Context key = stack depth + the positions/values of JUMPDEST-valued literals (return addresses: a call-string
@@ -193,9 +193,10 @@ function computeEntries(ins) {
     c.map.clear();
     work.push([k, 'S']);
   };
-  edge(0, []);
+  const visited = new Set();
+  for (const [k, st] of seeds) edge(k, st);
   while (work.length) {
-    if (++visits > 200_000) return { entries: new Map(), unresolved: true };
+    if (++visits > 200_000) return { entries: new Map(), unresolved: true, visited };
     const [start, key] = work.pop();
     const c = ctx.get(start);
     const entry = key === 'S' ? c.summary : c.map.get(key);
@@ -204,6 +205,7 @@ function computeEntries(ins) {
     for (let i = start; i < ins.length; i++) {
       const { op } = ins[i];
       if (i > start && op === JUMPDEST) { edge(i, stack); break; }
+      visited.add(i);
       if (op === JUMP || op === JUMPI) {
         const t = targetsOf(stack.length ? stack[stack.length - 1] : null);
         stepStack(ins[i], stack, null);
@@ -221,7 +223,7 @@ function computeEntries(ins) {
     const all = c.summary ? [c.summary] : [...c.map.values()];
     entries.set(k, all.reduce((acc, x) => joinStacks(acc, x)));
   }
-  return { entries, unresolved };
+  return { entries, unresolved, visited };
 }
 
 // ---- dispatcher chain (scanner v3) ----
@@ -240,8 +242,9 @@ const selHex = (v) => `0x${v.toString(16).padStart(8, '0')}`;
 
 function analyzeDispatcher(ins) {
   const idx = new Map(ins.map((x, k) => [x.pc, k]));
-  const res = { ok: true, failure: null, selectors: [], fallbackLogic: false, logicAt: [] };
+  const res = { ok: true, failure: null, selectors: [], fallbackLogic: false, logicAt: [], entries: {} };
   const sels = new Set();
+  const addEntry = (sel, k) => { (res.entries[sel] ??= []).includes(k) || res.entries[sel].push(k); };
   const logic = new Set();
   const fail = (why) => { if (res.ok) { res.ok = false; res.failure = why; } };
   const jumpIdx = (t) => {
@@ -337,8 +340,8 @@ function analyzeDispatcher(ins) {
       if (op === JUMPI) {
         const t = jumpIdx(pop()); const c = pop();
         if (t < 0) { fail(`dynamic-jumpi@${pc}`); break; }
-        if (c && typeof c === 'object' && c.eq !== undefined) { sels.add(selHex(c.eq)); i++; continue; }
-        if (c && typeof c === 'object' && c.neq !== undefined) { sels.add(selHex(c.neq)); i = t; continue; }
+        if (c && typeof c === 'object' && c.eq !== undefined) { sels.add(selHex(c.eq)); addEntry(selHex(c.eq), t); i++; continue; }
+        if (c && typeof c === 'object' && c.neq !== undefined) { sels.add(selHex(c.neq)); addEntry(selHex(c.neq), i + 1); i = t; continue; }
         if (typeof c === 'bigint') { i = c === 0n ? i + 1 : t; continue; }
         if (c === 'CMP' || c === 'CV' || c === 'CDS' || phase === 'pre') {
           const np = c === 'CDS' && phase === 'pre' ? 'cds' : phase;
@@ -358,6 +361,38 @@ function analyzeDispatcher(ins) {
   res.logicAt = [...logic].sort((a, b) => a - b);
   res.fallbackLogic = res.logicAt.length > 0;
   return res;
+}
+
+// ---- block-context reads on the transfer paths (scanner v5, F-03 static fence) ----
+// NUMBER / TIMESTAMP / ORIGIN / TLOAD read on a path reachable from transfer() or transferFrom() can make a sale
+// depend on the block, the time, the transaction origin or the transaction itself: the router's same-transaction
+// probe cannot see such a trap. Any such read makes the token `privileged` (strict blocks it); time-based traps are
+// left to the simulator for balanced mode (EIP-2612 permit and honest launch logic also read TIMESTAMP).
+const BLOCK_CTX_OPS = Object.freeze({ 0x32: 'ORIGIN', 0x42: 'TIMESTAMP', 0x43: 'NUMBER', 0x5c: 'TLOAD' });
+const TRANSFER_PATH_SELECTORS = Object.freeze(CORE_ERC20.slice(0, 2)); // transfer, transferFrom
+
+/**
+ * Instruction indices reachable from the `starts` instruction indices: the same context-sensitive dataflow as the
+ * main pass, seeded at the function entries (so an internal function shared with, say, permit() returns only to the
+ * caller frames reached from here). Returns null when any jump target is unresolved (the caller then falls back to
+ * whole-code liveness, which is conservative).
+ */
+function reachableFrom(ins, starts, entries) {
+  const r = computeEntries(ins, starts.map((k) => [k, [...(entries.get(k) ?? [])]]));
+  return r.unresolved ? null : r.visited;
+}
+
+function blockContextOf(ins, df, disp, liveIdx) {
+  const starts = TRANSFER_PATH_SELECTORS.flatMap((s) => disp.entries[s] ?? []);
+  if (!starts.length) return { scope: 'no-transfer-entry', ops: {} };
+  const r = df.unresolved ? null : reachableFrom(ins, starts, df.entries);
+  const scope = r === null ? 'whole-code' : 'transfer-paths';
+  const ops = {};
+  for (const k of r === null ? liveIdx : [...r].sort((a, b) => a - b)) {
+    const name = BLOCK_CTX_OPS[ins[k].op];
+    if (name) (ops[name] ??= []).push(ins[k].pc);
+  }
+  return { scope, ops: Object.fromEntries(Object.entries(ops).sort(([a], [b]) => sortStr(a, b))) };
 }
 
 const isPush = (op) => op >= 0x60 && op <= 0x7f;
@@ -399,6 +434,7 @@ export function analyzeCode(codeHex) {
   const callerCodeOffsets = [];
   let balanceReads = 0;
   let unsafeDelegate = false;
+  const liveBlockCtx = []; // instruction indices of live NUMBER/TIMESTAMP/ORIGIN/TLOAD (whole-code fallback)
 
   // Entry stacks for every JUMPDEST from a small dataflow pass (constants / tags flow across internal jumps). If
   // any jump target cannot be resolved, the pass is discarded and every JUMPDEST starts from an unknown stack
@@ -470,6 +506,7 @@ export function analyzeCode(codeHex) {
       }
     }
     if (op === SELFBALANCE) { externalStateOffsets.push(pc); balanceReads++; }
+    if (BLOCK_CTX_OPS[op]) liveBlockCtx.push(i);
     if (op === SELFDESTRUCT) opcodes.selfdestruct++;
     if (TERMINATORS.has(op)) { live = false; stack = []; continue; }
     stepStack(ins[i], stack, onCmp);
@@ -482,6 +519,8 @@ export function analyzeCode(codeHex) {
   const dangerous = all.filter((s) => DANGEROUS[s]).map((s) => ({ selector: s, signature: DANGEROUS[s] }));
   const upgradeSelector = all.some((s) => UPGRADE_SELECTORS.includes(s));
   const accessControl = all.includes(HAS_ROLE);
+  const blockContext = blockContextOf(ins, df, disp, liveBlockCtx);
+  const blockContextRead = Object.keys(blockContext.ops).length > 0;
   return {
     selectors: sel,
     linearSelectors: linear,
@@ -498,8 +537,9 @@ export function analyzeCode(codeHex) {
     upgradeable: unsafeDelegate || upgradeSelector,
     dangerSetter: dangerous.length > 0 || opcodes.selfdestruct > 0,
     accessControl,
+    blockContext,
     privilegedCode: accessControl || callerChecks.length > 0 || callerLiteralChecks.length > 0
-      || externalCallOffsets.length > 0 || externalStateOffsets.length > 0,
+      || externalCallOffsets.length > 0 || externalStateOffsets.length > 0 || blockContextRead,
   };
 }
 
@@ -592,7 +632,7 @@ export async function scan(client, token, { blockNumber } = {}) {
         address: impl, codehash: keccak256(implCode), selectors: ia.selectors, dangerous: ia.dangerous,
         dispatcher: ia.dispatcher, callerChecks: ia.callerChecks, callerLiteralChecks: ia.callerLiteralChecks,
         externalCalls: ia.externalCalls, externalState: ia.externalState, callerCodeChecks: ia.callerCodeChecks,
-        opcodes: ia.opcodes,
+        blockContext: ia.blockContext, opcodes: ia.opcodes,
       };
     }
   }
@@ -617,6 +657,7 @@ export async function scan(client, token, { blockNumber } = {}) {
   if (both((x) => x.callerLiteralChecks.length > 0)) reasons.add('caller-vs-literal');
   if (both((x) => x.externalCalls.count > 0)) reasons.add('external-call');
   if (both((x) => x.externalState.count > 0)) reasons.add('external-state');
+  if (both((x) => Object.keys(x.blockContext.ops).length > 0)) reasons.add('block-context');
   if (both((x) => x.dangerous.length > 0)) reasons.add('dangerous-selector');
   if (both((x) => x.opcodes.selfdestruct > 0)) reasons.add('live-selfdestruct');
   if (dispatcherUnrecognized) reasons.add('dispatcher-unrecognized');
@@ -638,6 +679,7 @@ export async function scan(client, token, { blockNumber } = {}) {
 
   return {
     codehash,
+    block: Number(bn),
     privileged,
     upgradeable,
     dangerSetter,
@@ -657,6 +699,7 @@ export async function scan(client, token, { blockNumber } = {}) {
       externalCalls: a.externalCalls,
       externalState: a.externalState,
       callerCodeChecks: a.callerCodeChecks,
+      blockContext: a.blockContext,
       proxySlots,
       implementation,
       clone,
