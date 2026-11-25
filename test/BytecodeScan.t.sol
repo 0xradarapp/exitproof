@@ -174,6 +174,7 @@ contract BytecodeScanTest is Test {
 
     function test_forgedJumpdestInIpfsHashStillFlagged() public {
         // valid ipfs header/footer, hash region = 5b 5a f4 ... (reachable via JUMP)
+        // forge-lint: disable-next-line(unsafe-typecast)
         bytes memory code = abi.encodePacked(hex"00", _ipfsTrailer(bytes32(bytes3(hex"5b5af4")), 0x0000));
         (bool d,,) = _scan(code);
         assertTrue(d);
@@ -208,7 +209,7 @@ contract BytecodeScanTest is Test {
     function test_pushOverrunIntoIpfsTrailerStillFlagged() public {
         // PUSH32 whose immediates swallow header (8) + hash bytes 0..23; hash byte 24 = f4 executes
         bytes memory hash = new bytes(32);
-        hash[24 - 0] = 0xf4;
+        hash[24] = 0xf4;
         bytes memory code;
         code = abi.encodePacked(hex"7f", _ipfsTrailerBytes(hash, hex"0000"));
         // code = 7f + trailer; PUSH32 covers 32 bytes after it = header(8)+hash[0..23]; hash[24] is executed
@@ -226,5 +227,36 @@ contract BytecodeScanTest is Test {
 
     function _ipfsTrailerBytes(bytes memory hash32, bytes2 hi2) internal pure returns (bytes memory) {
         return abi.encodePacked(hex"a264697066735822", hash32, hi2, hex"64736f6c63430008180033");
+    }
+
+    // ---- F-07: EIP-7702 delegation designator
+
+    function test_eip7702DesignatorIsDelegatecall() public {
+        // 0xef0100 || implementation: re-delegatable by the account owner at any time => upgradeable. The 20 address
+        // bytes are not code: an implementation full of 0xff / 0xf2 bytes must not raise selfdestruct / callcode.
+        (bool d, bool s, bool c) = _scan(abi.encodePacked(hex"ef0100", address(0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF)));
+        assertTrue(d);
+        assertFalse(s);
+        assertFalse(c);
+        (d, s, c) = _scan(abi.encodePacked(hex"ef0100", address(0x1111111111111111111111111111111111111111)));
+        assertTrue(d);
+        assertFalse(s || c);
+    }
+
+    function test_eip7702LookalikesScannedAsCode() public {
+        // Any other 0xEF-prefixed code cannot exist on chain (EIP-3541; revm refuses to etch it), so the only
+        // lookalikes are 23-byte codes with another prefix: ordinary code, scanned linearly.
+        (bool d, bool s, bool c) = _scan(abi.encodePacked(hex"ee0100", bytes20(0)));
+        assertFalse(d || s || c);
+        (d,,) = _scan(abi.encodePacked(hex"ee0100", bytes19(0), hex"f4"));
+        assertTrue(d, "a real f4 opcode in a 23-byte non-designator code still flags");
+        (, s,) = _scan(abi.encodePacked(hex"000100", bytes19(0), hex"ff"));
+        assertTrue(s, "and a real ff opcode");
+    }
+
+    function test_noCodeIsClean() public {
+        vm.etch(T, "");
+        (bool d, bool s, bool c) = h.scan(T);
+        assertFalse(d || s || c);
     }
 }

@@ -4,12 +4,15 @@ pragma solidity 0.8.24;
 /// @title BytecodeScan
 /// @notice Flags DELEGATECALL (0xF4), SELFDESTRUCT (0xFF) and CALLCODE (0xF2) that appear as
 ///         real opcodes in a contract's runtime code. PUSH1..PUSH32 immediates are skipped.
-/// @dev The whole runtime code is scanned, including any Solidity CBOR metadata trailer. That
-///      trailer is data whose 32-byte IPFS hash would otherwise yield a false positive for ~1 in 3
-///      ordinary tokens, so a trailer is excluded, but ONLY if it matches one of two exact solc
-///      layout (ipfs+solc, length 0x33; solc-only is scanned in full). The length field alone is never
-///      trusted, so a forged length cannot move the scan boundary. Other layouts (e.g. old bzzr1
-///      swarm trailers) are scanned in full and may false-positive (conservative).
+///         An EIP-7702 delegation designator (exactly 23 bytes, 0xef0100 || implementation) is reported as
+///         DELEGATECALL: the account's owner can re-delegate it to any implementation with one transaction, so the
+///         code behind the address is swappable (upgradeable). The designator itself is not scanned as code.
+/// @dev The whole runtime code is scanned, except a Solidity CBOR metadata trailer. That trailer is data
+///      whose 32-byte IPFS hash would otherwise yield a false positive for ~1 in 3 ordinary tokens, so it
+///      is excluded, but ONLY if it matches the exact solc ipfs+solc layout (length field 0x33) and the
+///      linear scan reaches it on an instruction boundary. Every other layout (solc-only, bzzr0/bzzr1
+///      swarm trailers, ...) is scanned in full and may false-positive (conservative). The length field
+///      alone is never trusted, so a forged length cannot move the scan boundary.
 ///      This is a linear-time heuristic: it does not resolve jump targets, so unreachable code
 ///      or data tables embedded in code can also produce false positives.
 library BytecodeScan {
@@ -23,23 +26,25 @@ library BytecodeScan {
                     }
                 }
             }
+            t := and(t, 0xffffffffffffffffffffffffffffffffffffffff)
             let size := extcodesize(t)
-            if size {
-                let ptr := mload(0x40)
-                extcodecopy(t, ptr, 0, size)
+            let ptr := mload(0x40)
+            if size { extcodecopy(t, ptr, 0, size) }
+            // EIP-7702 delegated EOA: 0xef0100 || 20-byte implementation address
+            let delegated := and(eq(size, 23), eq(shr(232, mload(ptr)), 0xef0100))
+            if delegated { hasDelegatecall := 1 }
+            if iszero(or(iszero(size), delegated)) {
                 // Exclude a strictly-validated Solidity CBOR metadata trailer from the scan. Only the
                 // ipfs+solc layout is recognised (the solc-only layout is scanned in full: its bytes
-                // are executable-reachable by fall-through and contain no 0xf2/f4/ff when honest), and only if none of the variable bytes (hash/version)
-                // is 0x5b (JUMPDEST): the EVM does not treat the trailer as data, so a JUMP into a
-                // forged 0x5b there could reach hidden opcodes. Otherwise the full code is scanned.
+                // are executable-reachable by fall-through and contain no 0xf2/f4/ff when honest),
+                // and only if none of the variable bytes (hash/version) is 0x5b (JUMPDEST): the EVM does
+                // not treat the trailer as data, so a JUMP into a forged 0x5b there could reach hidden
+                // opcodes. Otherwise the full code is scanned.
                 // Free memory pointer is intentionally not bumped: the buffer is scratch only.
                 let scanEnd := size
                 let l := 0
                 if gt(size, 1) {
-                    l := or(
-                        shl(8, byte(0, mload(add(ptr, sub(size, 2))))),
-                        byte(0, mload(add(ptr, sub(size, 1))))
-                    )
+                    l := or(shl(8, byte(0, mload(add(ptr, sub(size, 2))))), byte(0, mload(add(ptr, sub(size, 1)))))
                 }
                 if and(gt(size, 0x34), eq(l, 0x33)) {
                     // a2 64 "ipfs" 58 22 <34 bytes ipfs hash> 64 "solc" 43 <3 bytes version> 00 33
