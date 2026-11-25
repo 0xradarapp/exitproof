@@ -9,10 +9,10 @@
 // What it does to web/:
 //   - index.html gets style.css (comments and indentation stripped), verdict.js + app.js (one inline module) and the
 //     config inlined, the favicon as a data: URI, and a CSP that allows exactly those inline blocks (sha256 hashes)
-//     and only the RPC host(s) of the mainnet config;
+//     and only the RPC host(s) of the mainnet config (rpc + rpcFallback);
 //   - vendor/ethers.min.js (byte-identical to the npm tarball, sha384 checked) and the woff2 fonts the CSS uses stay
 //     separate files (no base64 inflation), with their licenses next to them;
-//   - config: only the "xlayer" network (RPC https://rpc.xlayer.tech), filled from deployments/<DEPLOYMENT>.json when
+//   - config: only the "xlayer" network (RPC https://rpc.xlayer.tech, fallback https://xlayerrpc.okx.com), filled from deployments/<DEPLOYMENT>.json when
 //     it exists (else the pending state of web/config.json: router/registry null, the page shows "not deployed yet",
 //     and publish-deweb.mjs refuses the build).
 // Checks (the build fails on any): TapeKit's "100% on-chain" static rule (no off-chain URL in src/href/…, srcset,
@@ -52,11 +52,13 @@ if (fs.existsSync(depFile)) {
   const d = JSON.parse(fs.readFileSync(depFile, 'utf8'));
   for (const k of ['router', 'registry', 'processor', 'circuitId']) if (d[k] !== undefined && d[k] !== null) xl[k] = String(d[k]);
   if (d.feeBps !== undefined) xl.feeBps = d.feeBps;
+  if (d.deployBlock !== undefined && d.deployBlock !== null) xl.deployBlock = Number(d.deployBlock);
   source = 'deployments/' + NETWORK + '.json';
 }
-if (!/^https:\/\//.test(xl.rpc)) fail('networks.xlayer.rpc must be an https URL, got ' + xl.rpc);
+const rpcUrls = [xl.rpc, ...[].concat(xl.rpcFallback ?? [])];
+for (const u of rpcUrls) if (!/^https:\/\//.test(u)) fail('networks.xlayer.rpc / rpcFallback must be https URLs, got ' + u);
 const config = { defaultNetwork: 'xlayer', networks: { xlayer: xl } };
-const rpcOrigin = new URL(xl.rpc).origin;
+const rpcOrigin = [...new Set(rpcUrls.map((u) => new URL(u).origin))].join(' ');
 
 // ---- CSS: comments out, indentation and blank lines out (no string in style.css contains "/*")
 let css = read('style.css');

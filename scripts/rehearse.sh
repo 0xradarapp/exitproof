@@ -16,8 +16,8 @@
 # deployments/fork-demo.json and web/config.json are never touched and a concurrent run cannot interfere.
 # KEEP=1 copies the fresh fork artifacts back (deployments/fork*.json and only networks.fork of web/config.json).
 # anvil is killed on exit.
-# Env: PORT (default 8549), FORK_URL (default https://rpc.xlayer.tech; https://xlayerrpc.okx.com also serves the
-#      pinned block), KEEP=1.
+# Env: PORT (default 8549), FORK_URL (default https://xlayerrpc.okx.com; https://rpc.xlayer.tech also serves the
+#      pinned block but returns CloudFront 403s under load), KEEP=1. A full run takes about 7 minutes.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
@@ -25,9 +25,9 @@ export PATH="$HOME/.foundry/bin:$PATH"
 
 PORT="${PORT:-8549}"
 RPC="http://127.0.0.1:$PORT"
-FORK_URL="${FORK_URL:-https://rpc.xlayer.tech}"
+FORK_URL="${FORK_URL:-https://xlayerrpc.okx.com}"
 BLOCK=76861306
-# anvil default accounts #2 (deployer/attester) and #3 (buyer); #0, #1 and #5 carry EIP-7702 code on X Layer
+# anvil default accounts #2 (deployer/attester) and #3 (buyer); #0, #1, #5 and #6 carry EIP-7702 code on X Layer
 DEPLOYER_KEY=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
 BUYER_KEY=0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6
 BEM=0x60e62Efa9405d6873C5deaBD4E6CC91c25363952
@@ -146,6 +146,11 @@ AGAIN=$(DEPLOYER_KEY="$DEPLOYER_KEY" SEND=1 node scripts/deploy.mjs)
 grep -q "Already deployed" <<<"$AGAIN" || fail "deploy.mjs re-run is not idempotent"
 [ "$(cast nonce "$DEPLOYER" --rpc-url "$RPC")" = "$N1" ] || fail "idempotent re-run sent a transaction"
 echo "re-run: already deployed, nothing sent ✓"
+DEPLOY_BLOCK=$(node -p "require('./deployments/fork.json').deployBlock")
+ROUTER_BLOCK=$(cast receipt "$(node -p "require('./deployments/fork.json').routerTx")" blockNumber --rpc-url "$RPC")
+[ "$DEPLOY_BLOCK" = "$ROUTER_BLOCK" ] || fail "deployments/fork.json deployBlock $DEPLOY_BLOCK is not the router receipt block $ROUTER_BLOCK"
+[ "$(node -p "require('./web/config.json').networks.fork.deployBlock")" = "$DEPLOY_BLOCK" ] || fail "web/config.json networks.fork.deployBlock not written"
+echo "deployBlock $DEPLOY_BLOCK (router receipt) in deployments/fork.json and web/config.json ✓"
 
 step "3/6 demo-fork.mjs (fixture tokens + PotatoSwap pairs + one allowed buy)"
 # the fixtures need 30 OKB of pool liquidity; top up only now, after tape-out and deploy costs were measured

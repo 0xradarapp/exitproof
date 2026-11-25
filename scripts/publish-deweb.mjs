@@ -351,7 +351,7 @@ async function main() {
   }
   const dryStop = (why) => {
     console.log('\nDry run OK up to here (nothing sent, nothing written). ' + why);
-    console.log('When ready:  SEND=1' + (MAINNET ? ' CONFIRM_MAINNET=yes' : '') + ' node scripts/publish-deweb.mjs');
+    console.log('When ready:  MONTHS=' + MONTHS + ' SEND=1' + (MAINNET ? ' CONFIRM_MAINNET=yes' : '') + ' node scripts/publish-deweb.mjs');
   };
 
   // ---- b. open the container

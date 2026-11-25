@@ -2,12 +2,15 @@
 // that scripts/tapeout.mjs taped out and verified. This is the canonical deployer; scripts/deploy-fork.mjs is the
 // older fork-only variant, kept for reference.
 //
-//   1. read deployments/<network>.json (written by tapeout.mjs); refuse unless processor + circuitId are present and
-//      verified 2048/2048, and the on-chain netlist/circuitInfo still match circuit/netlist.json
+//   1. read deployments/<network>.json (written by tapeout.mjs); refuse unless processor + circuitId are present,
+//      tapeout.mjs finished its verification, the on-chain netlist/circuitInfo still match circuit/netlist.json, and
+//      processor.eval agrees with circuit/truth.json on all 2048 inputs, re-run here through Multicall3 (the state
+//      file's "verified" record is not trusted on its own)
 //   2. print the exact constructor arguments and the estimated OKB (gas estimate x gas price)
 //   3. deploy RiskRegistry → setAttester(deployer, true) → deploy ExitProofRouter (each simulated right before sending)
-//   4. read every router immutable back, write addresses + tx hashes into deployments/<network>.json and the network's
-//      entry in web/config.json (router, registry, processor, circuitId; buyEnabled is left as it is)
+//   4. read every router immutable back, write addresses + tx hashes + deployBlock (the router's deploy receipt block)
+//      into deployments/<network>.json and the network's entry in web/config.json (router, registry, processor,
+//      circuitId, deployBlock; buyEnabled is left as it is)
 //   5. print source-verification commands (Sourcify, OKLink); nothing is verified automatically
 //
 // The network is DETECTED (scripts/lib/net.mjs): an anvil node is "fork", any other chain-196 node is "xlayer" mainnet.
@@ -42,7 +45,8 @@ const SET_ATTESTER_GAS = 60_000n; // measured 47,781; estimated before the regis
 const CONFIG_FILE = path.join(ROOT, 'web', 'config.json');
 const PROC_ABI = parseAbi([
   'function netlist(uint256 id) view returns (bytes)',
-  'function circuitInfo(uint256 id) view returns (uint32 nIn, uint32 nOut, uint32 nState, uint32 gateCount)'
+  'function circuitInfo(uint256 id) view returns (uint32 nIn, uint32 nOut, uint32 nState, uint32 gateCount)',
+  'function eval(uint256 id, bytes inputs) view returns (bytes)'
 ]);
 const FACTORY_ABI = parseAbi(['function isCPU(address) view returns (bool)']);
 const ROUTER_CTOR = [
@@ -99,7 +103,9 @@ async function main() {
   if (nl !== C.netlist.toLowerCase()) throw new Error('on-chain netlist of circuit #' + circuitId + ' differs from circuit/netlist.json');
   const info = await pub.readContract({ address: processor, abi: PROC_ABI, functionName: 'circuitInfo', args: [circuitId] });
   if (info[0] !== C.nIn || info[1] !== C.nOut || info[2] !== 0 || info[3] !== C.gates) throw new Error('circuitInfo mismatch: ' + info.join(','));
-  console.log('Circuit        #' + circuitId + ' on ' + processor + ' · ' + C.gates + ' NAND · netlist identical · verified ' + dep.verified.evals + ' (' + dep.verified.at + ')');
+  const evals = await evalAll(pub, processor, circuitId);
+  console.log('Circuit        #' + circuitId + ' on ' + processor + ' · ' + C.gates + ' NAND · netlist identical · eval ' + evals +
+    ' re-checked on chain now (tapeout.mjs: ' + dep.verified.evals + ', ' + dep.verified.at + ')');
 
   // ---- deployer: plain EOA, enough OKB
   const code = await pub.getCode({ address: deployer });
@@ -170,6 +176,7 @@ async function main() {
       const r = await receiptOf(p.tx);
       if (r && r.status === 'success') {
         address = getAddress(r.contractAddress);
+        if (name === 'router') dep.deployBlock = Number(r.blockNumber);
         dep.gas = dep.gas || {};
         dep.gas['deploy ' + (name === 'registry' ? 'RiskRegistry' : 'ExitProofRouter')] = r.gasUsed.toString();
       }
@@ -216,6 +223,7 @@ async function main() {
     const net = cfg.networks && cfg.networks[network];
     if (!net) { console.log('Note           web/config.json has no "' + network + '" network; not changed'); return false; }
     const want = { router: dep.router, registry: dep.registry, processor, circuitId: circuitId.toString() };
+    if (dep.deployBlock != null) want.deployBlock = dep.deployBlock;
     if (Object.keys(want).every((k) => net[k] === want[k])) return false;
     if (!SEND) { console.log('Note           web/config.json networks.' + network + ' is out of date (a SEND=1 run re-syncs it)'); return false; }
     Object.assign(net, want); // buyEnabled untouched
@@ -236,6 +244,10 @@ async function main() {
     await verifyRouter(dep.router, dep.registry);
     console.log('Already deployed: router ' + dep.router + ' · registry ' + dep.registry + ' (recorded in ' + rel + '). Nothing to send.');
     if (!dep.routerConstructorArgs || !dep.feeBps) { fillRecord(); delete dep.pending; save(); } // e.g. a router adopted on resume
+    if (dep.deployBlock == null && dep.routerTx) { // older record, or a router adopted by its code: take the block from the receipt
+      const r = await receiptOf(dep.routerTx);
+      if (r && r.status === 'success') { dep.deployBlock = Number(r.blockNumber); save(); console.log('deployBlock    ' + dep.deployBlock + ' (router deploy receipt)'); }
+    }
     writeConfig();
     printVerify(network, dep);
     return;
@@ -330,6 +342,7 @@ async function main() {
     }
     console.log('    mined      ' + r.contractAddress + ' · block ' + r.blockNumber + ' · gas ' + r.gasUsed);
     dep.gas['deploy ' + label] = r.gasUsed.toString();
+    if (name === 'router') dep.deployBlock = Number(r.blockNumber);
     dep[name] = getAddress(r.contractAddress);
     dep[name + 'Tx'] = hash;
     delete dep.pending[name];
@@ -366,8 +379,41 @@ async function main() {
   console.log('Wrote          ' + rel);
   writeConfig();
   console.log('Spent          ' + dep.deploySpentOkb + ' OKB (since the first deploy run; this run ' + formatEther(okb0 - okb1) + ')');
-  console.log('\nROUTER=' + router + ' REGISTRY=' + registry);
+  console.log('\nROUTER=' + router + ' REGISTRY=' + registry + ' DEPLOY_BLOCK=' + dep.deployBlock);
   printVerify(network, dep);
+}
+
+// processor.eval on all 2^nIn inputs through Multicall3, compared with circuit/truth.json. Throws on any mismatch.
+async function evalAll(pub, processor, circuitId) {
+  const truth = JSON.parse(fs.readFileSync(path.join(ROOT, 'circuit', 'truth.json'), 'utf8'));
+  const CHUNK = 64; // ~137k gas per eval: keep each multicall well under RPC eth_call gas caps
+  let ok = 0;
+  for (let start = 0; start < truth.length; start += CHUNK) {
+    const xs = Array.from({ length: Math.min(CHUNK, truth.length - start) }, (_, i) => start + i);
+    let outs;
+    for (let t = 0; ; t++) {
+      try {
+        outs = await pub.multicall({
+          contracts: xs.map((x) => ({ address: processor, abi: PROC_ABI, functionName: 'eval', args: [circuitId, inputBytes(x)] })),
+          allowFailure: false
+        });
+        break;
+      } catch (e) { if (t >= 4) throw e; await new Promise((r) => setTimeout(r, 1000 * 2 ** t)); }
+    }
+    xs.forEach((x, i) => {
+      const o = outs[i];
+      if (o.length !== 4) throw new Error('eval(0x' + x.toString(16) + ') returned ' + o + ', expected 1 byte');
+      if (parseInt(o.slice(2, 4), 16) !== truth[x]) throw new Error('circuit #' + circuitId + ' eval mismatch at input ' + x + ': chain ' + o + ' vs truth ' + truth[x] + '; refusing to deploy');
+      ok++;
+    });
+  }
+  if (ok !== truth.length) throw new Error('only ' + ok + '/' + truth.length + ' evals checked');
+  return ok + '/' + truth.length;
+}
+
+// TapeOut input encoding: bit i of the input word = byte i/8, bit i%8 (little-endian). Same as tapeout.mjs.
+function inputBytes(x) {
+  return '0x' + (x & 0xff).toString(16).padStart(2, '0') + ((x >> 8) & 0xff).toString(16).padStart(2, '0');
 }
 
 function printVerify(network, dep) {
