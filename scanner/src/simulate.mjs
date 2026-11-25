@@ -73,7 +73,7 @@ export const DEFAULT_BUDGET_MS = 180_000;
 const STORAGE_CALLER_SLOTS = 16;
 const MAX_STORAGE_CALLERS = 8;
 // byte offsets at which an address is tried inside a storage word (packed after bool/uint8/16/32/64/96)
-const PACK_OFFSETS = [0, 1, 2, 4, 8, 12];
+const PACK_OFFSETS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]; // v8: every byte offset
 const MAX_HINT_PATTERNS = 32; // per selector: hint x argument position x {10000, max}
 
 /** SWEEP_BUDGET_S (default 180): wall-clock budget of one token's simulation, in ms. Validated. */
@@ -87,7 +87,7 @@ export function sweepBudgetMs(env = process.env) {
 /**
  * Address-shaped values inside a storage word. A word < 2^160 is a plain address. Otherwise two packings are tried:
  * the low 160 bits (address declared first, small values after it) and the address as the highest packed variable at
- * a byte offset 1, 2, 4, 8 or 12 (bool / uint8 / 16 / 32 / 64 / 96 declared before it). Values < 2^120 are ignored.
+ * any byte offset 1..12 (smaller values declared before it). Values < 2^120 are ignored.
  */
 export function packedAddresses(word) {
   const w = BigInt(word ?? 0);
@@ -191,27 +191,6 @@ const sellJson = (r) => (r ? {
   actualOut: r.actual.toString(),
 } : null);
 
-/**
- * owner() or getOwner() returns exactly one zero word at the pinned block (ownership renounced, as opposed to no
- * getter at all), and the storage slots that getter reads (prestateTracer of the call): only caller-vs-storage
- * checks on those slots belong to the renounced owner.
- */
-async function ownerRenounced(client, rpc, token, blockNumber) {
-  for (const data of ['0x8da5cb5b', '0x893d20e8']) {
-    let ret;
-    try {
-      ({ data: ret } = await client.call({ to: token, data, gas: 100_000n, blockNumber }));
-    } catch { continue; } // no such getter
-    if (!ret || ret.length !== 66 || BigInt(ret) !== 0n) continue;
-    let slots = [];
-    try {
-      const pre = await rpc('debug_traceCall', [{ to: token, data, gas: '0x186a0' }, toHex(blockNumber), { tracer: 'prestateTracer' }]);
-      slots = Object.keys(pre?.[token.toLowerCase()]?.storage ?? {}).map((k) => `0x${BigInt(k).toString(16)}`);
-    } catch { /* tracer unavailable: no slot is attributed to the owner (fail closed) */ }
-    return { renounced: true, slots };
-  }
-  return { renounced: false, slots: [] };
-}
 
 const taxBucket = (r) => {
   if (!r || r.expected === 0n) return 3;
@@ -653,9 +632,10 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
         const unknown = s.evidence.unknownSelectors.filter((x) => !DANGEROUS[x] && !dangerousSel.has(x));
         const todo = unknown.slice(0, maxUnknown);
         const hints = opts.noHints ? {} : (s.evidence.selectorHints ?? {});
+        const plumbing = new Set(s.evidence.ownershipPlumbing ?? []);
         const sweep = {
           selectors: unknown.length, tried: 0, patterns: UNKNOWN_PATTERNS.length, calls: 0, complete: true,
-          truncatedBy: null, callers: callers.length, exercised: [], unexercised: [], stateChanging: [],
+          truncatedBy: null, callers: callers.length, exercised: [], unexercised: [], plumbingUnexercised: [], stateChanging: [],
           pairs: 0, pairsTruncated: false, trapped: [],
         };
         evidence.unknownSweep = sweep;
@@ -712,7 +692,10 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
               break; // first caller whose call succeeds
             }
           }
-          (exercised ? sweep.exercised : sweep.unexercised).push(selector);
+          // v8: an unexercised Ownable.transferOwnership (statically verified shape, e.g. renounced owner) is plumbing,
+          // not a gap; every other caller-gated selector is dangerSetter statically anyway
+          if (!exercised && plumbing.has(selector)) sweep.plumbingUnexercised.push(selector);
+          else (exercised ? sweep.exercised : sweep.unexercised).push(selector);
           if (firstStep) { firstSteps.push(firstStep); sweep.stateChanging.push(selector); }
         }
         // two-step: a state-changing call first (e.g. raise a cap), then every other unknown selector
@@ -746,23 +729,14 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
         }
         for (const sel of sweep.trapped) evidence.signals.push(`unknown-setter-trap:${sel}`);
         // fail closed when an admin exists that the sweep could not fully exercise
-        // A caller-vs-storage gate on a token whose owner()/getOwner() explicitly returns 0 (renounced) is taken to be
-        // the renounced owner's: its functions revert for everyone by design (hidden second admin: README residual).
-        // v7 (I-1): only when EVERY caller-vs-storage check compares a literal slot that owner() itself reads.
-        const own = await ownerRenounced(client, rpc, token, blockNumber);
-        const ownerSlots = new Set(own.slots.map((x) => BigInt(x)));
-        const checkSlots = s.evidence.callerCheckSlots ?? [null];
-        const onlyOwnerChecks = own.renounced && checkSlots.length > 0
-          && checkSlots.every((x) => x !== null && ownerSlots.has(BigInt(x)));
+        // v8: no renounce exemption (owner-renounce is not trusted); caller-gated unknown selectors are dangerSetter
+        // statically (scan.mjs) whatever this sweep finds
         const why = [
           s.evidence.owner !== null && 'owner-active',
           s.evidence.reasons.includes('access-control') && 'access-control',
           s.evidence.reasons.includes('caller-vs-literal') && 'caller-vs-literal',
-          s.evidence.reasons.includes('caller-vs-storage') && !onlyOwnerChecks && 'caller-vs-storage',
+          s.evidence.reasons.includes('caller-vs-storage') && 'caller-vs-storage',
         ].filter(Boolean);
-        sweep.ownerRenounced = own.renounced;
-        sweep.ownerSlots = own.slots;
-        sweep.callerCheckSlots = checkSlots;
         if (!sweep.complete) sweep.failClosedBecause = why;
         if (!sweep.complete && why.length) {
           evidence.signals.push('sweep-incomplete');

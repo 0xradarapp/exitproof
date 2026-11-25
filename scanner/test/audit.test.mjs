@@ -104,7 +104,7 @@ test('cooldown (no same-block sell) is not a delayed trap: immediate fails, late
 
 test('F-04a HiddenAdminBomb: unlisted setter, admin in a private slot => unknown sweep finds it, ownerCanTrap', async () => {
   const { s, sim } = await run('HiddenAdminBomb');
-  assert.equal(s.dangerSetter, false);
+  assert.equal(s.dangerSetter, true, 'v8: setLaunchParam reads CALLER => caller-gated-unknown (statically)');
   assert.equal(s.evidence.owner, null);
   const sel = selectorOf('setLaunchParam(uint256)');
   assert.ok(s.evidence.unknownSelectors.includes(sel));
@@ -117,7 +117,7 @@ test('F-04a HiddenAdminBomb: unlisted setter, admin in a private slot => unknown
 
 test('F-04b RenamedSetterBomb: owner + setSellFeeBps (not on the name list) => ownerCanTrap', async () => {
   const { s, sim } = await run('RenamedSetterBomb');
-  assert.equal(s.dangerSetter, false);
+  assert.equal(s.dangerSetter, true, 'v8: caller-gated-unknown (statically)');
   const sel = selectorOf('setSellFeeBps(uint256)');
   assert.ok(sim.signals.includes(`unknown-setter-trap:${sel}`));
   const hits = sim.evidence.unknownAttempts.filter((a) => a.selector === sel).map((a) => a.pattern).sort();

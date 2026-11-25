@@ -221,7 +221,8 @@ test('caller-vs-storage taint: CALLER/ORIGIN compared (EQ/SUB/XOR) with an SLOAD
   assert.equal(A('5f546002043203').callerChecks.length, 1, 'DIV then ORIGIN SUB');
   assert.equal(A('335f3514').callerChecks.length, 0, 'calldata, not storage');
   assert.equal(A('3360011460015f5414').callerChecks.length, 0, 'taint does not survive EQ');
-  assert.equal(A('335f54600101' + '14').callerChecks.length, 0, 'ADD launders (documented limit)');
+  // v8: the SLOAD taint survives ADD / XOR / SUB / NOT / MUL (computed 'S'), so this is a check now
+  assert.equal(A('335f54600101' + '14').callerChecks.length, 1, 'ADD no longer launders');
   assert.equal(A('335f5414').privilegedCode, true);
 });
 

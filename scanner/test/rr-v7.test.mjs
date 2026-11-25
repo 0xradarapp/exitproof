@@ -38,16 +38,13 @@ test('I-1 RenouncedPackedAdmin: packed hidden admin is discovered and its setter
   assert.ok(balancedBlocks(mergeSimulation(structuredClone(s), sim)));
 });
 
-test('I-1 renounce exemption only covers checks on the slot owner() reads: an incomplete sweep still fails closed', async () => {
+test('I-1 (v8): with the sweep capped, the packed-admin token still fails closed (no renounce exemption)', async () => {
   const { token, pair } = await launchAudit(env, infra, 'RenouncedPackedAdmin', { pairCreator: other });
   const s = await scan(env.pub, token.address);
   assert.ok(s.evidence.callerCheckSlots.length >= 2, JSON.stringify(s.evidence.callerCheckSlots));
+  assert.equal(s.dangerSetter, true, 'caller-gated-unknown');
   const sim = await simulate(env.rpc, token.address, pair.address, { callers: [other.account.address], maxUnknown: 0 });
-  const sw = sim.evidence.unknownSweep;
-  assert.equal(sw.ownerRenounced, true);
-  assert.ok(sw.ownerSlots.length > 0);
-  assert.ok(sw.callerCheckSlots.some((x) => !sw.ownerSlots.includes(x)), 'the _ops check is on another slot');
-  assert.ok(sw.failClosedBecause.includes('caller-vs-storage'));
+  assert.ok(sim.evidence.unknownSweep.failClosedBecause.includes('caller-vs-storage'));
   assert.ok(sim.signals.includes('sweep-incomplete'));
   assert.equal(sim.dangerSetter, true);
 });

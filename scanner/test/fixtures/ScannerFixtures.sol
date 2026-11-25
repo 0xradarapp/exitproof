@@ -763,3 +763,93 @@ contract MagicSecondSilent is FeeOnSell {
         _sellFeeBps = v;
     }
 }
+
+/// v8 control: OpenZeppelin-shaped Ownable ERC-20 with no custom functions (owner / renounceOwnership /
+/// transferOwnership only). Renounced after deployment in the test; must stay out of dangerSetter.
+contract OzOwnableToken is AuditERC20 {
+    address private _owner;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("OZOWN", p, liq, rest) {
+        _transferOwnership(msg.sender);
+    }
+
+    modifier onlyOwner() {
+        require(owner() == msg.sender, "Ownable: caller is not the owner");
+        _;
+    }
+
+    function owner() public view returns (address) {
+        return _owner;
+    }
+
+    function renounceOwnership() public onlyOwner {
+        _transferOwnership(address(0));
+    }
+
+    function transferOwnership(address newOwner) public onlyOwner {
+        require(newOwner != address(0), "Ownable: new owner is the zero address");
+        _transferOwnership(newOwner);
+    }
+
+    function _transferOwnership(address newOwner) internal {
+        address oldOwner = _owner;
+        _owner = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+
+// ---- v7 re-review variant PoC fixtures (/tmp/ep-v7rr, I-1a / I-1b / I-2a), verbatim ----
+/// v7 variant I-1a: owner() also reads the hidden admin's slot (decoy), admin packed at byte offset 3 (not in PACK_OFFSETS).
+contract RenouncedSharedSlot is FeeOnSell {
+    uint24 private _x;
+    address private _ops;
+    address private _owner;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("RENSHR", p, liq, rest) {
+        _x = 7;
+        _ops = address(uint160(uint256(keccak256("hidden-admin"))));
+    }
+
+    function owner() public view returns (address) { return _x == 9 ? address(0xdead) : _owner; }
+    function renounceOwnership() external { require(msg.sender == _owner, "no"); _owner = address(0); }
+
+    function setLaunchParam(uint256 v) external {
+        require(msg.sender == _ops, "na");
+        _sellFeeBps = v;
+    }
+}
+
+/// v7 variant I-1b: the stored admin is masked, so CALLER is compared with a computed (non-S) value: no caller check.
+contract ObfuscatedAdmin is FeeOnSell {
+    address public owner;
+    uint256 private _k;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("OBFADM", p, liq, rest) {
+        _k = uint256(uint160(uint256(keccak256("hidden-admin")))) ^ uint256(0x5555555555555555555555555555555555555555555555);
+    }
+
+    function setLaunchParam(uint256 v) external {
+        require(msg.sender == address(uint160(_k ^ uint256(0x5555555555555555555555555555555555555555555555))), "na");
+        _sellFeeBps = v;
+    }
+}
+
+/// v7 variant I-2: decoy storage write on every call + key transformed before the compare (hint != needed arg).
+contract DecoyMagic is FeeOnSell {
+    address public owner;
+    uint256 private _calls;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("DECOY", p, liq, rest) {
+        owner = tx.origin;
+    }
+
+    function setLaunchParam(uint256 v, uint256 key) external {
+        require(msg.sender == owner, "na");
+        _calls += 1;
+        if (key / 3 != 0x1234) return;
+        _sellFeeBps = v;
+    }
+}

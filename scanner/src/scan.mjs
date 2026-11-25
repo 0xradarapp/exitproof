@@ -31,7 +31,7 @@ import { keccak256, hexToBytes, bytesToHex, getAddress } from 'viem';
 import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS, CORE_ERC20, SAFE } from './selectors.mjs';
 import { readProxySlots, UPGRADE_SLOTS, isAddress20 } from './proxy.mjs';
 
-export const SCANNER_VERSION = 7;
+export const SCANNER_VERSION = 8;
 const OWNER_CALL_GAS = 100_000n;
 
 const JUMP = 0x56, JUMPI = 0x57, JUMPDEST = 0x5b, PUSH0 = 0x5f, EQ = 0x14;
@@ -60,6 +60,7 @@ set([CALL, CALLCODE], [7, 1]); set([DELEGATECALL, STATICCALL], [6, 1]);
 /** SLOAD-derived: 'S' (computed slot) or 'S:0x<slot>' (literal slot). */
 const isS = (v) => typeof v === 'string' && (v === 'S' || v.startsWith('S:'));
 const MASK_OPS = new Set([0x04, 0x16, 0x1c]); // DIV, AND, SHR keep taint
+const TAINT_OPS = new Set([0x01, 0x02, 0x03, 0x18, 0x19]); // ADD, MUL, SUB, XOR, NOT
 const CMP_OPS = new Set([0x14, 0x03, 0x18, 0x01]); // EQ, SUB, XOR, ADD (solc -O: add(caller, not(c-1)) == 0)
 const MAX_PRECOMPILE = 0x0an;
 const isLiteralPrecompile = (v) => (typeof v === 'bigint' && v <= MAX_PRECOMPILE)
@@ -119,6 +120,8 @@ function stepStack(x, stack, onCmp) {
   else if (op === 0x54) out = typeof args[0] === 'bigint' ? `S:0x${args[0].toString(16)}` : 'S'; // v7: literal slot kept
   else if (MASK_OPS.has(op) && out === null) out = args.find((v) => v === 'C' || isS(v)) ?? null;
   else if (CMP_OPS.has(op) && onCmp) onCmp(pc, args);
+  // v8: SLOAD taint survives XOR / ADD / SUB / NOT / MUL as a computed-slot 'S' (evidence quality: masked admins)
+  if (out === null && TAINT_OPS.has(op) && args.some(isS)) out = 'S';
   stack.push(out);
 }
 
@@ -151,7 +154,7 @@ const sig = (st) => st.map((v) => (v === null ? '_' : typeof v === 'bigint' ? v.
  * detection pass) and whether any jump target stayed unresolved.
  */
 const MAX_CTX = 64;
-function computeEntries(ins, seeds = [[0, []]], onCmp = null) {
+function computeEntries(ins, seeds = [[0, []]], onCmp = null, onOp = null) {
   const idx = new Map(ins.map((x, k) => [x.pc, k]));
   const isDest = (v) => typeof v === 'bigint' && v <= 0xffffffffn && ins[idx.get(Number(v))]?.op === JUMPDEST;
   // Context key = stack depth + the positions/values of JUMPDEST-valued literals (return addresses: a call-string
@@ -208,6 +211,7 @@ function computeEntries(ins, seeds = [[0, []]], onCmp = null) {
       const { op } = ins[i];
       if (i > start && op === JUMPDEST) { edge(i, stack); break; }
       visited.add(i);
+      if (onOp) onOp(ins[i], stack);
       if (op === JUMP || op === JUMPI) {
         const t = targetsOf(stack.length ? stack[stack.length - 1] : null);
         stepStack(ins[i], stack, onCmp);
@@ -407,26 +411,50 @@ function blockContextOf(ins, df, disp, liveIdx) {
 // For every dispatcher selector outside SAFE: the literals compared (EQ / XOR) on the paths reachable from its entry,
 // e.g. `require(key == 0x1234)`. The simulator adds them to its ABI-less argument patterns.
 const MAX_HINTS = 8;
+const OWNERSHIP_TRANSFER = '0xf2fde38b'; // transferOwnership(address)
 const HINT_LIMIT = 1n << 160n;
-function selectorHintsOf(ins, df, disp) {
-  const out = {};
+function selectorHintsOf(ins, df, disp, liveIdx) {
+  const hints = {};
+  const callerGated = [];
+  const plumbing = [];
   const opAt = new Map(ins.map((x) => [x.pc, x.op]));
+  const liveCaller = liveIdx.some((k) => ins[k].op === 0x33 || ins[k].op === 0x32);
   for (const sel of Object.keys(disp.entries).sort(sortStr)) {
     if (SAFE[sel]) continue;
     const consts = new Set();
+    const callerSlots = new Set();
+    const sstores = [];
+    let calls = 0;
     const onCmp = (pc, args) => {
+      if (args.includes('C')) for (const v of args) if (isS(v)) callerSlots.add(v);
       const op = opAt.get(pc);
       if (op === 0x01 || op === 0x03) return; // ADD / SUB: memory and calldata offsets
       for (const v of args) for (const x of asSet(v) ?? []) if (x > 1n && x < HINT_LIMIT) consts.add(x);
     };
+    const onOp = (x, stack) => {
+      if (x.op === 0x55) sstores.push(stack.length ? stack[stack.length - 1] : null);
+      if ([0xf0, 0xf1, 0xf2, 0xf4, 0xf5, 0xfa, 0xff].includes(x.op)) calls++;
+    };
     const starts = disp.entries[sel];
-    const r = computeEntries(ins, starts.map((k) => [k, [...(df.entries.get(k) ?? [])]]), onCmp);
+    const r = df.unresolved ? { unresolved: true, visited: new Set() }
+      : computeEntries(ins, starts.map((k) => [k, [...(df.entries.get(k) ?? [])]]), onCmp, onOp);
+    // v8 rule: an unknown selector whose reachable code reads CALLER or ORIGIN is caller-gated. Unresolved jumps fall
+    // back to whole-code liveness (conservative).
+    const readsCaller = r.unresolved ? liveCaller
+      : [...r.visited].some((k) => ins[k].op === 0x33 || ins[k].op === 0x32);
+    if (readsCaller && !DANGEROUS[sel]) {
+      // Ownable.transferOwnership(address) shape: no external call, one SSTORE, to the literal slot compared with
+      // CALLER in this function (the owner slot). Anything more is treated as an ordinary caller-gated function.
+      const slot = sstores.length === 1 && typeof sstores[0] === 'bigint' ? `S:0x${sstores[0].toString(16)}` : null;
+      if (sel === OWNERSHIP_TRANSFER && !r.unresolved && calls === 0 && slot && callerSlots.has(slot)) plumbing.push(sel);
+      else callerGated.push(sel);
+    }
     if (r.unresolved && !consts.size) continue;
     const list = [...consts].filter((x) => x !== 0xffffffffn && !(x <= 0xffffffffn && disp.entries[selHex(x)]))
       .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).slice(0, MAX_HINTS);
-    if (list.length) out[sel] = list.map((x) => `0x${x.toString(16)}`);
+    if (list.length) hints[sel] = list.map((x) => `0x${x.toString(16)}`);
   }
-  return out;
+  return { hints, callerGated, plumbing };
 }
 
 const isPush = (op) => op >= 0x60 && op <= 0x7f;
@@ -481,6 +509,7 @@ export function analyzeCode(codeHex) {
   const callerCodeOffsets = [];
   let balanceReads = 0;
   let unsafeDelegate = false;
+  const liveCallerIdx = []; // live CALLER / ORIGIN (whole-code fallback of the caller-gated rule)
   const liveBlockCtx = []; // instruction indices of live NUMBER/TIMESTAMP/ORIGIN/TLOAD (whole-code fallback)
 
   // Entry stacks for every JUMPDEST from a small dataflow pass (constants / tags flow across internal jumps). If
@@ -574,6 +603,7 @@ export function analyzeCode(codeHex) {
     }
     if (op === SELFBALANCE) { externalStateOffsets.push(pc); balanceReads++; }
     if (BLOCK_CTX_OPS[op]) liveBlockCtx.push(i);
+    if (op === 0x33 || op === 0x32) liveCallerIdx.push(i);
     if (op === SELFDESTRUCT) opcodes.selfdestruct++;
     if (TERMINATORS.has(op)) { live = false; stack = []; continue; }
     stepStack(ins[i], stack, onCmp);
@@ -589,7 +619,8 @@ export function analyzeCode(codeHex) {
   const blockContext = blockContextOf(ins, df, disp, liveBlockCtx);
   const blockContextRead = Object.keys(blockContext.ops).length > 0;
   const envFingerprint = ENV_FINGERPRINT_OPS.some((n) => blockContext.ops[n]);
-  const selectorHints = df.unresolved ? {} : selectorHintsOf(ins, df, disp);
+  const unk = selectorHintsOf(ins, df, disp, liveCallerIdx);
+  const selectorHints = df.unresolved ? {} : unk.hints;
   return {
     selectors: sel,
     linearSelectors: linear,
@@ -603,13 +634,15 @@ export function analyzeCode(codeHex) {
     callerLiterals: [...callerLiterals].sort(sortStr),
     callerCheckSlots: [...new Set(callerCheckSlots.map(String))].sort(sortStr).map((x) => (x === 'null' ? null : x)),
     selectorHints,
+    callerGatedUnknown: unk.callerGated,
+    ownershipPlumbing: unk.plumbing,
     envFingerprint,
     externalCalls: { count: externalCallOffsets.length, offsets: externalCallOffsets },
     externalState: { count: externalStateOffsets.length, offsets: externalStateOffsets, balance: balanceReads },
     callerCodeChecks: { count: callerCodeOffsets.length, offsets: callerCodeOffsets },
     unsafeDelegatecall: unsafeDelegate,
     upgradeable: unsafeDelegate || upgradeSelector,
-    dangerSetter: dangerous.length > 0 || opcodes.selfdestruct > 0 || envFingerprint,
+    dangerSetter: dangerous.length > 0 || opcodes.selfdestruct > 0 || envFingerprint || unk.callerGated.length > 0,
     accessControl,
     blockContext,
     privilegedCode: accessControl || callerChecks.length > 0 || callerLiteralChecks.length > 0
@@ -733,6 +766,7 @@ export async function scan(client, token, { blockNumber } = {}) {
   if (both((x) => x.externalState.count > 0)) reasons.add('external-state');
   if (both((x) => Object.keys(x.blockContext.ops).length > 0)) reasons.add('block-context');
   if (both((x) => x.envFingerprint)) reasons.add('env-fingerprint');
+  if (both((x) => x.callerGatedUnknown.length > 0)) reasons.add('caller-gated-unknown');
   if (both((x) => x.dangerous.length > 0)) reasons.add('dangerous-selector');
   if (both((x) => x.opcodes.selfdestruct > 0)) reasons.add('live-selfdestruct');
   if (dispatcherUnrecognized) reasons.add('dispatcher-unrecognized');
@@ -779,6 +813,8 @@ export async function scan(client, token, { blockNumber } = {}) {
       callerCheckSlots: [...new Set([...a.callerCheckSlots, ...(ia?.callerCheckSlots ?? [])].map(String))].sort(sortStr)
         .map((x) => (x === 'null' ? null : x)),
       selectorHints: { ...(ia?.selectorHints ?? {}), ...a.selectorHints },
+      callerGatedUnknown: [...new Set([...a.callerGatedUnknown, ...(ia?.callerGatedUnknown ?? [])])].sort(sortStr),
+      ownershipPlumbing: [...new Set([...a.ownershipPlumbing, ...(ia?.ownershipPlumbing ?? [])])].sort(sortStr),
       proxySlots,
       implementation,
       clone,

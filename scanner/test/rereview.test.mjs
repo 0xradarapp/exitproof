@@ -142,20 +142,17 @@ test('N-02 CoinbaseGatedTrap: the fork gets the forked chain coinbase => trap ca
   }
 });
 
-test('N-01 fail-closed rule: a renounced owner (owner() == 0) does not make the onlyOwner leftovers fail closed', async () => {
-  // RenamedSetterBomb with its owner slot zeroed: setSellFeeBps now reverts for everyone (like transferOwnership on a
-  // renounced token); the caller-vs-storage gate belongs to the renounced owner
+test('v8: owner-renounce is not trusted: zeroing the owner slot does not clear a caller-gated setter', async () => {
   const { token, pair } = await launchAudit(env, infra, 'RenamedSetterBomb', { pairCreator: other });
-  const sim0 = await simulate(env.rpc, token.address, pair.address, { callers: [other.account.address] });
-  assert.ok(sim0.signals.some((x) => x.startsWith('unknown-setter-trap')), 'owner active: trap found');
   // AuditERC20 slots: name 0, symbol 1, totalSupply 2, balanceOf 3, allowance 4, then owner 5
   await env.pub.request({ method: 'anvil_setStorageAt', params: [token.address, `0x${'00'.repeat(31)}05`, `0x${'00'.repeat(32)}`] });
+  const s = await scan(env.pub, token.address);
+  assert.equal(s.evidence.owner, null);
+  assert.equal(s.dangerSetter, true);
   const sim = await simulate(env.rpc, token.address, pair.address, { callers: [other.account.address] });
   assert.equal(sim.evidence.unknownSweep.complete, false);
-  assert.equal(sim.evidence.unknownSweep.ownerRenounced, true);
-  assert.deepEqual(sim.evidence.unknownSweep.failClosedBecause, []);
-  assert.ok(!sim.signals.includes('sweep-incomplete'));
-  assert.equal(sim.dangerSetter, false);
+  assert.ok(sim.evidence.unknownSweep.failClosedBecause.includes('caller-vs-storage'));
+  assert.ok(sim.signals.includes('sweep-incomplete'));
 });
 
 test('swap-back (Flap-style) token: sells priced on post-transfer reserves => sellable, no baseline-sell-failed', async () => {
