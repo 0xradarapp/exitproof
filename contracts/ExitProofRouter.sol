@@ -239,7 +239,8 @@ contract ExitProofRouter {
         if (!ok) return (false, 0);
         uint256 bal;
         (ok, bal) = _tryBalanceOf(token, pair);
-        if (!ok || bal <= rTok) return (false, 0);
+        // a V2 pair cannot hold more than uint112 (its _update reverts): mirror that, and never overflow _amountOut
+        if (!ok || bal <= rTok || bal > type(uint112).max) return (false, 0);
         uint256 requested = _amountOut(bal - rTok, rTok, rIn, fee);
         if (requested == 0) return (false, 0);
         uint256 before;
