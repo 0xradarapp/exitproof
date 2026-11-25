@@ -39,7 +39,10 @@ const REGISTRY_ABI = parseAbi([
 const ERC20_ABI = parseAbi(['function symbol() view returns (string)', 'function decimals() view returns (uint8)']);
 const PROBE_FROM = getAddress('0x00000000000000000000000000000000e21df00f'); // read-only checks: any address, balance overridden
 const CALL_GAS = 10_000_000n; // the probe alone needs ~3.1M available; eth_call gas is free
-const FALLBACK_GAS = 4_000_000n; // only when the wallet-side estimate fails without a revert reason (>= 3.5M rule)
+// Measured on X Layer (block gas limit 210M): the first buy of a ~24KB token costs ~4.82M gas (bytecode scan runs once per
+// codehash, then cached); worst case, a 24KB token that also burns the full probe cap, costs 7.62M. So 4M was too low.
+const FALLBACK_GAS = 8_000_000n; // only when the wallet-side estimate fails without a revert reason
+const MIN_GAS = 3_500_000n, MAX_GAS = 12_000_000n; // clamp for every gas limit we send
 
 function die(msg, code = 2) {
   console.log(JSON.stringify({ error: msg }, null, 2));
@@ -210,11 +213,13 @@ async function prepareBuy(o, ctx, address) {
   return { v, args, data: encodeFunctionData({ abi: ROUTER_ABI, functionName: 'buyETH', args }) };
 }
 
-/** Wallet-side gas: estimate (+20%). A decodable revert stops the buy; an undecodable failure gets 4M (>= 3.5M). */
+function clampGas(g) { return g < MIN_GAS ? MIN_GAS : g > MAX_GAS ? MAX_GAS : g; }
+
+/** Wallet-side gas: estimate (+20%). A decodable revert stops the buy; an undecodable failure gets 8M. Clamped to 3.5M..12M. */
 async function gasFor(o, ctx, account, args) {
   try {
     const g = await ctx.pub.estimateContractGas({ address: ctx.net.router, abi: ROUTER_ABI, functionName: 'buyETH', args, value: o.value, account });
-    return g * 12n / 10n;
+    return clampGas(g * 12n / 10n);
   } catch (e) {
     const r = decodeRevert(revertData(e));
     if (r.name === 'Blocked') {
@@ -225,7 +230,7 @@ async function gasFor(o, ctx, account, args) {
       console.log(JSON.stringify({ sent: false, why: r.name, reasonText: errorText(r.name) }, null, 2));
       process.exit(1);
     }
-    return FALLBACK_GAS;
+    return clampGas(FALLBACK_GAS);
   }
 }
 

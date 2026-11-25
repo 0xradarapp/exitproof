@@ -17,7 +17,11 @@ const REGISTRY = new ethers.Interface([
 const ERC20 = new ethers.Interface(['function symbol() view returns (string)', 'function decimals() view returns (uint8)']);
 const PROBE_FROM = '0x00000000000000000000000000000000e21df00f'; // read-only checks; its balance is overridden
 const CALL_GAS = '0x989680'; // 10M for eth_call: the sell probe needs ~3.1M available
-const FALLBACK_GAS = 4_000_000n; // wallet estimate failed without a reason: never below 3.5M
+// Measured on X Layer (block gas limit 210M): the first buy of a ~24KB token costs ~4.82M gas (bytecode scan runs once per
+// codehash, then cached); worst case, a 24KB token that also burns the full probe cap, costs 7.62M. So 4M was too low.
+const FALLBACK_GAS = 8_000_000n; // wallet estimate failed without a reason
+const MIN_GAS = 3_500_000n, MAX_GAS = 12_000_000n; // clamp for every gas limit we send
+const clampGas = (g) => (g < MIN_GAS ? MIN_GAS : g > MAX_GAS ? MAX_GAS : g);
 const FEED_WINDOW = 100; // blocks per eth_getLogs
 const FEED_SPAN = 2000; // look back at most this far
 const FEED_MAX = 12;
@@ -362,12 +366,12 @@ async function buy() {
     const tx = { from: account, to: n.router, data, value: r.amount };
     let gasLimit;
     try {
-      gasLimit = (await provider.estimateGas(tx)) * 12n / 10n;
+      gasLimit = clampGas((await provider.estimateGas(tx)) * 12n / 10n);
     } catch (e) {
       const d = decodeRevert(walletRevertData(e));
       if (d.name === 'Blocked') return fail(fill(L.buyBlocked, { reason: reasonText(d.args[0], r.mode, state.lang) }));
       if (d.name) return fail(errorText(d.name, state.lang));
-      gasLimit = FALLBACK_GAS; // no reason given: send with room for the probe; the router still reverts on deny
+      gasLimit = clampGas(FALLBACK_GAS); // no reason given: send with room for the probe; the router still reverts on deny
     }
     // re-check right before signing: the user may have switched networks while we were estimating
     if (Number(await window.ethereum.request({ method: 'eth_chainId' })) !== n.chainId) return fail(L.wrongChain);
