@@ -18,3 +18,8 @@ export function eqDispatcher(extra = [], tail = '') {
   const d = dest.toString(16).padStart(4, '0');
   return `0x${prologue}${body.replaceAll('ZZZZ', d)}5f5ffd${tail}5b00`;
 }
+
+/** EIP-1167 minimal proxy runtime pointing at `impl`. */
+export const eip1167 = (impl) => `0x363d3d373d3d3d363d73${impl.slice(2).toLowerCase()}5af43d82803e903d91602b57fd5bf3`;
+/** ERC-7511 (PUSH0) minimal proxy runtime pointing at `impl`. */
+export const erc7511 = (impl) => `0x365f5f375f5f365f73${impl.slice(2).toLowerCase()}5af43d5f5f3e5f3d91602a57fd5bf3`;

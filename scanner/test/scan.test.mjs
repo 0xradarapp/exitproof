@@ -5,7 +5,7 @@ import { scan } from '../src/scan.mjs';
 import { selectorOf } from '../src/selectors.mjs';
 import { SLOTS } from '../src/proxy.mjs';
 import { startAnvil, deployToken, deployScannerFixture, SUPPLY } from './helpers.mjs';
-import { XOR_DISPATCHER, eqDispatcher } from './fixtures/raw.mjs';
+import { XOR_DISPATCHER, eqDispatcher, eip1167, erc7511 } from './fixtures/raw.mjs';
 
 let env;
 before(async () => { env = await startAnvil(); });
@@ -172,6 +172,60 @@ test('fixture audit: flags for every test/fixtures/Tokens.sol token under scanne
     got[name] = [r.privileged, r.upgradeable, r.dangerSetter, r.evidence.reasons];
   }
   assert.deepEqual(got, expected);
+});
+
+const FL = (r) => [r.privileged, r.upgradeable, r.dangerSetter, r.ownerCanTrap, r.evidence.reasons];
+let cloneN = 0;
+async function clone(code) {
+  cloneN += 1;
+  const a = `0x00000000000000000000000000000000c10e${cloneN.toString(16).padStart(4, '0')}`;
+  await env.pub.request({ method: 'anvil_setCode', params: [a, code] });
+  return a;
+}
+
+test('EIP-1167 / ERC-7511 clone of CleanToken: same flags as CleanToken, not upgradeable', async () => {
+  const t = await deployToken(env, 'CleanToken');
+  const base = await scan(env.pub, t.address);
+  for (const mk of [eip1167, erc7511]) {
+    const c = await clone(mk(t.address));
+    const r = await scan(env.pub, c);
+    assert.deepEqual(FL(r), FL(base));
+    assert.equal(r.upgradeable, false);
+    assert.equal(r.evidence.clone.implementation.toLowerCase(), t.address.toLowerCase());
+    assert.deepEqual(r.evidence.selectors, base.evidence.selectors);
+  }
+});
+
+test('clone of TimeBombToken: dangerSetter (setSellFee seen through the clone)', async () => {
+  const t = await deployToken(env, 'TimeBombToken');
+  const r = await scan(env.pub, await clone(eip1167(t.address)));
+  assert.equal(r.dangerSetter, true);
+  assert.equal(r.privileged, true);
+  assert.equal(r.upgradeable, false);
+  assert.ok(r.evidence.dangerous.some((d) => d.signature === 'setSellFee(uint256)'));
+});
+
+test('clone of an EOA, or of another clone: fail-closed', async () => {
+  const eoa = await scan(env.pub, await clone(eip1167('0x00000000000000000000000000000000000e0a01')));
+  assert.equal(eoa.upgradeable, true);
+  assert.equal(eoa.privileged, true);
+  assert.equal(eoa.dangerSetter, true);
+  assert.ok(eoa.evidence.reasons.includes('dispatcher-unrecognized'));
+  assert.ok(eoa.evidence.reasons.includes('clone-unresolved'));
+  const t = await deployToken(env, 'CleanToken');
+  const inner = await clone(eip1167(t.address));
+  const nested = await scan(env.pub, await clone(eip1167(inner)));
+  assert.equal(nested.upgradeable, true);
+  assert.ok(nested.evidence.reasons.includes('dispatcher-unrecognized'));
+  assert.ok(nested.evidence.reasons.includes('clone-unresolved'));
+});
+
+test('near-miss clone bytes are not treated as a clone', async () => {
+  const t = await deployToken(env, 'CleanToken');
+  const bad = eip1167(t.address).replace(/5bf3$/, '5bfd');
+  const r = await scan(env.pub, await clone(bad));
+  assert.equal(r.evidence.clone, null);
+  assert.equal(r.upgradeable, true);
 });
 
 test('scan rejects an address without code', async () => {

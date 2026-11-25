@@ -20,6 +20,9 @@
 //    OR EIP-1822 PROXIABLE slot non-zero OR upgradeTo/upgradeToAndCall/setImplementation selector in the dispatcher.
 // 5. dangerSetter = any selector from selectors.mjs DANGEROUS in the dispatcher (token, plus the EIP-1967
 //    implementation's dispatcher when the token is a proxy) OR a live SELFDESTRUCT.
+// 5b. Minimal proxies (exact EIP-1167 / ERC-7511 runtime only): the implementation's code is analyzed instead of
+//    the clone's (its own fixed-target DELEGATECALL does not count). An implementation without code, or one that is
+//    itself a clone, is fail-closed: upgradeable + dispatcher-unrecognized + reason `clone-unresolved`.
 // 6. privileged = owner()/getOwner() returns a non-zero 32-byte word (a non-address word counts: conservative)
 //    OR hasRole(bytes32,address) (AccessControl) selector present OR dangerSetter.
 //    The owner probe is an eth_call capped at 100k gas; revert, short (<32 byte) return or gas exhaustion => no owner.
@@ -180,6 +183,23 @@ export function analyzeCode(codeHex) {
   };
 }
 
+const CLONE_PATTERNS = [
+  // EIP-1167
+  /^0x363d3d373d3d3d363d73([0-9a-f]{40})5af43d82803e903d91602b57fd5bf3$/,
+  // ERC-7511 (PUSH0 minimal proxy)
+  /^0x365f5f375f5f365f73([0-9a-f]{40})5af43d5f5f3e5f3d91602a57fd5bf3$/,
+];
+
+/** Implementation address if `code` is exactly an EIP-1167 / ERC-7511 minimal proxy, else null. */
+export function cloneTarget(code) {
+  const c = code.toLowerCase();
+  for (const re of CLONE_PATTERNS) {
+    const m = re.exec(c);
+    if (m) return getAddress(`0x${m[1]}`);
+  }
+  return null;
+}
+
 async function probeOwner(client, address, blockNumber) {
   for (const data of OWNER_GETTERS) {
     let ret;
@@ -208,7 +228,27 @@ export async function scan(client, token, { blockNumber } = {}) {
   const code = await client.getCode({ address, blockNumber: bn });
   if (!code || code === '0x') throw new Error(`scan: no code at ${address}`);
   const codehash = keccak256(code);
-  const a = analyzeCode(code);
+
+  // EIP-1167 / ERC-7511 minimal proxy: the implementation address is baked into the code, so the clone itself is
+  // not upgradeable; analyze the implementation's code in its place (one level only; unresolvable => fail closed).
+  let clone = null;
+  let cloneUnresolved = false;
+  let a;
+  const cloneImpl = cloneTarget(code);
+  if (cloneImpl) {
+    clone = { implementation: cloneImpl };
+    const implCode = await client.getCode({ address: cloneImpl, blockNumber: bn });
+    if (!implCode || implCode === '0x' || cloneTarget(implCode)) {
+      cloneUnresolved = true;
+      a = analyzeCode('0x');
+      a.upgradeable = true;
+    } else {
+      clone.codehash = keccak256(implCode);
+      a = analyzeCode(implCode);
+    }
+  } else {
+    a = analyzeCode(code);
+  }
   const proxySlots = await readProxySlots(client, address, bn);
 
   // When the token is an EIP-1967 proxy, the implementation's dispatcher is what users actually call.
@@ -255,6 +295,7 @@ export async function scan(client, token, { blockNumber } = {}) {
   if (a.selectors.some((x) => UPGRADE_SELECTORS.includes(x))) reasons.add('upgrade-selector');
   if (a.unsafeDelegatecall) reasons.add('delegatecall');
   if (slotUpgradeable) reasons.add('proxy-slot');
+  if (cloneUnresolved) reasons.add('clone-unresolved');
 
   const upgradeable = a.upgradeable || slotUpgradeable;
   const dangerSetter = both((x) => x.dangerSetter) || dispatcherUnrecognized;
@@ -281,6 +322,7 @@ export async function scan(client, token, { blockNumber } = {}) {
       externalCalls: a.externalCalls,
       proxySlots,
       implementation,
+      clone,
       owner,
       opcodes: a.opcodes,
     },

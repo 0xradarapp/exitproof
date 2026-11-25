@@ -31,6 +31,8 @@ node --test test/                                     # needs anvil and ../out (
 
 `evidence.reasons` lists which rules fired.
 
+Minimal proxies are resolved. A clone whose runtime is exactly EIP-1167 (`363d3d373d3d3d363d73<impl>5af43d82803e903d91602b57fd5bf3`) or ERC-7511 (`365f5f375f5f365f73<impl>5af43d5f5f3e5f3d91602a57fd5bf3`) is scanned using its implementation's code. The clone's own fixed DELEGATECALL does not count, and the result is recorded in `evidence.clone`. Only one level is resolved. If the implementation has no code or is itself a clone, the scan fails closed: upgradeable, dispatcher-unrecognized, `clone-unresolved`.
+
 The dispatcher is unrecognized when the EQ-form extraction does not find all of `transfer`, `transferFrom`, `approve` and `balanceOf`. For proxies the token and implementation dispatchers are merged before this check.
 
 ## Limitations
