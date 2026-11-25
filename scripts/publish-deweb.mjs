@@ -11,7 +11,8 @@
 //   d. upload every file: putFile(chunk 0) + appendChunk(1…) in 24,000-byte chunks, assets first and index.html last;
 //      a file whose on-chain sha256 and chunk count already match is skipped, a half-uploaded one continues where it
 //      stopped; every file is then read back with readRange and its SHA-256 compared with the local file
-//   e. setFallback("index.html"), then bind(name, container, MONTHS) paying monthlyFee() × MONTHS
+//   e. setFallback("index.html"), then bind(name, container, MONTHS) paying monthlyFee() × MONTHS (MONTHS defaults
+//      to 1, the protocol minimum; renew or extend later with MONTHS=n)
 //   f. resolve the name exactly as the TapeKit kernel does (cpuAt → accountOf/isOpened → ownerOf → isLive /
 //      isContainerLive → pathCount/pathsRange/fallbackPath → fileInfo + readRange + sha256) and print the gateway URL
 //
@@ -22,14 +23,18 @@
 //   RPC_URL=http://127.0.0.1:8549 SEND=1 node scripts/publish-deweb.mjs             rehearsal on a local anvil fork
 //   SEND=1 CONFIRM_MAINNET=yes node scripts/publish-deweb.mjs                       mainnet (prints the exact spend first)
 //
+// Guards: fee caps (open ≤ 0.1 OKB, name ≤ 0.05 OKB, all fees ≤ 0.15 OKB; FEE_CAP_OKB=<n> replaces all three with n),
+// the Opener's runtime code hash is pinned, dist/deweb.manifest.json must embed exactly the router/registry/processor/
+// circuitId of deployments/<network>.json (no stale or "pending" build), one run at a time (lock file).
+//
 // Env: DEPLOYER_KEY (required, 0x + 64 hex; environment only; must hold the circuit NFT), RPC_URL (default
-//      https://rpc.xlayer.tech), SEND=1, CONFIRM_MAINNET=yes (mainnet only), MONTHS (default 12),
+//      https://rpc.xlayer.tech), SEND=1, CONFIRM_MAINNET=yes (mainnet only), MONTHS (default 1), FEE_CAP_OKB,
 //      PROCESSOR + CIRCUIT_ID (override deployments/<network>.json).
 
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { createWalletClient, http, parseAbi, formatEther, formatGwei, getAddress, toHex, keccak256, toBytes } from 'viem';
+import { createWalletClient, http, parseAbi, formatEther, formatGwei, parseEther, getAddress, toHex, keccak256, toBytes } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { ROOT, loadConstants, xlayerChain, detectNetwork, deploymentFile } from './lib/net.mjs';
 
@@ -42,6 +47,14 @@ const BINDING = getAddress('0x68809Fd2fb343aA57D0aeB7f33Defe477c9666f9');
 // ERC-1967 implementations TapeKit pins (kernel/config.js expectedImpl): any other → the gateway shows "store-changed"
 const EXPECTED_IMPL = { [SITES]: '0xa85c4143d1d4a77f54b8e4ecc9e6d1418afea45f', [BINDING]: '0x5ebf29b80789e548907c707530c3c7607c4347df' };
 const IMPL_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+// The Opener is not a proxy (ERC-1967 implementation and beacon slots are empty, no owner()): pin its runtime code.
+// FEE() is then whatever this exact code returns. Read on X Layer mainnet 2026-11-25.
+const OPENER_CODEHASH = '0xf0c334d8d72983af1c38694dac7a1c83348c0c000cbb987467d2aedee06999fd';
+// Fee caps (msg.value): checked against the on-chain fees before anything is sent, and again right before each payment
+const CAP_ENV = process.env.FEE_CAP_OKB;
+const CAPS = CAP_ENV !== undefined
+  ? { open: parseEther(CAP_ENV), bind: parseEther(CAP_ENV), total: parseEther(CAP_ENV), from: 'FEE_CAP_OKB=' + CAP_ENV }
+  : { open: parseEther('0.1'), bind: parseEther('0.05'), total: parseEther('0.15'), from: 'built-in' };
 const AREA = 2; // TapeKit area code of X Layer
 const CHUNK = 24_000;
 const READ = 24_000; // readRange window (TapeKit reads in the same size)
@@ -53,8 +66,11 @@ const GAS = { open: 200_000n, perByte: 225n, perTx: 120_000n, fallback: 130_000n
 
 const SEND = process.env.SEND === '1';
 const RPC_URL = process.env.RPC_URL || 'https://rpc.xlayer.tech';
-const MONTHS = BigInt(process.env.MONTHS || 12);
+const MONTHS = BigInt(process.env.MONTHS || 1); // DomainBinding accepts 1 (fork-tested); 0 reverts
 const DIST = path.join(ROOT, 'dist', 'deweb');
+const MANIFEST = path.join(ROOT, 'dist', 'deweb.manifest.json');
+const ZERO = '0x0000000000000000000000000000000000000000';
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
 const ABI = parseAbi([
   'function cpuCount() view returns (uint256)',
@@ -133,11 +149,29 @@ function loadSite() {
   const html = fs.readFileSync(path.join(DIST, FALLBACK), 'utf8');
   if (/127\.0\.0\.1|localhost:|\[::1\]/.test((html.match(/Content-Security-Policy" content="([^"]*)"/) || [])[1] || '') ||
       /"rpc":"http:\/\//.test(html)) throw new Error('dist/deweb/index.html points at a local RPC: rebuild with node scripts/build-deweb.mjs');
-  return files;
+  if (!fs.existsSync(MANIFEST)) throw new Error('dist/deweb.manifest.json missing: rebuild with node scripts/build-deweb.mjs');
+  const manifest = JSON.parse(fs.readFileSync(MANIFEST, 'utf8'));
+  const listed = Object.keys(manifest.files || {}).sort().join('\n');
+  if (listed !== files.map((f) => f.path).sort().join('\n')) throw new Error('dist/deweb does not hold exactly the files of dist/deweb.manifest.json: rebuild');
+  for (const f of files) if ('0x' + manifest.files[f.path] !== f.sha) throw new Error('dist/deweb/' + f.path + ' changed after the build: rebuild');
+  return { files, manifest };
+}
+
+/** The build must embed exactly this network's deployment: no "pending" page, no stale addresses. */
+function checkManifest(manifest, network, dep, depName) {
+  const e = manifest.embedded || {};
+  if (manifest.network !== network) throw new Error('dist/deweb was built for "' + manifest.network + '" but this RPC is "' + network + '": rebuild with DEPLOYMENT=' + network);
+  const bad = [];
+  for (const k of ['router', 'registry', 'processor', 'circuitId']) {
+    if (e[k] === null || e[k] === undefined || e[k] === '') { bad.push(k + ' is empty in the build ("pending" page)'); continue; }
+    if (dep[k] === undefined || dep[k] === null) { bad.push(k + ' is missing in ' + depName); continue; }
+    if (String(e[k]).toLowerCase() !== String(dep[k]).toLowerCase()) bad.push(k + ' ' + e[k] + ' ≠ ' + depName + ' ' + dep[k]);
+  }
+  if (bad.length) throw new Error('refusing to publish a stale build: ' + bad.join('; ') + '. Run node scripts/build-deweb.mjs' + (network === 'fork' ? ' with DEPLOYMENT=fork' : '') + ' after deploy.mjs.');
 }
 
 async function main() {
-  const files = loadSite();
+  const { files, manifest } = loadSite();
   const totalBytes = files.reduce((s, f) => s + f.size, 0);
   const totalChunks = files.reduce((s, f) => s + f.chunks.length, 0);
   console.log('Site           ' + files.length + ' files, ' + totalBytes.toLocaleString('en-US') + ' bytes, ' + totalChunks + ' chunks of ≤' + CHUNK + ' bytes (dist/deweb)');
@@ -161,26 +195,40 @@ async function main() {
   if (!circuitId || processor === '0x0000000000000000000000000000000000000000') {
     throw new Error(path.relative(ROOT, deploymentFile(NETWORK)) + ' has no processor/circuitId: run scripts/tapeout.mjs on this network first (or set PROCESSOR and CIRCUIT_ID)');
   }
+  checkManifest(manifest, NETWORK, dep, path.relative(ROOT, deploymentFile(NETWORK)));
+  if (getAddress(manifest.embedded.processor) !== processor || BigInt(manifest.embedded.circuitId) !== circuitId) {
+    throw new Error('the build embeds processor ' + manifest.embedded.processor + ' #' + manifest.embedded.circuitId + ', but this publish is for ' + processor + ' #' + circuitId);
+  }
+  console.log('Build          dist/deweb.manifest.json: ' + NETWORK + ' router ' + manifest.embedded.router + ', registry ' + manifest.embedded.registry + ' = ' + path.relative(ROOT, deploymentFile(NETWORK)) + ' ✓');
   const STATE_FILE = path.join(ROOT, 'deployments', 'deweb-' + NETWORK + '.json');
+  const LOCK = STATE_FILE.replace(/\.json$/, '.lock');
+  if (SEND) {
+    // one run at a time: two runs would race on chunk indexes and nonces
+    try { fs.writeFileSync(LOCK, String(process.pid), { flag: 'wx' }); } catch {
+      const other = Number(fs.readFileSync(LOCK, 'utf8'));
+      let alive = false; try { process.kill(other, 0); alive = true; } catch { /* gone */ }
+      if (alive) throw new Error('another publish-deweb run (pid ' + other + ') holds ' + path.relative(ROOT, LOCK));
+      fs.writeFileSync(LOCK, String(process.pid));
+      console.log('Lock           took over the stale lock of pid ' + other);
+    }
+    process.on('exit', () => { try { if (fs.readFileSync(LOCK, 'utf8') === String(process.pid)) fs.unlinkSync(LOCK); } catch { /* already gone */ } });
+  }
   const state = fs.existsSync(STATE_FILE) ? JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) : {};
   if (state.processor && (getAddress(state.processor) !== processor || state.circuitId !== circuitId.toString())) {
     throw new Error(path.relative(ROOT, STATE_FILE) + ' is for ' + state.processor + ' #' + state.circuitId + ', not ' + processor + ' #' + circuitId);
   }
-  const save = () => { if (SEND) fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n'); };
+  const save = () => { // atomic: write a temp file, then rename over the state file
+    if (!SEND) return;
+    const tmp = STATE_FILE + '.' + process.pid + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n');
+    fs.renameSync(tmp, STATE_FILE);
+  };
   Object.assign(state, { network: NETWORK, chainId, processor, circuitId: circuitId.toString(), wallet: account.address });
   state.txs ||= []; state.files ||= {};
 
   const code = await pub.getCode({ address: account.address });
   if (code && code !== '0x') throw new Error('wallet ' + account.address + ' has contract code (EIP-7702); use a plain EOA');
-  // A tx sent by an interrupted run: wait for it before reading what is on chain (a duplicate would only revert, but why pay)
-  for (const t of state.txs.filter((x) => !x.gas && !x.dropped)) {
-    const seen = await pub.getTransaction({ hash: t.hash }).catch(() => null);
-    if (!seen) { t.dropped = true; console.log('Earlier tx     ' + t.label + ' ' + t.hash + ' is unknown to the node: treated as dropped'); continue; }
-    console.log('Earlier tx     waiting for ' + t.label + ' ' + t.hash);
-    const r = await pub.waitForTransactionReceipt({ hash: t.hash, timeout: 300_000 });
-    Object.assign(t, { block: r.blockNumber.toString(), gas: r.gasUsed.toString(), gasPrice: r.effectiveGasPrice.toString(), value: (seen.value || 0n).toString(), status: r.status });
-  }
-  save();
+  await reconcile(pub, account.address, state, save);
 
   // ---- a. checks
   if (!(await read(FACTORY, 'isCPU', [processor]))) throw new Error(processor + ' is not a TapeOut processor');
@@ -200,6 +248,10 @@ async function main() {
     const impl = '0x' + impls[i].slice(-40);
     if (impl.toLowerCase() !== EXPECTED_IMPL[a]) throw new Error(a + ' implementation is ' + impl + ', TapeKit pins ' + EXPECTED_IMPL[a] + ' (the gateway would refuse to serve)');
   });
+  const openerCode = await pub.getCode({ address: OPENER });
+  const openerHash = openerCode ? keccak256(openerCode) : '0x';
+  const openerImpl = '0x' + (await pub.getStorageAt({ address: OPENER, slot: IMPL_SLOT })).slice(-40);
+  if (openerHash !== OPENER_CODEHASH) throw new Error('Opener runtime code hash is ' + openerHash + ', pinned ' + OPENER_CODEHASH + ' (code changed: re-check FEE() before trusting it)');
   if (BigInt(CHUNK) > chunkMax) throw new Error('CHUNK_MAX is ' + chunkMax + ' < ' + CHUNK);
   for (const f of files) if (BigInt(f.chunks.length) > chunksMax) throw new Error(f.path + ' needs ' + f.chunks.length + ' chunks, CHUNKS_MAX is ' + chunksMax);
 
@@ -213,7 +265,7 @@ async function main() {
   console.log('Circuit        #' + circuitId + ' on processor ' + processor + ' (index ' + cpuIndex + ' in the TapeOut factory) · holder = wallet ✓');
   console.log('Name           ' + NAME + '  →  ' + URL_);
   console.log('Container      ' + container + ' (ERC-6551 account of the circuit NFT) · opened: ' + opened);
-  console.log('Contracts      Opener ' + OPENER + ' · SiteRegistry ' + SITES + ' · DomainBinding ' + BINDING + ' (implementations = TapeKit pins ✓)');
+  console.log('Contracts      Opener ' + OPENER + ' (code hash pinned ✓, ERC-1967 slot ' + openerImpl + ') · SiteRegistry ' + SITES + ' · DomainBinding ' + BINDING + ' (implementations = TapeKit pins ✓)');
 
   // ---- what is already on chain
   const editable = opened ? await read(SITES, 'canEdit', [container, account.address]) : false;
@@ -245,13 +297,20 @@ async function main() {
     sendChunks.length && 'upload ' + todo.filter((t) => t.from < t.f.chunks.length).length + ' files in ' + sendChunks.length + ' txs (' +
       sendChunks.reduce((s, c) => s + c.length, 0).toLocaleString('en-US') + ' bytes)',
     fbNow !== FALLBACK && 'setFallback(' + FALLBACK + ')',
-    !live && 'bind ' + NAME + ' for ' + MONTHS + ' months (' + formatEther(monthlyFee * MONTHS) + ' OKB)'
+    !live && 'bind ' + NAME + ' for ' + MONTHS + ' month(s) (' + formatEther(monthlyFee * MONTHS) + ' OKB)'
   ].filter(Boolean);
   const gasOkb = plan.gas * gasPrice;
-  console.log('Fees           open ' + formatEther(openFee) + ' OKB (once) · name ' + formatEther(monthlyFee) + ' OKB/month × ' + MONTHS + ' · gas price ' + formatGwei(gasPrice) + ' gwei · BEM: none');
+  const bindTotal = monthlyFee * MONTHS;
+  console.log('Fees           open ' + formatEther(openFee) + ' OKB (once) · name ' + formatEther(monthlyFee) + ' OKB/month × ' + MONTHS + ' month(s) · gas price ' + formatGwei(gasPrice) + ' gwei · BEM: none');
+  console.log('Fee caps       open ≤ ' + formatEther(CAPS.open) + ' · name ≤ ' + formatEther(CAPS.bind) + ' · all fees ≤ ' + formatEther(CAPS.total) + ' OKB (' + CAPS.from + ')');
   console.log('Plan           ' + (steps.length ? steps.join(' → ') : 'nothing to send; verify only'));
-  console.log('Will spend     ' + formatEther(plan.fees) + ' OKB fees + ≈' + formatEther(gasOkb) + ' OKB gas (≈' + plan.gas.toLocaleString('en-US') + ' gas) = ≈' +
+  console.log('Will spend     ' + formatEther(plan.fees) + ' OKB fees (exact) + ≈' + formatEther(gasOkb) + ' OKB gas (estimated, ≈' + plan.gas.toLocaleString('en-US') + ' gas) = ≈' +
     formatEther(plan.fees + gasOkb) + ' OKB · 0 BEM · balance ' + formatEther(okb0) + ' OKB');
+  const capErr = [];
+  if (!opened && openFee > CAPS.open) capErr.push('open fee ' + formatEther(openFee) + ' > cap ' + formatEther(CAPS.open));
+  if (!live && bindTotal > CAPS.bind) capErr.push('name fee ' + formatEther(bindTotal) + ' > cap ' + formatEther(CAPS.bind));
+  if (plan.fees > CAPS.total) capErr.push('total fees ' + formatEther(plan.fees) + ' > cap ' + formatEther(CAPS.total));
+  if (capErr.length) throw new Error('fee cap exceeded, nothing sent: ' + capErr.join('; ') + '. Check the fees on chain; to accept them set FEE_CAP_OKB=<OKB>.');
   if (okb0 < plan.fees + gasOkb + gasOkb / 4n) throw new Error('Not enough OKB: need ≈' + formatEther(plan.fees + gasOkb + gasOkb / 4n) + ' (incl. 25% gas margin), have ' + formatEther(okb0));
 
   if (SEND && MAINNET && steps.length) {
@@ -261,7 +320,10 @@ async function main() {
     console.log('  container  ' + container);
     console.log('  name       ' + NAME + '  →  ' + URL_);
     console.log('  steps      ' + steps.join(' → '));
-    console.log('  spend      ' + formatEther(plan.fees) + ' OKB fees + ≈' + formatEther(gasOkb) + ' OKB gas · 0 BEM');
+    console.log('  name for   ' + MONTHS + ' month(s) (renew: MONTHS=n, free while monthlyFee() is 0)');
+    console.log('  opener     code hash ' + openerHash + ' (pinned) · ERC-1967 impl slot ' + openerImpl);
+    console.log('  spend      ' + formatEther(plan.fees) + ' OKB fees (exact) + ≈' + formatEther(gasOkb) + ' OKB gas (estimated) · 0 BEM');
+    console.log('  caps       open ≤ ' + formatEther(CAPS.open) + ' · name ≤ ' + formatEther(CAPS.bind) + ' · all fees ≤ ' + formatEther(CAPS.total) + ' OKB (' + CAPS.from + ')');
     console.log('='.repeat(72));
     if (process.env.CONFIRM_MAINNET !== 'yes') throw new Error('mainnet send needs CONFIRM_MAINNET=yes in addition to SEND=1 (nothing was sent)');
   }
@@ -275,13 +337,15 @@ async function main() {
     } catch (err) { throw new Error(label + ' would revert: ' + (err.shortMessage || err.message).split('\n')[0]); }
     if (!SEND) { console.log('  ✓ simulated  ' + label + (value ? ' (' + formatEther(value) + ' OKB)' : '')); return null; }
     const gas = await pub.estimateContractGas({ account, address, abi: ABI, functionName, args, value });
-    const hash = await wallet.writeContract({ ...request, gas: gas + gas / 5n });
-    const entry = { label, hash, sentAt: new Date().toISOString() };
-    state.txs.push(entry); save();
+    const nonce = await pub.getTransactionCount({ address: account.address, blockTag: 'pending' });
+    const entry = { label, nonce, value: value.toString(), sentAt: new Date().toISOString() };
+    state.txs.push(entry); save(); // recorded before the broadcast: a crash here leaves a nonce to reconcile
+    const hash = await wallet.writeContract({ ...request, gas: gas + gas / 5n, nonce });
+    entry.hash = hash; save();
     const r = await pub.waitForTransactionReceipt({ hash, timeout: 300_000 });
-    if (r.status !== 'success') throw new Error(label + ' reverted on chain: ' + hash);
-    Object.assign(entry, { block: r.blockNumber.toString(), gas: r.gasUsed.toString(), gasPrice: r.effectiveGasPrice.toString(), value: value.toString() });
+    Object.assign(entry, { block: r.blockNumber.toString(), gas: r.gasUsed.toString(), gasPrice: r.effectiveGasPrice.toString(), status: r.status });
     save();
+    if (r.status !== 'success') throw new Error(label + ' reverted on chain: ' + hash);
     console.log('  ✓ ' + label.padEnd(44) + ' gas ' + String(r.gasUsed).padStart(9) + '  ' + hash);
     return r;
   }
@@ -293,6 +357,10 @@ async function main() {
   // ---- b. open the container
   if (!opened) {
     console.log('Step b  open container of circuit #' + circuitId + ' (' + formatEther(openFee) + ' OKB)');
+    // re-read right before paying: another run (or a late tx) may have opened it, or the fee may have changed
+    const [stillClosed, feeNow] = await Promise.all([read(OPENER, 'isOpened', [processor, circuitId]).then((x) => !x), read(OPENER, 'FEE')]);
+    if (!stillClosed) throw new Error('the container was opened in the meantime: run again (nothing was paid by this run)');
+    if (feeNow !== openFee) throw new Error('Opener FEE() changed from ' + formatEther(openFee) + ' to ' + formatEther(feeNow) + ' OKB: run again to see the new plan');
     const r = await send('open container', OPENER, 'open', [processor, circuitId], openFee);
     if (!r) return dryStop('Upload, fallback and bind are simulated once the container is open.');
     if (!(await read(OPENER, 'isOpened', [processor, circuitId]))) throw new Error('isOpened is still false after open');
@@ -330,7 +398,9 @@ async function main() {
   if ((await read(SITES, 'fallbackPath', [container])) !== FALLBACK) await send('setFallback ' + FALLBACK, SITES, 'setFallback', [container, FALLBACK]);
   else console.log('Step e  fallback is ' + FALLBACK + ' ✓');
   if (!(await read(BINDING, 'isLive', [NAME, container]))) {
-    await send('bind ' + NAME + ' ' + MONTHS + ' months', BINDING, 'bind', [NAME, container, MONTHS], monthlyFee * MONTHS);
+    const feeNow = (await read(BINDING, 'monthlyFee')) * MONTHS;
+    if (feeNow !== bindTotal || feeNow > CAPS.bind) throw new Error('DomainBinding fee changed to ' + formatEther(feeNow) + ' OKB for ' + MONTHS + ' month(s): run again to see the new plan');
+    await send('bind ' + NAME + ' ' + MONTHS + ' month(s)', BINDING, 'bind', [NAME, container, MONTHS], monthlyFee * MONTHS);
   } else console.log('Step e  ' + NAME + ' is live ✓');
   if (!SEND) return dryStop('');
 
@@ -338,10 +408,10 @@ async function main() {
   console.log('Step f  resolve ' + NAME + ' as the TapeKit gateway does');
   await gatewayCheck(pub, read, { NAME, cpuIndex, processor, circuitId, container, files, holder: account.address });
   const okb1 = await pub.getBalance({ address: account.address });
-  const mined = state.txs.filter((t) => t.gas);
+  const mined = state.txs.filter((t) => t.gas); // gas is paid by reverted txs too; value only moves on success
   const totalGas = mined.reduce((s, t) => s + BigInt(t.gas), 0n);
   const gasPaid = mined.reduce((s, t) => s + BigInt(t.gas) * BigInt(t.gasPrice), 0n);
-  const feesPaid = mined.reduce((s, t) => s + BigInt(t.value), 0n);
+  const feesPaid = mined.filter((t) => t.status === 'success').reduce((s, t) => s + BigInt(t.value || 0), 0n);
   state.spent = { okb: formatEther(BigInt(state.start.okb) - okb1), gas: totalGas.toString(), gasOkb: formatEther(gasPaid), feesOkb: formatEther(feesPaid) };
   state.done = new Date().toISOString();
   save();
@@ -388,9 +458,11 @@ async function gatewayCheck(pub, read, { NAME, cpuIndex, processor, circuitId, c
   const [acct, opened, owner] = await Promise.all([read(OPENER, 'accountOf', [circuits, circuitId]), read(OPENER, 'isOpened', [circuits, circuitId]), read(circuits, 'ownerOf', [circuitId])]);
   if (getAddress(acct) !== getAddress(container) || !opened) throw new Error('accountOf/isOpened do not give the container');
   const [live, until, cLive] = await Promise.all([read(BINDING, 'isLive', [NAME, container]), read(BINDING, 'paidUntil', [keccak256(toBytes(NAME)), container]), read(BINDING, 'isContainerLive', [container])]);
-  if (!live && !cLive) throw new Error('name is not live: the gateway would answer 402 "unpaid"');
+  if (!live) throw new Error('isLive(' + NAME + ', container) is false: the name is not bound (isContainerLive ' + cLive + '); not claiming DONE');
   const count = Number(await read(SITES, 'pathCount', [container]));
-  const paths = await read(SITES, 'pathsRange', [container, 0n, BigInt(Math.min(count, 200))]);
+  const paths = [];
+  for (let from = 0; from < count; from += 200) paths.push(...(await read(SITES, 'pathsRange', [container, BigInt(from), BigInt(Math.min(200, count - from))])));
+  if (paths.length !== count) throw new Error('pathsRange returned ' + paths.length + ' of ' + count + ' paths');
   const fb = await read(SITES, 'fallbackPath', [container]);
   const missing = files.filter((f) => !paths.includes(f.path)).map((f) => f.path);
   if (missing.length) throw new Error('not in pathsRange: ' + missing.join(', '));
@@ -402,4 +474,39 @@ async function gatewayCheck(pub, read, { NAME, cpuIndex, processor, circuitId, c
   console.log('  ✓ manifest   ' + count + ' paths, fallback "' + fb + '", every local file listed and read back with matching sha256' +
     (extra.length ? ' · NOTE extra on-chain paths not in dist/deweb: ' + extra.join(', ') : ''));
   console.log('  ✓ "/"        resolves to index.html (TapeKit path rules: "/" → index.html, extension-less paths → fallback)');
+}
+
+/**
+ * Txs an interrupted run recorded but never saw mined. Decided by nonce, never by a single "not found":
+ *   receipt exists → record it; tx known but pending → wait; unknown → poll the latest nonce: once it passes ours,
+ *   the receipt (if this hash landed) decides, else that nonce went to another tx; if it stays ≤ ours after
+ *   N polls, nothing landed and the entry is cleared (moved to state.cleared).
+ */
+async function reconcile(pub, me, state, save) {
+  const open = state.txs.filter((t) => !t.gas && !t.replaced);
+  for (const t of open) {
+    const rec = (r, seen) => Object.assign(t, { block: r.blockNumber.toString(), gas: r.gasUsed.toString(), gasPrice: r.effectiveGasPrice.toString(), status: r.status, value: t.value ?? (seen?.value || 0n).toString() });
+    const receipt = () => (t.hash ? pub.getTransactionReceipt({ hash: t.hash }).catch(() => null) : Promise.resolve(null));
+    let r = await receipt();
+    if (r) { rec(r); console.log('Earlier tx     ' + t.label + ' mined (' + r.status + ')'); save(); continue; }
+    const seen = t.hash ? await pub.getTransaction({ hash: t.hash }).catch(() => null) : null;
+    if (seen) { console.log('Earlier tx     waiting for ' + t.label + ' ' + t.hash); rec(await pub.waitForTransactionReceipt({ hash: t.hash, timeout: 300_000 }), seen); save(); continue; }
+    if (t.nonce === undefined) throw new Error('state has an unmined tx without a nonce (' + t.label + '): check ' + (t.hash || 'it') + ' on the explorer');
+    let decided = false;
+    for (let i = 0; i < 6 && !decided; i++) {
+      const latest = await pub.getTransactionCount({ address: me, blockTag: 'latest' });
+      if (latest > t.nonce) {
+        for (let j = 0; j < 5 && !r; j++) { r = await receipt(); if (!r) await sleep(2000); }
+        if (r) { rec(r); console.log('Earlier tx     ' + t.label + ' mined (' + r.status + ')'); }
+        else { t.replaced = true; console.log('Earlier tx     ' + t.label + ': nonce ' + t.nonce + ' was used by another tx; this one never landed'); }
+        decided = true;
+      } else if (i < 5) { console.log('Earlier tx     ' + t.label + ' (nonce ' + t.nonce + ') not seen yet; latest nonce ' + latest + ', re-checking in 10 s'); await sleep(10_000); }
+    }
+    if (!decided) {
+      console.log('Earlier tx     ' + t.label + ' (nonce ' + t.nonce + ') did not land: cleared');
+      state.cleared = [...(state.cleared || []), { ...t, clearedAt: new Date().toISOString() }];
+      state.txs = state.txs.filter((x) => x !== t);
+    }
+    save();
+  }
 }

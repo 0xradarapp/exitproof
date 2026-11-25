@@ -136,7 +136,9 @@ hash-based. `vendor/ethers.min.js` is ethers 6.13.4, byte-identical to the npm t
 fonts and the two license files are also in the output. The build fails on any off-chain `src`/`href`/`url()` (TapeKit's
 "100% on-chain" rule), on any unresolved or absolute reference, and on a loopback RPC. The config comes from
 `deployments/xlayer.json` when that file exists. Otherwise the page shows its "mainnet deployment pending" state, so
-**rebuild after `deploy.mjs`**.
+**rebuild after `deploy.mjs`**. The build also writes `dist/deweb.manifest.json` with the config hash, the
+router/registry/processor/circuitId it embedded, and each file's sha256. `publish-deweb.mjs` refuses a build whose
+embedded values are empty or differ from `deployments/<network>.json`, and any file changed after the build.
 
 ```zsh
 node scripts/build-deweb.mjs
@@ -156,11 +158,22 @@ DEPLOYER_KEY="$(k)" node scripts/publish-deweb.mjs
 3. upload with `putFile`/`appendChunk` in 24,000-byte chunks, assets first and `index.html` last, reading every file
    back and comparing its SHA-256;
 4. `setFallback("index.html")`;
-5. `bind(name, container, MONTHS)` (MONTHS defaults to 12);
+5. `bind(name, container, MONTHS)`. MONTHS defaults to 1, the protocol minimum. With `monthlyFee()` at 0, renewing is
+   free: run again with `MONTHS=n`. Watch `paidUntil` so the name stays live through judging;
 6. resolve the name the way the TapeKit kernel does.
 
-If it stops, run the same command again. It skips verified files, continues a half-uploaded file at the next chunk, and
-waits for any tx an earlier run left pending.
+If it stops, run the same command again. It skips verified files and continues a half-uploaded file at the next chunk.
+It records a nonce for every tx before broadcasting it. Before doing anything else, it settles any tx an earlier run left
+unmined: it records the receipt if the tx landed, waits if the tx is pending, and decides by the account nonce if the
+node does not know the tx. A lock file stops two runs from overlapping.
+
+**Fee caps.** Before anything is sent, and again right before each payment, the script checks:
+- the open fee is at most 0.1 OKB;
+- the name fee (`monthlyFee × MONTHS`) is at most 0.05 OKB;
+- all fees together are at most 0.15 OKB.
+
+If a cap is exceeded it stops without sending anything. `FEE_CAP_OKB=<n>` replaces all three caps with `n`. The
+Opener's runtime code hash is pinned (it is not a proxy), and the banner shows the hash and its ERC-1967 slot.
 
 ```zsh
 DEPLOYER_KEY="$(k)" SEND=1 CONFIRM_MAINNET=yes node scripts/publish-deweb.mjs
@@ -170,14 +183,16 @@ Progress and every tx are recorded in `deployments/deweb-xlayer.json`. The scrip
 `DONE https://<id>-2-<index>.tapekit.org/`. Put that URL and the `.tape` name in the README judges table.
 
 **Rehearsal on a fork** (run in a scratch copy of the repo, as `scripts/rehearse.sh` does, so the committed
-`deployments/fork.json` is not touched; anvil account #2):
+`deployments/fork.json` is not touched). The key below is anvil's **public test key** for account #2 (anyone can derive
+it), so use it only on a fork. Pick a free port that you own.
+`DEPLOYMENT=fork` makes the build embed `deployments/fork.json`, for the rehearsal only.
 
 ```zsh
 anvil --fork-url https://xlayerrpc.okx.com --chain-id 196 --port 8573 --silent &
 cast rpc anvil_setBalance 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC 0xDE0B6B3A7640000 --rpc-url http://127.0.0.1:8573
 cast rpc anvil_setStorageAt 0x60e62Efa9405d6873C5deaBD4E6CC91c25363952 "$(cast index address 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC 5)" "$(cast to-uint256 12000000)" --rpc-url http://127.0.0.1:8573
 export RPC_URL=http://127.0.0.1:8573 DEPLOYER_KEY=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
-SEND=1 node scripts/tapeout.mjs && node scripts/build-deweb.mjs && node scripts/publish-deweb.mjs && SEND=1 node scripts/publish-deweb.mjs
+SEND=1 node scripts/tapeout.mjs && SEND=1 node scripts/deploy.mjs && DEPLOYMENT=fork node scripts/build-deweb.mjs && node scripts/publish-deweb.mjs && SEND=1 node scripts/publish-deweb.mjs
 ```
 
 Measured on a fork of block 76,869,339 (2026-11-25):
@@ -186,6 +201,12 @@ Measured on a fork of block 76,869,339 (2026-11-25):
 - Total: **154,038,564 gas**. At 0.02 gwei that is 0.00308 OKB, so the whole publish costs **≈0.0831 OKB** (0.08 open fee + gas) and 0 BEM.
 - The name came out as `1.2.453.tape` → `https://1-2-453.tapekit.org/` (processor index 453 on that fork).
 - A run killed during the ethers upload resumed at chunk 7/22. A third run sent nothing.
+- Fix round, fresh fork of block 76,870,299 (DEPLOYMENT=fork build, 674,096 bytes): 38 txs, 154,064,406 gas.
+  - These were refused, with nothing sent: a pending build, a build for the wrong network, a stale router, a file edited after the build, and `FEE_CAP_OKB=0.01` (the nonce did not change).
+  - A run killed after ethers chunk 9/22 resumed at 10/22 and took over its stale lock.
+  - An injected lost tx was cleared after 6 nonce polls.
+  - A tx whose result had been removed from the state file was found again from its receipt.
+  - 31 days later the 1-month name had expired (`isLive` false), and a re-run re-bound it (134k gas). `bind` with 0 months reverts.
 
 On mainnet the processor index is whatever `cpuAt` gives for our processor at tape-out time.
 

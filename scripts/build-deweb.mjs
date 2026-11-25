@@ -1,6 +1,10 @@
 // Builds the DeWEB copy of web/ into dist/deweb/: the files TapeKit serves from our circuit's ERC-6551 container.
 //
-//   node scripts/build-deweb.mjs        → dist/deweb/ (prints every file, its size and sha256, and the total)
+//   node scripts/build-deweb.mjs                      → dist/deweb/ from deployments/xlayer.json (mainnet)
+//   DEPLOYMENT=fork node scripts/build-deweb.mjs      → same, embedding deployments/fork.json (fork rehearsal only)
+// Prints every file, its size and sha256, and the total; writes dist/deweb.manifest.json (network, config hash, the
+// router/registry/processor/circuitId it embedded, every file's sha256), which publish-deweb.mjs checks against
+// deployments/<network>.json before it publishes anything.
 //
 // What it does to web/:
 //   - index.html gets style.css (comments and indentation stripped), verdict.js + app.js (one inline module) and the
@@ -8,12 +12,13 @@
 //     and only the RPC host(s) of the mainnet config;
 //   - vendor/ethers.min.js (byte-identical to the npm tarball, sha384 checked) and the woff2 fonts the CSS uses stay
 //     separate files (no base64 inflation), with their licenses next to them;
-//   - config: only the "xlayer" network, filled from deployments/xlayer.json when it exists (else the pending state
-//     of web/config.json: router/registry null, so the page shows its "not deployed yet" notice).
+//   - config: only the "xlayer" network (RPC https://rpc.xlayer.tech), filled from deployments/<DEPLOYMENT>.json when
+//     it exists (else the pending state of web/config.json: router/registry null, the page shows "not deployed yet",
+//     and publish-deweb.mjs refuses the build).
 // Checks (the build fails on any): TapeKit's "100% on-chain" static rule (no off-chain URL in src/href/…, srcset,
 // CSS url() or @import, meta refresh), every site-internal reference is relative and resolves to a built file, no
 // loopback RPC in the config or CSP, the inline module parses, and no file exceeds the SiteRegistry limit.
-// Nothing outside dist/deweb/ is written.
+// Nothing outside dist/ is written.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -39,13 +44,15 @@ const replaceOnce = (s, from, to, what) => {
 // ---- config: mainnet only
 const webCfg = JSON.parse(read('config.json'));
 const xl = { ...webCfg.networks.xlayer };
-const depFile = path.join(ROOT, 'deployments', 'xlayer.json');
-let source = 'web/config.json (pending: no deployments/xlayer.json)';
+const NETWORK = process.env.DEPLOYMENT || 'xlayer';
+if (!['xlayer', 'fork'].includes(NETWORK)) fail('DEPLOYMENT must be xlayer or fork');
+const depFile = path.join(ROOT, 'deployments', NETWORK + '.json');
+let source = 'web/config.json (pending: no deployments/' + NETWORK + '.json)';
 if (fs.existsSync(depFile)) {
   const d = JSON.parse(fs.readFileSync(depFile, 'utf8'));
   for (const k of ['router', 'registry', 'processor', 'circuitId']) if (d[k] !== undefined && d[k] !== null) xl[k] = String(d[k]);
   if (d.feeBps !== undefined) xl.feeBps = d.feeBps;
-  source = 'deployments/xlayer.json';
+  source = 'deployments/' + NETWORK + '.json';
 }
 if (!/^https:\/\//.test(xl.rpc)) fail('networks.xlayer.rpc must be an https URL, got ' + xl.rpc);
 const config = { defaultNetwork: 'xlayer', networks: { xlayer: xl } };
@@ -138,6 +145,13 @@ for (const [p, b] of files) if (b.length > MAX_FILE) fail(`${p} is ${b.length} b
 // ---- write
 fs.rmSync(OUT, { recursive: true, force: true });
 for (const [p, b] of files) { fs.mkdirSync(path.dirname(path.join(OUT, p)), { recursive: true }); fs.writeFileSync(path.join(OUT, p), b); }
+const embedded = Object.fromEntries(['router', 'registry', 'processor', 'circuitId'].map((k) => [k, xl[k] ?? null]));
+const manifest = {
+  network: NETWORK, source, configSha256: sha256(JSON.stringify(config)), embedded,
+  files: Object.fromEntries([...files].sort((a, b) => a[0].localeCompare(b[0])).map(([p, b]) => [p, sha256(b)]))
+};
+fs.writeFileSync(path.join(ROOT, 'dist', 'deweb.manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+const pending = Object.entries(embedded).filter(([, v]) => v === null || v === undefined).map(([k]) => k);
 
 let total = 0;
 console.log('dist/deweb/  (config: ' + source + '; RPC ' + rpcOrigin + '; router ' + xl.router + ')\n');
@@ -149,3 +163,5 @@ console.log(`  ${'TOTAL (' + files.size + ' files)'.padEnd(42)} ${String(total).
 console.log('\nreferences   ' + internal.length + ' relative, all resolve: ' + [...new Set(internal)].join(', '));
 console.log('static rule  on-chain pure (no off-chain src/href/srcset/url()/@import/meta refresh)');
 console.log('CSP          ' + csp.replace(/'sha256-[^']+'/g, "'sha256-…'"));
+console.log('manifest     dist/deweb.manifest.json · ' + NETWORK + ' · config sha256 ' + manifest.configSha256.slice(0, 16) + '… · ' +
+  (pending.length ? 'PENDING (' + pending.join(', ') + ' empty): publish-deweb.mjs will refuse this build' : 'router ' + embedded.router + ', registry ' + embedded.registry + ', processor ' + embedded.processor + ' #' + embedded.circuitId));
