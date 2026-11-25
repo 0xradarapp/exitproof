@@ -5,8 +5,10 @@
 //  1. Refuse unless web3_clientVersion contains "anvil".
 //  2. Static scan (scan.mjs) at the fork block -> dangerous selectors, unknown selectors, owner().
 //     Callers (impersonated + funded): owner(), deployer() (if exposed), the EIP-1967 admin slot, `opts.callers`
-//     (the daemon passes the PairCreated sender) and up to 4 address-shaped words from storage slots 0..15 (a hidden
-//     admin kept in a plain slot).
+//     (the daemon passes the PairCreated sender), the addresses compared with CALLER in the code (immutable admins),
+//     the token's creator (creation tx sender, first mint recipients) and up to 4 address-shaped words from storage
+//     slots 0..15 (a hidden admin kept in a plain slot).
+//     N-02: the fork's coinbase, gas limit and next base fee are set to the forked block's values first.
 //  3. Actors are derived from the fork block hash and the token: holder = keccak(blockHash ++ token)[12:],
 //     router = keccak(that ++ "router")[12:]. Reproducible given the block, unpredictable before it (a token cannot
 //     whitelist the simulator). SimRouter (src/sim/SimRouter.sol) is installed at `router` with anvil_setCode: a V2
@@ -16,8 +18,9 @@
 //     its token reserve to the holder (`acquiredVia: pair-transfer`).
 //  5. Sells (each in its own snapshot):
 //       immediate  = SimRouter.roundTrip: buy and sell back in ONE transaction (same block as receipt);
-//       delayed    = router sell of the whole position after +1 block, +60 s, +1 h, +1 day;
-//       transfer   = holder.transfer(pair) + swap (the old path) after +1 h.
+//       delayed    = router sell of the whole position after +1 block, +60 s, +1 h, +1 d, +7 d, +30 d;
+//       transfer   = holder.transfer(pair) + swap (the old path) after +1 h;
+//       interleaved = after +1 h, a third (random) address buys first, then the holder sells (N-03).
 //     A sell "passes" when it executes and returns >= 50% of the no-tax V2 output for the amount sold.
 //     Baseline = the +1 h router sell (or +1 d if only that passes). If nothing passes, owner "unlock" calls present
 //     in the dispatcher (enableTrading/openTrading/.../setAuthorizedBuyer(holder)) are applied cumulatively and the
@@ -27,13 +30,19 @@
 //       delayed-sell-trap    immediate passes, some delayed sell fails           -> dangerSetter
 //       transferFrom-trap    transfer path passes, router (transferFrom) fails   -> ownerCanTrap
 //       baseline-sell-failed no sell passes at all, even after unlocks          -> ownerCanTrap
+//       delayed-tax-jump     a later sell lands in a higher router tax bucket    -> dangerSetter
+//       sequence-trap        baseline passes, the interleaved sell fails         -> dangerSetter
 //  7. Owner sweeps against the baseline state (snapshot, call, router sell, revert; trapped = sell fails or returns
 //     < 50% of the baseline):
 //       a. dangerous-list setters with typed worst-case args (uintN 0/99/100/10000/max, address pair/holder,
 //          bool, address[]), cartesian product <= 32 else index-aligned;
-//       b. F-04: every other dispatcher selector outside SAFE (ABI-less): four identical words for 0, max, 1, 10000,
-//          and [holder,1,1,1], [pair,1,1,1]. At most MAX_UNKNOWN_SELECTORS selectors and a wall-clock budget;
-//          an incomplete sweep with a privileged caller fails closed (`unknown-sweep-incomplete`).
+//       b. F-04 / N-01: every other dispatcher selector outside SAFE (ABI-less): four identical words for 0, max,
+//          1, 10000, and [holder,1,1,1], [pair,1,1,1], plus [K,10000..] / [K,max..] for each constant K the selector's
+//          code compares with (magic arguments). Then two-step pairs: each state-changing call (prestateTracer
+//          diff) followed by every other unknown selector (MAX_PAIRS). At most MAX_UNKNOWN_SELECTORS and a
+//          wall-clock budget. `complete` only when every selector was executed without revert by some identity;
+//          an incomplete sweep on a token with an owner or a caller check fails closed (sweep-incomplete ->
+//          dangerSetter).
 //     Any trapped attempt -> ownerCanTrap. An exception after a good baseline -> ownerCanTrap (simulate-error).
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -53,7 +62,11 @@ const TX_GAS = '0x7a1200'; // 8,000,000
 const FUND = '0x3635c9adc5dea00000'; // 1000 ether
 const ASSUMED_FEE_BPS = 100n;
 const MAX_COMBOS = 32;
-export const DELAYS = Object.freeze([['+1block', 0], ['+60s', 60], ['+1h', 3600], ['+1d', 86400]]);
+export const DELAYS = Object.freeze([
+  ['+1block', 0], ['+60s', 60], ['+1h', 3600], ['+1d', 86400], ['+7d', 7 * 86400], ['+30d', 30 * 86400],
+]);
+export const MAX_PAIRS = 120; // two-step sequences (first setter, second setter) per token
+const TAX_BUCKETS = [500n, 1500n, 5000n]; // the router's sell-tax bucket edges (bps)
 export const MAX_UNKNOWN_SELECTORS = 40;
 export const UNKNOWN_PATTERNS = Object.freeze(['0', 'max', 'holder', 'pair', '1', '10000']);
 export const DEFAULT_BUDGET_MS = 180_000;
@@ -151,6 +164,95 @@ const sellJson = (r) => (r ? {
   actualOut: r.actual.toString(),
 } : null);
 
+/** owner() or getOwner() returns exactly one zero word (ownership renounced), as opposed to no getter at all. */
+async function ownerRenounced(client, token) {
+  for (const data of ['0x8da5cb5b', '0x893d20e8']) {
+    try {
+      const { data: ret } = await client.call({ to: token, data, gas: 100_000n });
+      if (ret && ret.length === 66 && BigInt(ret) === 0n) return true;
+    } catch { /* no such getter */ }
+  }
+  return false;
+}
+
+const taxBucket = (r) => {
+  if (!r || r.expected === 0n) return 3;
+  if (r.actual >= r.expected) return 0;
+  const bps = ((r.expected - r.actual) * 10000n + r.expected - 1n) / r.expected;
+  return TAX_BUCKETS.findIndex((edge) => bps < edge) === -1 ? 3 : TAX_BUCKETS.findIndex((edge) => bps < edge);
+};
+
+/**
+ * N-02: make the fork's block environment look like the chain it forks. anvil mines with coinbase 0x0 and its own
+ * base fee / gas limit; X Layer's coinbase is 0x4200...0011. Values come from the fork block (anvil_nodeInfo
+ * forkConfig), or from the latest block on a plain node. PREVRANDAO cannot be set on anvil (residual, see README).
+ */
+async function neutralizeEnv(client, rpc, blockNumber) {
+  let forkBlock = null;
+  try { forkBlock = (await rpc('anvil_nodeInfo'))?.forkConfig?.forkBlockNumber ?? null; } catch { /* not exposed */ }
+  const ref = await client.getBlock({ blockNumber: forkBlock !== null ? BigInt(forkBlock) : blockNumber });
+  const env = {
+    refBlock: Number(ref.number), coinbase: getAddress(ref.miner), gasLimit: ref.gasLimit.toString(),
+    baseFee: ref.baseFeePerGas?.toString() ?? null, chainId: await client.getChainId(), prevrandao: 'not settable on anvil',
+  };
+  await rpc('anvil_setCoinbase', [env.coinbase]);
+  await rpc('evm_setBlockGasLimit', [toHex(ref.gasLimit)]);
+  if (ref.baseFeePerGas !== undefined && ref.baseFeePerGas !== null) {
+    await rpc('anvil_setNextBlockBaseFeePerGas', [toHex(ref.baseFeePerGas)]);
+  }
+  return env;
+}
+
+/**
+ * The token's creator: ots_getContractCreator (anvil answers it for contracts created on the node), else the
+ * creation block found by bisecting eth_getCode, whose transaction senders (bounded) are taken. Plus the recipients
+ * of mints (Transfer from 0x0) in the creation block. Best effort: errors give an empty list.
+ */
+async function findCreator(client, rpc, token, blockNumber) {
+  const from = new Set();
+  let createdAt = null;
+  let via = 'none';
+  try {
+    const c = await rpc('ots_getContractCreator', [token]);
+    if (c?.creator) {
+      from.add(getAddress(c.creator));
+      const tx = await client.getTransaction({ hash: c.hash });
+      from.add(getAddress(tx.from));
+      createdAt = tx.blockNumber;
+      via = 'ots';
+    }
+  } catch { /* not supported */ }
+  try {
+    if (createdAt === null) {
+      let lo = 0n;
+      let hi = blockNumber; // code at hi, find the first block with code
+      for (let i = 0; i < 64 && lo < hi; i++) {
+        const mid = (lo + hi) / 2n;
+        const code = await client.getCode({ address: token, blockNumber: mid });
+        if (code && code !== '0x') hi = mid; else lo = mid + 1n;
+      }
+      createdAt = hi;
+      // the creating transaction: the one whose receipt created the token or carries the token's logs (its mint)
+      const b = await client.getBlock({ blockNumber: hi, includeTransactions: true });
+      let receipts = null;
+      try { receipts = await rpc('eth_getBlockReceipts', [toHex(hi)]); } catch { /* not supported */ }
+      const lc = token.toLowerCase();
+      const creating = (receipts ?? []).filter((r) => r.contractAddress?.toLowerCase() === lc
+        || r.logs?.some((l) => l.address.toLowerCase() === lc));
+      const senders = creating.length ? creating.map((r) => r.from) : b.transactions.slice(0, 10).map((tx) => tx.from);
+      for (const f of senders) if (f && !/^0xdeaddeaddeaddeaddeaddeaddeaddeaddead/i.test(f)) from.add(getAddress(f));
+      via = creating.length ? 'bisect+receipt' : 'bisect';
+    }
+    const mints = await client.getLogs({
+      address: token, fromBlock: createdAt, toBlock: createdAt,
+      event: parseAbiItem('event Transfer(address indexed from, address indexed to, uint256 value)'),
+      args: { from: '0x0000000000000000000000000000000000000000' },
+    });
+    for (const l of mints) if (l.args.to) from.add(getAddress(l.args.to));
+  } catch { /* best effort */ }
+  return { via, block: createdAt === null ? null : Number(createdAt), from: [...from].sort() };
+}
+
 export async function assertAnvil(client) {
   let v = '';
   try { v = String(await client.request({ method: 'web3_clientVersion' })); } catch { /* fallthrough */ }
@@ -234,6 +336,7 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
     const blockNumber = await client.getBlockNumber({ cacheTime: 0 });
     const block = await client.getBlock({ blockNumber });
     const s = await scan(client, token, { blockNumber });
+    const chainEnv = await neutralizeEnv(client, rpc, blockNumber);
     const actors = deriveActors(block.hash, token);
     const holder = getAddress(opts.holder ?? actors.holder);
     const { router } = actors;
@@ -256,6 +359,11 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
     addCaller(await tryRead(token, [DEPLOYER], 'deployer'));
     addCaller(s.evidence.proxySlots.eip1967Admin);
     for (const c of opts.callers ?? []) addCaller(c);
+    // v6 (N-01): immutable / constant admins compared with CALLER, and the token's creator (creation tx sender and
+    // the first mint's recipients): a mapping admin is usually whoever deployed the token.
+    for (const a of s.evidence.callerLiterals ?? []) addCaller(a);
+    const creator = opts.creator ? { from: [getAddress(opts.creator)], via: 'opts' } : await findCreator(client, rpc, token, blockNumber);
+    for (const a of creator.from) addCaller(a);
     const storageCallers = [];
     for (let i = 0; i < STORAGE_CALLER_SLOTS && storageCallers.length < MAX_STORAGE_CALLERS; i++) {
       const w = BigInt(await client.getStorageAt({ address: token, slot: toHex(i, { size: 32 }), blockNumber }) ?? '0x0');
@@ -323,6 +431,18 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
       return 'pair-transfer';
     };
 
+    const third = getAddress(`0x${keccak256(concat([keccak256(concat([block.hash, token])), toHex('third')])).slice(-40)}`);
+    exclude.add(third);
+    /** Another (random) address buys a little on the pair through the router (funded from the holder's quote). */
+    const thirdPartyBuy = async (q) => {
+      await impersonate(third);
+      if (!(await send(holder, quote, encodeFunctionData({ abi: ERC20, functionName: 'transfer', args: [third, q] })))) return false;
+      await send(third, quote, encodeFunctionData({ abi: ERC20, functionName: 'approve', args: [router, maxUint256] }));
+      const rc = await sendTx(third, router, encodeFunctionData({
+        abi: ROUTER_ABI, functionName: 'buy', args: [pair, quote, token, q, ASSUMED_FEE_BPS],
+      }));
+      return !!routerLogs(rc).find((x) => x.eventName === 'Bought' && x.args.ok);
+    };
     const routerSell = async () => soldOf(await sendTx(holder, router, encodeFunctionData({
       abi: ROUTER_ABI, functionName: 'sell', args: [pair, quote, token, 0n, ASSUMED_FEE_BPS],
     })));
@@ -366,12 +486,17 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
       const at = !passes(dl['+1h']) && passes(dl['+1d']) ? '+1d' : '+1h';
       await advance(at === '+1d' ? 86400 : 3600);
       const transfer = await inSnapshot(transferSell);
-      return { via, immediate, delayed, transfer, baselineAt: at, baseline: dl[at] };
+      // N-03: a third party trades between the holder's receipt and the sell (state-sequence traps)
+      const interleaved = qIn > 0n ? await inSnapshot(async () => {
+        if (!(await thirdPartyBuy(qIn / 10n || 1n))) return null;
+        return routerSell();
+      }) : null;
+      return { via, immediate, delayed, transfer, interleaved, baselineAt: at, baseline: dl[at] };
     };
 
     const evidence = {
       block: { number: blockNumber.toString(), hash: block.hash }, holder, holderDerived: !opts.holder, router,
-      routerRuntimeHash: keccak256(SIM_ROUTER.runtime), callers, storageCallers, quote, funding,
+      routerRuntimeHash: keccak256(SIM_ROUTER.runtime), env: chainEnv, creator, third, callers, storageCallers, quote, funding,
       acquiredVia: null, position: '0', unlockedBy: [], baselineSellOk: false, baselineAt: null, expectedOut: '0',
       immediate: null, delayed: [], transferSell: null, signals: [], attempts: [], skipped: [],
       unknownAttempts: [], unknownSweep: null,
@@ -381,6 +506,7 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
       evidence.immediate = sellJson(m.immediate);
       evidence.delayed = m.delayed.map((d) => ({ label: d.label, ...sellJson(d) }));
       evidence.transferSell = sellJson(m.transfer);
+      evidence.interleavedSell = sellJson(m.interleaved);
       evidence.baselineAt = m.baselineAt;
     };
     const anyPass = (m) => passes(m.immediate) || m.delayed.some(passes) || passes(m.transfer);
@@ -421,6 +547,12 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
       out.privileged = true;
     };
     if (passes(m.immediate) && m.delayed.some((d) => !passes(d))) signal('delayed-sell-trap', 'dangerSetter');
+    // N-05: a later sell lands in a higher router tax bucket than the immediate one (under the 50% pass line)
+    if (passes(m.immediate) && m.delayed.some((d) => d.ok && taxBucket(d) > taxBucket(m.immediate))) {
+      signal('delayed-tax-jump', 'dangerSetter');
+    }
+    // N-03: passes alone, fails once someone else traded in between
+    if (passes(m.baseline) && m.interleaved && !passes(m.interleaved)) signal('sequence-trap', 'dangerSetter');
     if (passes(m.transfer) && !passes(m.baseline)) signal('transferFrom-trap', 'ownerCanTrap');
     if (!anyPass(m)) {
       if (evidence.position === '0') evidence.note = 'no holder position';
@@ -459,53 +591,115 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
       }
       timing.dangerousMs = Date.now() - ta;
 
-      // ---- b. F-04: unknown selectors, ABI-less worst-case words ----
+      // ---- b. F-04 / N-01: unknown selectors, ABI-less worst-case words, magic constants, two-step pairs ----
       if (opts.unknown !== false) {
         const tb = Date.now();
         const dangerousSel = new Set(s.evidence.dangerous.map((d) => d.selector));
         const unknown = s.evidence.unknownSelectors.filter((x) => !DANGEROUS[x] && !dangerousSel.has(x));
         const todo = unknown.slice(0, maxUnknown);
+        const hints = opts.noHints ? {} : (s.evidence.selectorHints ?? {});
         const sweep = {
           selectors: unknown.length, tried: 0, patterns: UNKNOWN_PATTERNS.length, calls: 0, complete: true,
-          truncatedBy: null, callers: callers.length, trapped: [],
+          truncatedBy: null, callers: callers.length, exercised: [], unexercised: [], stateChanging: [],
+          pairs: 0, pairsTruncated: false, trapped: [],
         };
         evidence.unknownSweep = sweep;
+        const overBudget = () => Date.now() - t0 > budgetMs;
+        const patternsFor = (sel) => [
+          ...UNKNOWN_PATTERNS.map((p) => [p, unknownCalldata(sel, p, ctx)]),
+          ...(hints[sel] ?? []).flatMap((k) => [
+            [`magic:${k}/10000`, `${sel}${[BigInt(k), 10000n, 10000n, 10000n].map(word).join('')}`],
+            [`magic:${k}/max`, `${sel}${[BigInt(k), maxUint256, maxUint256, maxUint256].map(word).join('')}`],
+          ]),
+        ];
+        const trap = (attempt) => {
+          evidence.unknownAttempts.push(attempt);
+          if (!sweep.trapped.includes(attempt.selector)) sweep.trapped.push(attempt.selector);
+          out.ownerCanTrap = true;
+        };
+        const changesTokenState = async (rc) => {
+          try {
+            const d = await rpc('debug_traceTransaction', [rc.transactionHash, { tracer: 'prestateTracer', tracerConfig: { diffMode: true } }]);
+            const post = d?.post?.[token.toLowerCase()];
+            return !!post?.storage && Object.keys(post.storage).length > 0;
+          } catch {
+            return true; // tracer unavailable: treat as state-changing (more pairs, never fewer)
+          }
+        };
+        const firstSteps = []; // { selector, pattern, data, caller } of state-changing successful calls
         if (unknown.length > maxUnknown) { sweep.complete = false; sweep.truncatedBy = `max-selectors(${maxUnknown})`; }
-        if (callers.length) {
-          outer: for (const selector of todo) {
-            sweep.tried++;
-            for (const pattern of UNKNOWN_PATTERNS) {
-              if (Date.now() - t0 > budgetMs) {
-                sweep.complete = false;
-                sweep.truncatedBy = `budget(${budgetMs}ms)`;
-                break outer;
-              }
-              const data = unknownCalldata(selector, pattern, ctx);
-              for (const caller of callers) {
-                sweep.calls++;
-                const attempt = await inSnapshot(async () => {
-                  if (!(await send(caller, token, data))) return null;
-                  const r = await routerSell();
-                  return { selector, pattern, caller, sellOk: r.ok, out: r.actual.toString(), trapped: trappedBy(r) };
-                });
-                if (!attempt) continue;
-                if (attempt.trapped) {
-                  evidence.unknownAttempts.push(attempt);
-                  if (!sweep.trapped.includes(selector)) sweep.trapped.push(selector);
-                  out.ownerCanTrap = true;
-                }
-                break; // first caller whose call succeeds
-              }
+        outer: for (const selector of todo) {
+          sweep.tried++;
+          let exercised = false;
+          let firstStep = null;
+          for (const [pattern, data] of patternsFor(selector)) {
+            if (overBudget()) { sweep.complete = false; sweep.truncatedBy = `budget(${budgetMs}ms)`; break outer; }
+            for (const caller of callers) {
+              sweep.calls++;
+              const attempt = await inSnapshot(async () => {
+                const rc = await sendTx(caller, token, data);
+                if (!rc) return null;
+                const changed = firstStep === null && (pattern === 'max' || pattern === '10000' || pattern.startsWith('magic:'))
+                  ? await changesTokenState(rc) : false;
+                const r = await routerSell();
+                return { selector, pattern, caller, sellOk: r.ok, out: r.actual.toString(), trapped: trappedBy(r), changed };
+              });
+              if (!attempt) continue;
+              exercised = true;
+              if (attempt.changed && firstStep === null) firstStep = { selector, pattern, data, caller };
+              if (attempt.trapped) trap(attempt);
+              break; // first caller whose call succeeds
             }
           }
-          for (const sel of sweep.trapped) evidence.signals.push(`unknown-setter-trap:${sel}`);
-          if (!sweep.complete) {
-            evidence.signals.push('unknown-sweep-incomplete');
-            out.ownerCanTrap = true;
+          (exercised ? sweep.exercised : sweep.unexercised).push(selector);
+          if (firstStep) { firstSteps.push(firstStep); sweep.stateChanging.push(selector); }
+        }
+        // two-step: a state-changing call first (e.g. raise a cap), then every other unknown selector
+        pairs: for (const f of firstSteps) {
+          for (const selector of todo) {
+            if (selector === f.selector) continue;
+            if (sweep.pairs >= MAX_PAIRS || overBudget()) { sweep.pairsTruncated = true; break pairs; }
+            sweep.pairs++;
+            const second = patternsFor(selector).filter(([p]) => p === '10000' || p === 'max' || p.startsWith('magic:'));
+            for (const [pattern, data] of second) {
+              const attempt = await inSnapshot(async () => {
+                if (!(await send(f.caller, token, f.data))) return null;
+                for (const caller of [f.caller, ...callers.filter((c) => c !== f.caller)]) {
+                  sweep.calls++;
+                  if (!(await send(caller, token, data))) continue;
+                  const r = await routerSell();
+                  return {
+                    selector: `${f.selector}+${selector}`, pattern: `${f.pattern}+${pattern}`, caller,
+                    sellOk: r.ok, out: r.actual.toString(), trapped: trappedBy(r),
+                  };
+                }
+                return null;
+              });
+              if (attempt?.trapped) { trap(attempt); break; }
+            }
           }
-        } else if (unknown.length) {
+        }
+        if (sweep.unexercised.length) {
           sweep.complete = false;
-          sweep.truncatedBy = 'no-privileged-caller';
+          sweep.truncatedBy ??= `unexercised(${sweep.unexercised.length})`;
+        }
+        for (const sel of sweep.trapped) evidence.signals.push(`unknown-setter-trap:${sel}`);
+        // fail closed when an admin exists that the sweep could not fully exercise
+        // A caller-vs-storage gate on a token whose owner()/getOwner() explicitly returns 0 (renounced) is taken to be
+        // the renounced owner's: its functions revert for everyone by design (hidden second admin: README residual).
+        const renounced = await ownerRenounced(client, token);
+        const why = [
+          s.evidence.owner !== null && 'owner-active',
+          s.evidence.reasons.includes('access-control') && 'access-control',
+          s.evidence.reasons.includes('caller-vs-literal') && 'caller-vs-literal',
+          s.evidence.reasons.includes('caller-vs-storage') && !renounced && 'caller-vs-storage',
+        ].filter(Boolean);
+        sweep.ownerRenounced = renounced;
+        if (!sweep.complete) sweep.failClosedBecause = why;
+        if (!sweep.complete && why.length) {
+          evidence.signals.push('sweep-incomplete');
+          out.dangerSetter = true;
+          out.privileged = true;
         }
         timing.unknownMs = Date.now() - tb;
       }

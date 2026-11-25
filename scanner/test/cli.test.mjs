@@ -34,7 +34,7 @@ test('cli scan prints the scan JSON (with the block it was pinned to)', async ()
   const r = JSON.parse(stdout);
   assert.equal(r.dangerSetter, true);
   assert.equal(r.privileged, true);
-  assert.equal(r.scannerVersion, 5);
+  assert.equal(r.scannerVersion, 6);
   assert.equal(r.block, Number(await env.pub.getBlockNumber({ cacheTime: 0 })));
 });
 
@@ -54,13 +54,17 @@ test('cli attest refuses to downgrade a flag of the same codehash unless --force
   const codehash = keccak256(await env.pub.getCode({ address: t.address }));
   const w = createWalletClient({ chain: foundry, transport: viemHttp(env.rpc), account: privateKeyToAccount(KEY2) });
   const hash = await attest(w, registry.address, t.address, {
-    codehash, privileged: true, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 5,
+    codehash, privileged: true, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 6,
   });
   await env.pub.waitForTransactionReceipt({ hash });
   const reports = tmp('exitproof-cli-');
   const cliEnv = {
     ...process.env, RPC_URL: env.rpc, REGISTRY: registry.address, ATTESTER_KEY: KEY2, SEND: '1', REPORTS_DIR: reports,
   };
+  // N-06: no send without the sell simulation unless STATIC_ONLY=1 is explicit
+  await assert.rejects(run('node', [CLI, 'attest', t.address], { env: cliEnv }), (e) => e.code === 1 && /requires FORK_RPC/.test(e.stderr));
+  await assert.rejects(run('node', [CLI, 'daemon'], { env: { ...cliEnv, START_BLOCK: '0' } }), (e) => e.code === 1 && /requires FORK_RPC/.test(e.stderr));
+  cliEnv.STATIC_ONLY = '1';
   await assert.rejects(run('node', [CLI, 'attest', t.address], { env: cliEnv }),
     (e) => e.code === 1 && /downgrade/.test(e.stderr) && /privileged/.test(e.stderr));
   assert.equal((await readEntry(env.pub, registry.address, t.address)).f.privileged, true);
@@ -77,9 +81,9 @@ test('cli attest: an entry for another codehash (code changed) is not a downgrad
   const t = await deployToken(env, 'CleanToken');
   const w = createWalletClient({ chain: foundry, transport: viemHttp(env.rpc), account: privateKeyToAccount(KEY2) });
   await env.pub.waitForTransactionReceipt({ hash: await attest(w, registry.address, t.address, {
-    codehash: `0x${'77'.repeat(32)}`, privileged: true, upgradeable: true, dangerSetter: true, ownerCanTrap: true, scannerVersion: 5,
+    codehash: `0x${'77'.repeat(32)}`, privileged: true, upgradeable: true, dangerSetter: true, ownerCanTrap: true, scannerVersion: 6,
   }) });
-  const cliEnv = { ...process.env, RPC_URL: env.rpc, REGISTRY: registry.address, ATTESTER_KEY: KEY2, SEND: '1', REPORTS_DIR: tmp('exitproof-cli-') };
+  const cliEnv = { ...process.env, RPC_URL: env.rpc, REGISTRY: registry.address, ATTESTER_KEY: KEY2, SEND: '1', STATIC_ONLY: '1', REPORTS_DIR: tmp('exitproof-cli-') };
   const { stderr } = await run('node', [CLI, 'attest', t.address], { env: cliEnv });
   assert.match(stderr, /attested/);
   const e = await readEntry(env.pub, registry.address, t.address);
@@ -129,7 +133,7 @@ test('F-13 / F-14 mainnet gate: chain 196 needs CONFIRM_MAINNET=yes; an anvil an
     assert.equal((await sendGate(url, { CONFIRM_MAINNET: 'yes' }, { log: () => {} })).network, 'xlayer');
     // the CLI send path is gated too
     await assert.rejects(run('node', [CLI, 'attest', '0x00000000000000000000000000000000000000aa'], {
-      env: { ...process.env, RPC_URL: url, REGISTRY: '0x00000000000000000000000000000000000000bb', ATTESTER_KEY: KEY3, SEND: '1' },
+      env: { ...process.env, RPC_URL: url, REGISTRY: '0x00000000000000000000000000000000000000bb', ATTESTER_KEY: KEY3, SEND: '1', STATIC_ONLY: '1' },
     }), (e) => e.code === 1 && /CONFIRM_MAINNET=yes/.test(e.stderr));
   } finally {
     srv.close();
@@ -193,7 +197,7 @@ test('publish-reports bundles reports/<token>.json into a static index', () => {
   const out = tmp('exitproof-pub-');
   const tok = '0x00000000000000000000000000000000000000aa';
   writeFileSync(path.join(src, `${tok}.json`), JSON.stringify({
-    token: tok, codehash: `0x${'11'.repeat(32)}`, block: 7, scannerVersion: 5, flags: { privileged: true },
+    token: tok, codehash: `0x${'11'.repeat(32)}`, block: 7, scannerVersion: 6, flags: { privileged: true },
     evidence: { reasons: ['owner-getter'], simulation: { signals: ['delayed-sell-trap'] } }, reportURI: 'x',
   }));
   writeFileSync(path.join(src, 'junk.json'), '{}');

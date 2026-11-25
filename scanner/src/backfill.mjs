@@ -13,10 +13,10 @@
 //   backoff, and RATE_MS (250) spaces tokens.
 // - SEND=1 attests through the same per-token decision as the daemon (no downgrade of a same-codehash entry), behind
 //   the mainnet gate (CONFIRM_MAINNET=yes). It requires FORK_RPC (an anvil fork, pinned to the block with
-//   FORK_UPSTREAM) unless ALLOW_STATIC_ONLY=1: a static-only "clean" attestation would turn strict mode's
+//   FORK_UPSTREAM) unless STATIC_ONLY=1 (ALLOW_STATIC_ONLY=1 is still accepted): a static-only "clean" attestation would turn strict mode's
 //   `unscanned` block into an allow without the sell simulation.
 // Env: RPC_URLS, REGISTRY, FACTORY, BASE_WOKB / BASE_USDT0 (local tests only), BLOCK, LIMIT, DUST_OKB, DUST_USDT, STATE_FILE, REPORTS_DIR, RATE_MS, FORK_RPC,
-//      FORK_UPSTREAM, ALLOW_STATIC_ONLY, ESTIMATE_PAIRS (950), COUNT_ALL (count every live pair for the estimate).
+//      FORK_UPSTREAM, STATIC_ONLY, ESTIMATE_PAIRS (950), COUNT_ALL (count every live pair for the estimate).
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import {
@@ -183,8 +183,8 @@ export async function runBackfill({ env = process.env, baseDir, log = console.er
   let walletClient;
   if (send) {
     if (!registry) throw new Error('SEND=1 requires REGISTRY');
-    if (!forkRpc && env.ALLOW_STATIC_ONLY !== '1') {
-      throw new Error('SEND=1 requires FORK_RPC (sell simulation); ALLOW_STATIC_ONLY=1 to attest static scans only');
+    if (!forkRpc && env.STATIC_ONLY !== '1' && env.ALLOW_STATIC_ONLY !== '1') {
+      throw new Error('SEND=1 requires FORK_RPC (sell simulation); STATIC_ONLY=1 to attest static scans only');
     }
     const key = attesterKey(env);
     if (!key) throw new Error('SEND=1 requires ATTESTER_KEY or ATTESTER_KEY_FILE');

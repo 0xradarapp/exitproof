@@ -262,6 +262,9 @@ export async function runDaemon({ client, walletClient, env = process.env, baseD
   };
   if (!opts.registry) throw new Error('REGISTRY is required');
   if (opts.send && !walletClient) throw new Error('SEND=1 requires ATTESTER_KEY or ATTESTER_KEY_FILE');
+  if (opts.send && !opts.forkRpc && env.STATIC_ONLY !== '1') {
+    throw new Error('SEND=1 requires FORK_RPC (sell simulation); STATIC_ONLY=1 to attest static scans only');
+  }
   if (opts.startBlock === undefined && !existsSync(opts.stateFile)) throw new Error('START_BLOCK is required on first run');
   const poll = Number(env.POLL_MS ?? 10_000);
   // dry-run keeps its whole state (cursor, pending, retry) in memory only

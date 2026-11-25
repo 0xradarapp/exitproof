@@ -36,9 +36,9 @@ function freePort() {
   });
 }
 
-export async function startAnvil() {
+export async function startAnvil(extraArgs = []) {
   const port = await freePort();
-  const proc = spawn('anvil', ['--port', String(port), '--silent', '--hardfork', 'cancun'], {
+  const proc = spawn('anvil', ['--port', String(port), '--silent', '--hardfork', 'cancun', ...extraArgs], {
     stdio: 'ignore',
   });
   const rpc = `http://127.0.0.1:${port}`;
@@ -136,11 +136,19 @@ export async function deployScannerFixture(env, name, args = []) {
  * then (now or later via `finish()`) deploy the ScannerFixtures token that mints its liquidity straight to the pair,
  * then add WOKB and sync. Returns { predicted, pair, finish, token }.
  */
-export async function launchAudit(env, infra, name, { deployNow = true, liq = 100_000n * 10n ** 18n, rest = 900_000n * 10n ** 18n, okb = parseEther('10') } = {}) {
+export async function launchAudit(env, infra, name, {
+  deployNow = true, liq = 100_000n * 10n ** 18n, rest = 900_000n * 10n ** 18n, okb = parseEther('10'), pairCreator = null,
+} = {}) {
   const { getContractAddress } = await import('viem');
   const nonce = await env.pub.getTransactionCount({ address: env.account.address });
-  const predicted = getContractAddress({ from: env.account.address, nonce: BigInt(nonce + 1) });
-  await write(env, infra.factory, 'createPair', [predicted, infra.wokb.address]);
+  // pairCreator (another wallet) creates the pair, so the PairCreated sender is not the token's admin
+  const predicted = getContractAddress({ from: env.account.address, nonce: BigInt(pairCreator ? nonce : nonce + 1) });
+  if (pairCreator) {
+    const h = await pairCreator.writeContract({ address: infra.factory.address, abi: infra.factory.abi, functionName: 'createPair', args: [predicted, infra.wokb.address] });
+    await env.pub.waitForTransactionReceipt({ hash: h });
+  } else {
+    await write(env, infra.factory, 'createPair', [predicted, infra.wokb.address]);
+  }
   const pairAddr = await read(env, infra.factory, 'getPair', [predicted, infra.wokb.address]);
   const pair = { address: pairAddr, abi: artifact('V2.sol', 'MockV2Pair').abi };
   const finish = async () => {

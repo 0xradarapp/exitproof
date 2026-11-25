@@ -236,3 +236,17 @@ test('external calls: live CALL/STATICCALL to a non-literal, non-ADDRESS target'
   assert.equal(A('5f5f5f5f5f545afa').privilegedCode, true);
 });
 
+
+test('v6: solc CBOR metadata trailer is data (a 0x5b in its hash does not make EXTCODEHASH "live")', async () => {
+  const { metadataStart } = await import('../src/scan.mjs');
+  const { hexToBytes } = await import('viem');
+  // STOP, INVALID, then a fake metadata map {ipfs: <bytes with 5b 3f>} + 2-byte length
+  const meta = `a264697066735822${'1220'}${'91d7991a41255b15bb9e3fb3'.padEnd(64, '0')}64736f6c6343000818`;
+  const len = (meta.length / 2).toString(16).padStart(4, '0');
+  const code = `0x00fe${meta}${len}`;
+  assert.equal(metadataStart(hexToBytes(code)), 2);
+  const a = analyzeCode(code);
+  assert.equal(a.externalState.count, 0);
+  // without the trailer shape the same bytes stay conservative (live after the JUMPDEST)
+  assert.equal(analyzeCode(`0x00fe${meta}`).externalState.count, 1);
+});

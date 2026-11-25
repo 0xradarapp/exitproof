@@ -75,7 +75,7 @@ test('F-03 SellWindowToken (sells close 10 min after receipt) => +1h / +1d fail 
   const { s, sim } = await run('SellWindowToken');
   assert.ok(s.evidence.blockContext.ops.TIMESTAMP.length > 0);
   const d = Object.fromEntries(sim.evidence.delayed.map((x) => [x.label, x.passes]));
-  assert.deepEqual(d, { '+1block': true, '+60s': true, '+1h': false, '+1d': false });
+  assert.deepEqual(d, { '+1block': true, '+60s': true, '+1h': false, '+1d': false, '+7d': false, '+30d': false });
   assert.ok(sim.signals.includes('delayed-sell-trap'));
   assert.equal(sim.dangerSetter, true);
 });
@@ -94,9 +94,12 @@ test('cooldown (no same-block sell) is not a delayed trap: immediate fails, late
   const sim = await simulate(env.rpc, t.address, pair.address);
   assert.equal(sim.evidence.immediate.passes, false);
   assert.ok(sim.evidence.delayed.every((d) => d.passes));
-  assert.deepEqual(sim.signals, []);
+  assert.ok(!sim.signals.includes('delayed-sell-trap'));
   assert.equal(sim.ownerCanTrap, false);
-  assert.equal(sim.dangerSetter, false);
+  // v6: the fixture's one-shot initPair(address) (deployer-only, already called) reverts for every identity, and
+  // the token has a caller-vs-literal check => the sweep is incomplete and fails closed (sweep-incomplete)
+  assert.deepEqual(sim.signals, ['sweep-incomplete']);
+  assert.deepEqual(sim.evidence.unknownSweep.unexercised, [selectorOf('initPair(address)')]);
 });
 
 test('F-04a HiddenAdminBomb: unlisted setter, admin in a private slot => unknown sweep finds it, ownerCanTrap', async () => {
@@ -105,7 +108,7 @@ test('F-04a HiddenAdminBomb: unlisted setter, admin in a private slot => unknown
   assert.equal(s.evidence.owner, null);
   const sel = selectorOf('setLaunchParam(uint256)');
   assert.ok(s.evidence.unknownSelectors.includes(sel));
-  assert.ok(sim.evidence.storageCallers.includes(env.account.address), 'admin found in storage');
+  assert.ok(sim.evidence.callers.includes(env.account.address), 'admin found (creator / storage word)');
   assert.ok(sim.signals.includes(`unknown-setter-trap:${sel}`));
   assert.ok(sim.evidence.unknownAttempts.some((a) => a.selector === sel && a.trapped));
   assert.equal(sim.ownerCanTrap, true);
@@ -128,6 +131,6 @@ test('F-04 sweep bound: more unknown selectors than the cap with a privileged ca
   const sim = await simulate(env.rpc, token.address, pair.address, { maxUnknown: 0 });
   assert.equal(sim.evidence.unknownSweep.complete, false);
   assert.match(sim.evidence.unknownSweep.truncatedBy, /max-selectors/);
-  assert.ok(sim.signals.includes('unknown-sweep-incomplete'));
-  assert.equal(sim.ownerCanTrap, true);
+  assert.ok(sim.signals.includes('sweep-incomplete'));
+  assert.equal(sim.dangerSetter, true, 'owner() is set: fail closed');
 });

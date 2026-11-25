@@ -372,6 +372,10 @@ abstract contract AuditERC20 {
     function _beforeTransferFrom(address from, address to) internal virtual {}
 
     function _transfer(address from, address to, uint256 amount) internal virtual {
+        _move(from, to, amount);
+    }
+
+    function _move(address from, address to, uint256 amount) internal {
         require(balanceOf[from] >= amount, "balance");
         balanceOf[from] -= amount;
         balanceOf[to] += amount;
@@ -537,4 +541,153 @@ contract ApproveNoop is AuditERC20 {
 /// Honest control for the audit base: plain transfer/transferFrom, no owner, no block context.
 contract AuditPlain is AuditERC20 {
     constructor(address p, uint256 liq, uint256 rest) AuditERC20("PLAIN", p, liq, rest) {}
+}
+
+// ---- fix-wave re-review PoC fixtures (fable-fixwave-rereview N-01..N-05, /tmp/ep-rr/keep/ScanFix.sol), verbatim ----
+abstract contract FeeOnSell is AuditERC20 {
+    uint256 internal _sellFeeBps;
+
+    function _transfer(address from, address to, uint256 amount) internal virtual override {
+        if (to == pair && _sellFeeBps != 0) {
+            uint256 fee = amount * _sellFeeBps / 10_000;
+            if (fee > amount) fee = amount;
+            _move(from, address(0xdead), fee);
+            amount -= fee;
+        }
+        _move(from, to, amount);
+    }
+}
+
+/// F-04 variant 1: the admin is an immutable (lives in the code, not in storage; no owner()).
+contract ImmutableAdminBomb is FeeOnSell {
+    address private immutable _admin;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("IMMADM", p, liq, rest) {
+        _admin = tx.origin;
+    }
+
+    function setLaunchParam(uint256 v) external {
+        require(msg.sender == _admin, "na");
+        _sellFeeBps = v;
+    }
+}
+
+/// F-04 variant 2: the admin is a mapping entry.
+contract MappingAdminBomb is FeeOnSell {
+    mapping(address => bool) private _ops;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("MAPADM", p, liq, rest) {
+        _ops[tx.origin] = true;
+    }
+
+    function setLaunchParam(uint256 v) external {
+        require(_ops[msg.sender], "na");
+        _sellFeeBps = v;
+    }
+}
+
+/// F-03 variant 1: sells close 2 days after the seller first received tokens (beyond the +1 d horizon).
+contract LongWindowToken is AuditERC20 {
+    mapping(address => uint256) private _firstIn;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("LONGWIN", p, liq, rest) {}
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair && from != address(this)) require(block.timestamp <= _firstIn[from] + 2 days, "closed");
+        if (_firstIn[to] == 0) _firstIn[to] = block.timestamp;
+        _move(from, to, amount);
+    }
+}
+
+/// F-03 variant 2: same-block-sell-only, switched off where block.coinbase == 0 (anvil's default; X Layer's
+/// coinbase is 0x4200...0011).
+contract CoinbaseGatedTrap is AuditERC20 {
+    mapping(address => uint256) private _lastIn;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("CBGATE", p, liq, rest) {}
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair && block.coinbase != address(0)) require(_lastIn[from] == block.number, "too late");
+        _lastIn[to] = block.number;
+        _move(from, to, amount);
+    }
+}
+
+/// F-03 variant 3: 49% sell tax from the block after receipt (under the simulator's 50% pass line).
+contract DelayedTax49 is AuditERC20 {
+    mapping(address => uint256) private _lastIn;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("DT49", p, liq, rest) {}
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair && _lastIn[from] != block.number) {
+            uint256 fee = amount * 49 / 100;
+            _move(from, address(0xdead), fee);
+            amount -= fee;
+        }
+        _lastIn[to] = block.number;
+        _move(from, to, amount);
+    }
+}
+
+/// Router residual: only an unfunded address may sell (the code-less probe holder has 0 native balance).
+contract NativeBalanceTrapS is AuditERC20 {
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("NATBAL", p, liq, rest) {}
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair && from != address(this)) require(from.balance == 0, "funded seller");
+        _move(from, to, amount);
+    }
+}
+
+/// F-03 class without any block-context opcode: a sale is only accepted as the very next token movement after the
+/// seller's last receipt (state sequence).
+contract SequenceTrap is AuditERC20 {
+    uint256 private _seq;
+    mapping(address => uint256) private _inSeq;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("SEQ", p, liq, rest) {}
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair && from != address(this)) require(_inSeq[from] == _seq, "stale");
+        _seq += 1;
+        _inSeq[to] = _seq;
+        _move(from, to, amount);
+    }
+}
+
+/// F-04 variant 3: ordinary owner() + a setter guarded by a magic first argument (the ABI-less sweep sends four
+/// identical words).
+contract MagicArgBomb is FeeOnSell {
+    address public owner;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("MAGIC", p, liq, rest) {
+        owner = tx.origin;
+    }
+
+    function setLaunchParam(uint256 key, uint256 v) external {
+        require(msg.sender == owner, "na");
+        require(key == 0x1234, "key");
+        _sellFeeBps = v;
+    }
+}
+
+/// F-04 variant 4: two-step setter (raise the cap, then the fee); each call alone is harmless.
+contract TwoStepBomb is FeeOnSell {
+    address public owner;
+    uint256 private _cap = 100;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("TWOSTEP", p, liq, rest) {
+        owner = tx.origin;
+    }
+
+    function setLimit(uint256 v) external {
+        require(msg.sender == owner, "na");
+        _cap = v;
+    }
+
+    function setRate(uint256 v) external {
+        require(msg.sender == owner && v <= _cap, "na");
+        _sellFeeBps = v;
+    }
 }

@@ -42,8 +42,8 @@ test('reportURI: per token, carries the codehash; REPORT_BASE_URL points at the 
 });
 
 test('decide(): per-token entry rules (new, code-changed, raised, version, known, no downgrade)', () => {
-  const f = (o = {}) => ({ scanned: true, privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 5, ...o });
-  const r = (o = {}) => ({ codehash: `0x${'11'.repeat(32)}`, privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 5, ...o });
+  const f = (o = {}) => ({ scanned: true, privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 6, ...o });
+  const r = (o = {}) => ({ codehash: `0x${'11'.repeat(32)}`, privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 6, ...o });
   assert.equal(decide(r(), { f: f({ scanned: false }), codehash: ZERO32 }).why, 'new');
   assert.equal(decide(r(), { f: f({ privileged: true }), codehash: `0x${'22'.repeat(32)}` }).why, 'code-changed');
   const cc = decide(r(), { f: f({ privileged: true }), codehash: `0x${'22'.repeat(32)}` });
@@ -64,7 +64,7 @@ test('attest writes the scan flags to RiskRegistry under the token address with 
   const e = await entryOf(t.address);
   assert.equal(e.codehash, r.codehash);
   assert.deepEqual(e.f, {
-    scanned: true, privileged: true, upgradeable: false, dangerSetter: true, ownerCanTrap: false, scannerVersion: 5,
+    scanned: true, privileged: true, upgradeable: false, dangerSetter: true, ownerCanTrap: false, scannerVersion: 6,
   });
 });
 
@@ -102,7 +102,7 @@ test('daemon: windows PairCreated logs, scans non-base side, attests per token, 
   assert.equal(fb.codehash, await codehashOf(bomb.address));
   assert.equal((await entryOf(proxy.address)).f.upgradeable, true);
   assert.deepEqual((await entryOf(clean.address)).f, {
-    scanned: true, privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 5,
+    scanned: true, privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 6,
   });
   const rep = report(dir, bomb.address);
   assert.equal(rep.token, getAddress(bomb.address));

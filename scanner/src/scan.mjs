@@ -31,7 +31,7 @@ import { keccak256, hexToBytes, bytesToHex, getAddress } from 'viem';
 import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS, CORE_ERC20, SAFE } from './selectors.mjs';
 import { readProxySlots, UPGRADE_SLOTS, isAddress20 } from './proxy.mjs';
 
-export const SCANNER_VERSION = 5;
+export const SCANNER_VERSION = 6;
 const OWNER_CALL_GAS = 100_000n;
 
 const JUMP = 0x56, JUMPI = 0x57, JUMPDEST = 0x5b, PUSH0 = 0x5f, EQ = 0x14;
@@ -149,7 +149,7 @@ const sig = (st) => st.map((v) => (v === null ? '_' : typeof v === 'bigint' ? v.
  * detection pass) and whether any jump target stayed unresolved.
  */
 const MAX_CTX = 64;
-function computeEntries(ins, seeds = [[0, []]]) {
+function computeEntries(ins, seeds = [[0, []]], onCmp = null) {
   const idx = new Map(ins.map((x, k) => [x.pc, k]));
   const isDest = (v) => typeof v === 'bigint' && v <= 0xffffffffn && ins[idx.get(Number(v))]?.op === JUMPDEST;
   // Context key = stack depth + the positions/values of JUMPDEST-valued literals (return addresses: a call-string
@@ -208,14 +208,14 @@ function computeEntries(ins, seeds = [[0, []]]) {
       visited.add(i);
       if (op === JUMP || op === JUMPI) {
         const t = targetsOf(stack.length ? stack[stack.length - 1] : null);
-        stepStack(ins[i], stack, null);
+        stepStack(ins[i], stack, onCmp);
         if (t === null) unresolved = true;
         else for (const k of t) edge(k, stack);
         if (op === JUMP) break;
         continue; // JUMPI falls through within this walk
       }
       if (TERMINATORS.has(op)) break;
-      stepStack(ins[i], stack, null);
+      stepStack(ins[i], stack, onCmp);
     }
   }
   const entries = new Map();
@@ -368,7 +368,13 @@ function analyzeDispatcher(ins) {
 // depend on the block, the time, the transaction origin or the transaction itself: the router's same-transaction
 // probe cannot see such a trap. Any such read makes the token `privileged` (strict blocks it); time-based traps are
 // left to the simulator for balanced mode (EIP-2612 permit and honest launch logic also read TIMESTAMP).
-const BLOCK_CTX_OPS = Object.freeze({ 0x32: 'ORIGIN', 0x42: 'TIMESTAMP', 0x43: 'NUMBER', 0x5c: 'TLOAD' });
+// v6 (N-02): block-environment reads that tell a fork from mainnet (or have no honest use on a transfer path) are
+// also collected; any of them sets `dangerSetter` (reason env-fingerprint), not only `privileged`.
+const BLOCK_CTX_OPS = Object.freeze({
+  0x32: 'ORIGIN', 0x42: 'TIMESTAMP', 0x43: 'NUMBER', 0x5c: 'TLOAD',
+  0x3a: 'GASPRICE', 0x40: 'BLOCKHASH', 0x41: 'COINBASE', 0x44: 'PREVRANDAO', 0x48: 'BASEFEE', 0x4a: 'BLOBBASEFEE',
+});
+export const ENV_FINGERPRINT_OPS = Object.freeze(['BASEFEE', 'BLOBBASEFEE', 'BLOCKHASH', 'COINBASE', 'GASPRICE', 'PREVRANDAO']);
 const TRANSFER_PATH_SELECTORS = Object.freeze(CORE_ERC20.slice(0, 2)); // transfer, transferFrom
 
 /**
@@ -395,8 +401,45 @@ function blockContextOf(ins, df, disp, liveIdx) {
   return { scope, ops: Object.fromEntries(Object.entries(ops).sort(([a], [b]) => sortStr(a, b))) };
 }
 
+// ---- per-selector magic constants (v6, N-01) ----
+// For every dispatcher selector outside SAFE: the literals compared (EQ / XOR) on the paths reachable from its entry,
+// e.g. `require(key == 0x1234)`. The simulator adds them to its ABI-less argument patterns.
+const MAX_HINTS = 8;
+const HINT_LIMIT = 1n << 160n;
+function selectorHintsOf(ins, df, disp) {
+  const out = {};
+  const opAt = new Map(ins.map((x) => [x.pc, x.op]));
+  for (const sel of Object.keys(disp.entries).sort(sortStr)) {
+    if (SAFE[sel]) continue;
+    const consts = new Set();
+    const onCmp = (pc, args) => {
+      const op = opAt.get(pc);
+      if (op === 0x01 || op === 0x03) return; // ADD / SUB: memory and calldata offsets
+      for (const v of args) for (const x of asSet(v) ?? []) if (x > 1n && x < HINT_LIMIT) consts.add(x);
+    };
+    const starts = disp.entries[sel];
+    const r = computeEntries(ins, starts.map((k) => [k, [...(df.entries.get(k) ?? [])]]), onCmp);
+    if (r.unresolved && !consts.size) continue;
+    const list = [...consts].filter((x) => x !== 0xffffffffn && !(x <= 0xffffffffn && disp.entries[selHex(x)]))
+      .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).slice(0, MAX_HINTS);
+    if (list.length) out[sel] = list.map((x) => `0x${x.toString(16)}`);
+  }
+  return out;
+}
+
 const isPush = (op) => op >= 0x60 && op <= 0x7f;
 const sortStr = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/** Offset of solc's CBOR metadata trailer (map with an ipfs / bzzr / solc key, length in the last 2 bytes), or null. */
+export function metadataStart(bytes) {
+  const n = bytes.length;
+  if (n < 4) return null;
+  const len = (bytes[n - 2] << 8) | bytes[n - 1];
+  const start = n - 2 - len;
+  if (len < 8 || start < 1 || bytes[start] < 0xa1 || bytes[start] > 0xa5) return null;
+  const txt = Buffer.from(bytes.subarray(start, n - 2)).toString('latin1');
+  return /ipfs|bzzr0|bzzr1|solc|experimental/.test(txt) ? start : null;
+}
 
 /** Canonical instruction list: [{pc, op, imm (bigint|null)}] */
 function decode(bytes) {
@@ -429,6 +472,7 @@ export function analyzeCode(codeHex) {
   const selectors = new Set(); // linear heuristic (dangerous-list matching only)
   const callerChecks = [];
   const callerLiteralChecks = [];
+  const callerLiterals = new Set(); // the admin addresses themselves (immutables / constants compared with CALLER)
   const externalCallOffsets = [];
   const externalStateOffsets = [];
   const callerCodeOffsets = [];
@@ -440,6 +484,11 @@ export function analyzeCode(codeHex) {
   // any jump target cannot be resolved, the pass is discarded and every JUMPDEST starts from an unknown stack
   // (sound: an unresolved jump could enter any block with any stack).
   const df = computeEntries(ins);
+  // v6: solc's CBOR metadata trailer is data. A 0x5b byte inside its hash would otherwise open a "live" run and
+  // count random bytes as opcodes (EXTCODEHASH, BALANCE, ...). It is skipped only when the dataflow resolved every
+  // jump and no reached block starts inside it (so no code can execute there).
+  const metaFrom = metadataStart(bytes);
+  const skipMeta = metaFrom !== null && !df.unresolved && ![...df.entries.keys()].some((k) => ins[k].pc >= metaFrom);
   const entries = df.unresolved ? new Map() : df.entries;
 
   let live = true;
@@ -453,11 +502,20 @@ export function analyzeCode(codeHex) {
   const onCmp = (pc, args) => {
     if (!args.includes('C')) return;
     if (args.includes('S')) callerChecks.push(pc);
-    else if (args.some(litQualifies)) callerLiteralChecks.push(pc);
+    else if (args.some(litQualifies)) {
+      callerLiteralChecks.push(pc);
+      for (const v of args) {
+        for (const x of asSet(v) ?? []) {
+          const a = isAddrLit(x) ? x : isAddrLit(((1n << 256n) - x) & M256) ? ((1n << 256n) - x) & M256 : null;
+          if (a !== null) callerLiterals.add(getAddress(`0x${a.toString(16).padStart(40, '0')}`));
+        }
+      }
+    }
   };
 
   for (let i = 0; i < ins.length; i++) {
     const { op, pc } = ins[i];
+    if (skipMeta && pc >= metaFrom) break;
     if (op === JUMPDEST) { live = true; stack = entries.has(i) ? [...entries.get(i)] : []; continue; }
     if (!live) {
       if (op === DELEGATECALL) opcodes.deadDelegatecall++;
@@ -521,6 +579,8 @@ export function analyzeCode(codeHex) {
   const accessControl = all.includes(HAS_ROLE);
   const blockContext = blockContextOf(ins, df, disp, liveBlockCtx);
   const blockContextRead = Object.keys(blockContext.ops).length > 0;
+  const envFingerprint = ENV_FINGERPRINT_OPS.some((n) => blockContext.ops[n]);
+  const selectorHints = df.unresolved ? {} : selectorHintsOf(ins, df, disp);
   return {
     selectors: sel,
     linearSelectors: linear,
@@ -530,12 +590,15 @@ export function analyzeCode(codeHex) {
     jumpsResolved: !df.unresolved,
     callerChecks,
     callerLiteralChecks,
+    callerLiterals: [...callerLiterals].sort(sortStr),
+    selectorHints,
+    envFingerprint,
     externalCalls: { count: externalCallOffsets.length, offsets: externalCallOffsets },
     externalState: { count: externalStateOffsets.length, offsets: externalStateOffsets, balance: balanceReads },
     callerCodeChecks: { count: callerCodeOffsets.length, offsets: callerCodeOffsets },
     unsafeDelegatecall: unsafeDelegate,
     upgradeable: unsafeDelegate || upgradeSelector,
-    dangerSetter: dangerous.length > 0 || opcodes.selfdestruct > 0,
+    dangerSetter: dangerous.length > 0 || opcodes.selfdestruct > 0 || envFingerprint,
     accessControl,
     blockContext,
     privilegedCode: accessControl || callerChecks.length > 0 || callerLiteralChecks.length > 0
@@ -658,6 +721,7 @@ export async function scan(client, token, { blockNumber } = {}) {
   if (both((x) => x.externalCalls.count > 0)) reasons.add('external-call');
   if (both((x) => x.externalState.count > 0)) reasons.add('external-state');
   if (both((x) => Object.keys(x.blockContext.ops).length > 0)) reasons.add('block-context');
+  if (both((x) => x.envFingerprint)) reasons.add('env-fingerprint');
   if (both((x) => x.dangerous.length > 0)) reasons.add('dangerous-selector');
   if (both((x) => x.opcodes.selfdestruct > 0)) reasons.add('live-selfdestruct');
   if (dispatcherUnrecognized) reasons.add('dispatcher-unrecognized');
@@ -700,6 +764,8 @@ export async function scan(client, token, { blockNumber } = {}) {
       externalState: a.externalState,
       callerCodeChecks: a.callerCodeChecks,
       blockContext: a.blockContext,
+      callerLiterals: [...new Set([...a.callerLiterals, ...(ia?.callerLiterals ?? [])])].sort(sortStr),
+      selectorHints: { ...(ia?.selectorHints ?? {}), ...a.selectorHints },
       proxySlots,
       implementation,
       clone,

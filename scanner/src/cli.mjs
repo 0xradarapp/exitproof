@@ -7,7 +7,7 @@
 //   node scanner/src/cli.mjs daemon                            RPC_URL REGISTRY START_BLOCK [FORK_RPC SEND]
 //   node scanner/src/cli.mjs backfill                          existing PotatoSwap pairs, newest first (see backfill.mjs)
 // Attester key: env only, ATTESTER_KEY or ATTESTER_KEY_FILE (chmod 600). Sends on X Layer mainnet also need
-// CONFIRM_MAINNET=yes.
+// CONFIRM_MAINNET=yes. Every send needs FORK_RPC (the sell simulation) unless STATIC_ONLY=1 is set explicitly.
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createPublicClient, createWalletClient, http, defineChain, getAddress } from 'viem';
@@ -61,6 +61,9 @@ try {
     console.log(stringify(await simulate(env.FORK_RPC, a1, a2)));
   } else if (cmd === 'attest') {
     if (!a1 || !env.REGISTRY) usage();
+    if (env.SEND === '1' && !(env.FORK_RPC && a2) && env.STATIC_ONLY !== '1') {
+      throw new Error('SEND=1 requires FORK_RPC and <pair> (sell simulation); STATIC_ONLY=1 to attest the static scan only');
+    }
     const { client, walletClient } = await clients({ needKey: true, what: 'attest' });
     const token = getAddress(a1);
     const r = await scan(client, token);
@@ -92,6 +95,9 @@ try {
       console.error(`dry-run (${d.why}; set SEND=1 to attest)`);
     }
   } else if (cmd === 'daemon') {
+    if (env.SEND === '1' && !env.FORK_RPC && env.STATIC_ONLY !== '1') {
+      throw new Error('SEND=1 requires FORK_RPC (sell simulation); STATIC_ONLY=1 to attest static scans only');
+    }
     const { client, walletClient } = await clients({ needKey: true, what: 'run the attester daemon' });
     await runDaemon({ client, walletClient, env, baseDir: BASE_DIR });
   } else if (cmd === 'backfill') {
