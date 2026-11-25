@@ -835,7 +835,10 @@ async function boot() {
       setX(r.facts);
       $('#explorer').scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
     } else {
-      try { await navigator.clipboard.writeText(shareUrl(r)); $('#share-status').textContent = S().copied; } catch { $('#share-status').textContent = shareUrl(r); }
+      // the clipboard can refuse or stall (page not focused): then show the link to copy by hand
+      const copy = navigator.clipboard?.writeText(shareUrl(r)) ?? Promise.reject();
+      const ok = await Promise.race([copy.then(() => true, () => false), new Promise((res) => setTimeout(() => res(false), 1500))]);
+      $('#share-status').textContent = ok ? S().copied : shareUrl(r);
     }
   });
   $('#xbits').addEventListener('click', (e) => {
