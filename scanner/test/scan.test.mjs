@@ -15,11 +15,11 @@ const FLAGS = (r) => ({
   privileged: r.privileged, upgradeable: r.upgradeable, dangerSetter: r.dangerSetter, ownerCanTrap: r.ownerCanTrap,
 });
 
-test('CleanToken: all flags false, codehash = keccak(runtime), version 8', async () => {
+test('CleanToken: all flags false, codehash = keccak(runtime), version 9', async () => {
   const t = await deployToken(env, 'CleanToken');
   const r = await scan(env.pub, t.address);
   assert.deepEqual(FLAGS(r), { privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
-  assert.equal(r.scannerVersion, 8);
+  assert.equal(r.scannerVersion, 9);
   assert.equal(r.codehash, keccak256(await env.pub.getCode({ address: t.address })));
   assert.equal(r.evidence.owner, null);
   assert.ok(r.evidence.selectors.includes(selectorOf('transfer(address,uint256)')));
@@ -44,7 +44,11 @@ test('OwnedCleanToken: privileged only', async () => {
   const r = await scan(env.pub, t.address);
   assert.deepEqual(FLAGS(r), { privileged: true, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
   assert.equal(r.evidence.owner.toLowerCase(), env.account.address.toLowerCase());
-  assert.deepEqual(r.evidence.unknownSelectors, [], 'owner()/renounceOwnership() are allowlisted');
+  // v9: renounceOwnership() left SAFE; it is unknown but passes the ownership-plumbing check (stores 0 into the slot
+  // it compares with CALLER, nothing else), so it is not caller-gated
+  assert.deepEqual(r.evidence.unknownSelectors, [selectorOf('renounceOwnership()')]);
+  assert.deepEqual(r.evidence.ownershipPlumbing, [selectorOf('renounceOwnership()')]);
+  assert.deepEqual(r.evidence.callerGatedUnknown, []);
 });
 
 test('TimeBombToken: privileged + dangerSetter (setSellFee)', async () => {
@@ -187,7 +191,8 @@ test('ImmutableAdminToken: CALLER vs immutable literal => privileged', async () 
   assert.equal(r.privileged, true);
   assert.ok(r.evidence.callerLiteralChecks.length >= 1);
   assert.equal(r.dangerSetter, true, 'v8');
-  assert.deepEqual(r.evidence.reasons, ['caller-gated-unknown', 'caller-vs-literal', 'unknown-selector']);
+  // v9: _transfer also compares CALLER with the immutable admin => caller-gated-safe (transfer / transferFrom)
+  assert.deepEqual(r.evidence.reasons, ['caller-gated-safe', 'caller-gated-unknown', 'caller-vs-literal', 'unknown-selector']);
 });
 
 test('BalanceOracleToken: BALANCE(0xBEEF) on the transfer path => privileged (external-state)', async () => {
@@ -204,7 +209,9 @@ test('`address constant` admin: optimizer on and off, small and full literal => 
     const r = await scan(env.pub, t.address);
     assert.ok(r.evidence.callerLiteralChecks.length >= 1, n);
     assert.equal(r.privileged, true, n);
-    assert.deepEqual(r.evidence.reasons, ['caller-vs-literal'], n);
+    // v9: the constant-admin compare sits inside transfer() (SAFE) => caller-gated-safe => dangerSetter
+    assert.deepEqual(r.evidence.reasons, ['caller-gated-safe', 'caller-vs-literal'], n);
+    assert.equal(r.dangerSetter, true, n);
   }
 });
 
@@ -246,25 +253,29 @@ test('fixture audit: flags for every test/fixtures/Tokens.sol token under scanne
   // caller-gated-unknown => dangerSetter. ScanFalsePositiveToken's ping() and ReentrantToken's setTarget() likewise.
   // CleanToken / OwnedCleanToken / FeeToken have no caller-gated unknown function and are unchanged; ProxyToken was
   // already dangerSetter (its own code has no unknown caller-gated selector; the implementation's are dangerous-list).
+  // v9: PairAware's transfer() compares CALLER (as `from`) with the stored pair or the immutable deployer
+  // (`from == pair`, `from != deployer`) => caller-gated-safe; flags are unchanged from v8 (all already dangerSetter).
+  // OwnedCleanToken: renounceOwnership() is no longer SAFE (unknown-selector) but passes the plumbing check.
   const G = 'caller-gated-unknown';
+  const GS = 'caller-gated-safe';
   const expected = {
     CleanToken: [false, false, false, []],
-    OwnedCleanToken: [true, false, false, ['caller-vs-storage', 'owner-getter']],
+    OwnedCleanToken: [true, false, false, ['caller-vs-storage', 'owner-getter', 'unknown-selector']],
     FeeToken: [true, false, false, ['unknown-selector']],
-    BlacklistOnBuy: [true, false, true, [G, 'caller-vs-literal', 'unknown-selector']],
-    SellTax99: [true, false, true, [G, 'caller-vs-literal', 'unknown-selector']],
-    MaxTxToken: [true, false, true, [G, 'caller-vs-literal', 'unknown-selector']],
-    CooldownToken: [true, false, true, ['block-context', G, 'caller-vs-literal', 'unknown-selector']],
+    BlacklistOnBuy: [true, false, true, [GS, G, 'caller-vs-literal', 'unknown-selector']],
+    SellTax99: [true, false, true, [GS, G, 'caller-vs-literal', 'unknown-selector']],
+    MaxTxToken: [true, false, true, [GS, G, 'caller-vs-literal', 'unknown-selector']],
+    CooldownToken: [true, false, true, ['block-context', GS, G, 'caller-vs-literal', 'unknown-selector']],
     TradingDisabled: [true, false, true,
-      [G, 'caller-vs-literal', 'caller-vs-storage', 'dangerous-selector', 'owner-getter', 'unknown-selector']],
+      [GS, G, 'caller-vs-literal', 'caller-vs-storage', 'dangerous-selector', 'owner-getter', 'unknown-selector']],
     TimeBombToken: [true, false, true,
-      [G, 'caller-vs-literal', 'caller-vs-storage', 'dangerous-selector', 'owner-getter', 'unknown-selector']],
-    GasBombToken: [true, false, true, [G, 'caller-vs-literal', 'unknown-selector']],
-    ReturnBombToken: [true, false, true, [G, 'caller-vs-literal', 'unknown-selector']],
-    TxOriginTrap: [true, false, true, ['block-context', G, 'caller-vs-literal', 'unknown-selector']],
+      [GS, G, 'caller-vs-literal', 'caller-vs-storage', 'dangerous-selector', 'owner-getter', 'unknown-selector']],
+    GasBombToken: [true, false, true, [GS, G, 'caller-vs-literal', 'unknown-selector']],
+    ReturnBombToken: [true, false, true, [GS, G, 'caller-vs-literal', 'unknown-selector']],
+    TxOriginTrap: [true, false, true, ['block-context', GS, G, 'caller-vs-literal', 'unknown-selector']],
     ScanFalsePositiveToken: [true, false, true, [G, 'caller-vs-literal', 'unknown-selector']],
-    ReentrantToken: [true, false, true, [G, 'caller-vs-literal', 'external-call', 'unknown-selector']],
-    ForgedProbeToken: [true, false, true, [G, 'caller-vs-literal', 'unknown-selector']],
+    ReentrantToken: [true, false, true, [GS, G, 'caller-vs-literal', 'external-call', 'unknown-selector']],
+    ForgedProbeToken: [true, false, true, [GS, G, 'caller-vs-literal', 'unknown-selector']],
     ProxyToken: [true, true, true, ['caller-vs-storage', 'dangerous-selector', 'delegatecall', 'fallback-logic',
       'proxy-slot', 'unknown-selector', 'upgrade-selector']],
   };

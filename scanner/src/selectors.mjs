@@ -82,7 +82,8 @@ export const CORE_ERC20 = Object.freeze([
 /**
  * ALLOWLIST of known-safe external functions (scanner v3). Any dispatcher selector outside this set makes the
  * token `privileged` (evidence.unknownSelectors): strict mode only passes tokens whose whole external surface is
- * known. Kept deliberately small: the ERC-20 / EIP-2612 / EIP-5267 / ERC-165 surface, Ownable's read + renounce,
+ * known. Kept deliberately small: the ERC-20 / EIP-2612 / EIP-5267 / ERC-165 surface, Ownable's read getters (v9:
+ * renounceOwnership is no longer allowlisted; it is checked as ownership plumbing in scan.mjs),
  * and a few unambiguous no-argument getters of immutable/pair wiring (`pair()`, `uniswapV2Pair()`,
  * `uniswapV2Router()`, `router()`, `deployer()`). Residual risk: a function with an allowlisted name may still hide
  * logic (e.g. a `pair()` that writes state); behaviour inside allowlisted functions is not proven safe.
@@ -92,7 +93,7 @@ const SAFE_SIGNATURES = [
   'transfer(address,uint256)', 'transferFrom(address,address,uint256)', 'approve(address,uint256)',
   'increaseAllowance(address,uint256)', 'decreaseAllowance(address,uint256)',
   'permit(address,address,uint256,uint256,uint8,bytes32,bytes32)', 'nonces(address)', 'DOMAIN_SEPARATOR()',
-  'eip712Domain()', 'owner()', 'getOwner()', 'supportsInterface(bytes4)', 'renounceOwnership()',
+  'eip712Domain()', 'owner()', 'getOwner()', 'supportsInterface(bytes4)',
   'pair()', 'uniswapV2Pair()', 'uniswapV2Router()', 'router()', 'deployer()',
 ];
 export const SAFE = Object.freeze(Object.fromEntries(

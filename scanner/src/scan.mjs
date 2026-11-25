@@ -31,7 +31,7 @@ import { keccak256, hexToBytes, bytesToHex, getAddress } from 'viem';
 import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS, CORE_ERC20, SAFE } from './selectors.mjs';
 import { readProxySlots, UPGRADE_SLOTS, isAddress20 } from './proxy.mjs';
 
-export const SCANNER_VERSION = 8;
+export const SCANNER_VERSION = 9;
 const OWNER_CALL_GAS = 100_000n;
 
 const JUMP = 0x56, JUMPI = 0x57, JUMPDEST = 0x5b, PUSH0 = 0x5f, EQ = 0x14;
@@ -58,7 +58,12 @@ set([CALL, CALLCODE], [7, 1]); set([DELEGATECALL, STATICCALL], [6, 1]);
 
 // Symbolic values: bigint literal | 'C' (CALLER/ORIGIN) | 'S' (SLOAD-derived) | 'A' (ADDRESS) | null (unknown).
 /** SLOAD-derived: 'S' (computed slot) or 'S:0x<slot>' (literal slot). */
-const isS = (v) => typeof v === 'string' && (v === 'S' || v.startsWith('S:'));
+const isS = (v) => typeof v === 'string' && (v === 'S' || v.startsWith('S:') || v.startsWith('KEEP:') || v.startsWith('OWNERW:'));
+const MASK160 = (1n << 160n) - 1n;
+const NOT_MASK160 = ((1n << 256n) - 1n) ^ MASK160;
+const isAddrLitG = (v) => v > 0n && v < 1n << 160n;
+/** A literal (or joined literal set) that can stand for an address: L or -L mod 2^256 is non-zero and < 2^160. */
+const litQualifiesG = (v) => (asSet(v) ?? []).some((x) => isAddrLitG(x) || isAddrLitG(((1n << 256n) - x) & M256));
 const MASK_OPS = new Set([0x04, 0x16, 0x1c]); // DIV, AND, SHR keep taint
 const TAINT_OPS = new Set([0x01, 0x02, 0x03, 0x18, 0x19]); // ADD, MUL, SUB, XOR, NOT
 const CMP_OPS = new Set([0x14, 0x03, 0x18, 0x01]); // EQ, SUB, XOR, ADD (solc -O: add(caller, not(c-1)) == 0)
@@ -115,6 +120,22 @@ function stepStack(x, stack, onCmp) {
   stack.length = Math.max(0, stack.length - io[0]);
   if (io[1] === 0) return;
   let out = fold(op, args);
+  // v9 expression tags for the ownership-plumbing check: CD4 = calldataload(4), CD4A = and(CD4, 2^160-1),
+  // KEEP:<slot> = and(sload(slot), not(2^160-1)), OWNERW:<slot> = or(KEEP:<slot>, CD4A)
+  if (op === 0x35 && args[0] === 4n) { stack.push('CD4'); return; }
+  if (op === 0x16 && out === null) {
+    const [a, b] = args;
+    if ((a === 'CD4' && b === MASK160) || (b === 'CD4' && a === MASK160)) { stack.push('CD4A'); return; }
+    const sl = [a, b].find((v) => typeof v === 'string' && v.startsWith('S:'));
+    if (sl && (a === NOT_MASK160 || b === NOT_MASK160)) { stack.push(`KEEP:${sl.slice(2)}`); return; }
+  }
+  if (op === 0x17 && out === null) {
+    const [a, b] = args;
+    const keep = [a, b].find((v) => typeof v === 'string' && v.startsWith('KEEP:'));
+    const other = keep === a ? b : a;
+    if (keep && other === 'CD4A') { stack.push(`OWNERW:${keep.slice(5)}`); return; }
+    if (keep && other === 0n) { stack.push(keep); return; }
+  }
   if (op === 0x33 || op === 0x32) out = 'C';
   else if (op === 0x30) out = 'A';
   else if (op === 0x54) out = typeof args[0] === 'bigint' ? `S:0x${args[0].toString(16)}` : 'S'; // v7: literal slot kept
@@ -411,42 +432,52 @@ function blockContextOf(ins, df, disp, liveIdx) {
 // For every dispatcher selector outside SAFE: the literals compared (EQ / XOR) on the paths reachable from its entry,
 // e.g. `require(key == 0x1234)`. The simulator adds them to its ABI-less argument patterns.
 const MAX_HINTS = 8;
-const OWNERSHIP_TRANSFER = '0xf2fde38b'; // transferOwnership(address)
+const PLUMBING = Object.freeze({ '0xf2fde38b': 'transfer', '0x715018a6': 'renounce' }); // transferOwnership, renounceOwnership
 const HINT_LIMIT = 1n << 160n;
 function selectorHintsOf(ins, df, disp, liveIdx) {
   const hints = {};
   const callerGated = [];
+  const callerGatedSafe = [];
   const plumbing = [];
   const opAt = new Map(ins.map((x) => [x.pc, x.op]));
   const liveCaller = liveIdx.some((k) => ins[k].op === 0x33 || ins[k].op === 0x32);
   for (const sel of Object.keys(disp.entries).sort(sortStr)) {
-    if (SAFE[sel]) continue;
+    const safe = !!SAFE[sel];
     const consts = new Set();
     const callerSlots = new Set();
     const sstores = [];
     let calls = 0;
+    let callerCompared = false;
     const onCmp = (pc, args) => {
-      if (args.includes('C')) for (const v of args) if (isS(v)) callerSlots.add(v);
+      if (args.includes('C')) {
+        for (const v of args) if (isS(v)) callerSlots.add(v);
+        // v9: CALLER / ORIGIN compared (EQ/SUB/XOR/ADD) with a storage value or an address-like literal
+        if (args.some((v) => isS(v)) || args.some((v) => v !== 'C' && litQualifiesG(v))) callerCompared = true;
+      }
       const op = opAt.get(pc);
       if (op === 0x01 || op === 0x03) return; // ADD / SUB: memory and calldata offsets
       for (const v of args) for (const x of asSet(v) ?? []) if (x > 1n && x < HINT_LIMIT) consts.add(x);
     };
     const onOp = (x, stack) => {
-      if (x.op === 0x55) sstores.push(stack.length ? stack[stack.length - 1] : null);
+      if (x.op === 0x55) sstores.push({ slot: stack.length ? stack[stack.length - 1] : null, value: stack.length > 1 ? stack[stack.length - 2] : null });
       if ([0xf0, 0xf1, 0xf2, 0xf4, 0xf5, 0xfa, 0xff].includes(x.op)) calls++;
     };
     const starts = disp.entries[sel];
     const r = df.unresolved ? { unresolved: true, visited: new Set() }
       : computeEntries(ins, starts.map((k) => [k, [...(df.entries.get(k) ?? [])]]), onCmp, onOp);
+    if (safe) {
+      // v9: inside an allowlisted function CALLER may be a mapping key or the from/owner side of the accounting,
+      // never compared with storage or a literal (an admin branch in approve(), a backdoor in permit, ...)
+      if (r.unresolved || callerCompared) callerGatedSafe.push(sel);
+      continue;
+    }
     // v8 rule: an unknown selector whose reachable code reads CALLER or ORIGIN is caller-gated. Unresolved jumps fall
     // back to whole-code liveness (conservative).
     const readsCaller = r.unresolved ? liveCaller
       : [...r.visited].some((k) => ins[k].op === 0x33 || ins[k].op === 0x32);
     if (readsCaller && !DANGEROUS[sel]) {
-      // Ownable.transferOwnership(address) shape: no external call, one SSTORE, to the literal slot compared with
-      // CALLER in this function (the owner slot). Anything more is treated as an ordinary caller-gated function.
-      const slot = sstores.length === 1 && typeof sstores[0] === 'bigint' ? `S:0x${sstores[0].toString(16)}` : null;
-      if (sel === OWNERSHIP_TRANSFER && !r.unresolved && calls === 0 && slot && callerSlots.has(slot)) plumbing.push(sel);
+      if (PLUMBING[sel] && !r.unresolved && isPlumbing(PLUMBING[sel], sstores, calls, callerSlots)
+        && ownerSlotHarmless(ins, df, disp, sstores[0].slot)) plumbing.push(sel);
       else callerGated.push(sel);
     }
     if (r.unresolved && !consts.size) continue;
@@ -454,7 +485,50 @@ function selectorHintsOf(ins, df, disp, liveIdx) {
       .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)).slice(0, MAX_HINTS);
     if (list.length) hints[sel] = list.map((x) => `0x${x.toString(16)}`);
   }
-  return { hints, callerGated, plumbing };
+  return { hints, callerGated, callerGatedSafe, plumbing };
+}
+
+/**
+ * v9 ownership plumbing (transferOwnership / renounceOwnership): (a) no external call, (b) exactly one SSTORE, to a
+ * literal slot this function compares with CALLER, (c) the stored value is exactly and(calldataload(4), 2^160-1)
+ * (transfer) or 0 (renounce), optionally merged into the slot's other bits (solc's read-modify-write), nothing else.
+ */
+function isPlumbing(kind, sstores, calls, callerSlots) {
+  if (calls !== 0 || sstores.length !== 1 || typeof sstores[0].slot !== 'bigint') return false;
+  const slot = `0x${sstores[0].slot.toString(16)}`;
+  if (!callerSlots.has(`S:${slot}`)) return false;
+  const v = sstores[0].value;
+  if (kind === 'transfer') return v === 'CD4A' || v === `OWNERW:${slot}`;
+  return v === 0n || v === `KEEP:${slot}`;
+}
+
+/**
+ * (d) On the transfer / transferFrom paths the owner slot is not read, or only compared (EQ) with a non-literal
+ * (from, to, CALLER) after the usual address mask; any other use (a literal compare, ISZERO, arithmetic, shifts, a
+ * jump condition, memory) disqualifies the plumbing exemption.
+ */
+function ownerSlotHarmless(ins, df, disp, slotBig) {
+  const tag = `S:0x${slotBig.toString(16)}`;
+  const starts = TRANSFER_PATH_SELECTORS.flatMap((x) => disp.entries[x] ?? []);
+  if (!starts.length) return true;
+  let ok = true;
+  const onOp = (x, stack) => {
+    if (!ok || (x.op >= 0x80 && x.op <= 0x9f) || x.imm !== null || x.op === JUMPDEST) return;
+    const io = x.op >= 0xa0 && x.op <= 0xa4 ? [2 + x.op - 0xa0, 0] : ARITY.get(x.op);
+    if (!io) return;
+    const args = Array.from({ length: io[0] }, (_, k) => (k < stack.length ? stack[stack.length - 1 - k] : null));
+    if (!args.some((v) => v === tag || (typeof v === 'string' && v.endsWith(`:${tag.slice(2)}`)))) return;
+    if (x.op === 0x50) return; // POP
+    if (x.op === 0x16 && args.some((v) => v === MASK160)) return; // address cleanup mask
+    if (x.op === 0x14) {
+      const other = args.find((v) => v !== tag) ?? null;
+      // EQ with from / to (calldata, possibly masked, or an unknown joined value) or CALLER; never a literal or storage
+      if (other === null || (typeof other === 'string' && !isS(other))) return;
+    }
+    ok = false;
+  };
+  const r = computeEntries(ins, starts.map((k) => [k, [...(df.entries.get(k) ?? [])]]), null, onOp);
+  return ok && !r.unresolved;
 }
 
 const isPush = (op) => op >= 0x60 && op <= 0x7f;
@@ -635,6 +709,7 @@ export function analyzeCode(codeHex) {
     callerCheckSlots: [...new Set(callerCheckSlots.map(String))].sort(sortStr).map((x) => (x === 'null' ? null : x)),
     selectorHints,
     callerGatedUnknown: unk.callerGated,
+    callerGatedSafe: unk.callerGatedSafe,
     ownershipPlumbing: unk.plumbing,
     envFingerprint,
     externalCalls: { count: externalCallOffsets.length, offsets: externalCallOffsets },
@@ -642,7 +717,8 @@ export function analyzeCode(codeHex) {
     callerCodeChecks: { count: callerCodeOffsets.length, offsets: callerCodeOffsets },
     unsafeDelegatecall: unsafeDelegate,
     upgradeable: unsafeDelegate || upgradeSelector,
-    dangerSetter: dangerous.length > 0 || opcodes.selfdestruct > 0 || envFingerprint || unk.callerGated.length > 0,
+    dangerSetter: dangerous.length > 0 || opcodes.selfdestruct > 0 || envFingerprint || unk.callerGated.length > 0
+      || unk.callerGatedSafe.length > 0,
     accessControl,
     blockContext,
     privilegedCode: accessControl || callerChecks.length > 0 || callerLiteralChecks.length > 0
@@ -767,6 +843,7 @@ export async function scan(client, token, { blockNumber } = {}) {
   if (both((x) => Object.keys(x.blockContext.ops).length > 0)) reasons.add('block-context');
   if (both((x) => x.envFingerprint)) reasons.add('env-fingerprint');
   if (both((x) => x.callerGatedUnknown.length > 0)) reasons.add('caller-gated-unknown');
+  if (both((x) => x.callerGatedSafe.length > 0)) reasons.add('caller-gated-safe');
   if (both((x) => x.dangerous.length > 0)) reasons.add('dangerous-selector');
   if (both((x) => x.opcodes.selfdestruct > 0)) reasons.add('live-selfdestruct');
   if (dispatcherUnrecognized) reasons.add('dispatcher-unrecognized');
@@ -814,6 +891,7 @@ export async function scan(client, token, { blockNumber } = {}) {
         .map((x) => (x === 'null' ? null : x)),
       selectorHints: { ...(ia?.selectorHints ?? {}), ...a.selectorHints },
       callerGatedUnknown: [...new Set([...a.callerGatedUnknown, ...(ia?.callerGatedUnknown ?? [])])].sort(sortStr),
+      callerGatedSafe: [...new Set([...a.callerGatedSafe, ...(ia?.callerGatedSafe ?? [])])].sort(sortStr),
       ownershipPlumbing: [...new Set([...a.ownershipPlumbing, ...(ia?.ownershipPlumbing ?? [])])].sort(sortStr),
       proxySlots,
       implementation,

@@ -71,11 +71,12 @@ test('v8 controls: CleanToken, PermitToken and a renounced plain OZ Ownable toke
   const s = await scan(env.pub, token.address);
   assert.equal(s.evidence.owner, null, 'renounced');
   assert.deepEqual(s.evidence.callerGatedUnknown, []);
-  assert.deepEqual(s.evidence.ownershipPlumbing, [selectorOf('transferOwnership(address)')]);
+  assert.deepEqual(s.evidence.ownershipPlumbing, [selectorOf('renounceOwnership()'), selectorOf('transferOwnership(address)')].sort());
+  assert.deepEqual(s.evidence.callerGatedSafe, []);
   assert.equal(s.dangerSetter, false);
   assert.equal(s.privileged, true, 'caller-vs-storage (strict fence, unchanged since v3)');
   const sim = await simulate(env.rpc, token.address, pair.address, { callers: [other.account.address] });
-  assert.deepEqual(sim.evidence.unknownSweep.plumbingUnexercised, [selectorOf('transferOwnership(address)')]);
+  assert.deepEqual(sim.evidence.unknownSweep.plumbingUnexercised.sort(), [selectorOf('renounceOwnership()'), selectorOf('transferOwnership(address)')].sort());
   assert.equal(sim.evidence.unknownSweep.complete, true);
   assert.deepEqual(sim.signals, []);
   const m = mergeSimulation(structuredClone(s), sim);
@@ -93,7 +94,8 @@ test('v8 transferOwnership(address) is plumbing only in the Ownable shape (one S
     const Y = X + 2;
     // body: CALLER PUSH0 SLOAD EQ ISZERO PUSH2 R JUMPI; SSTORE(slot 0, calldata[4]) [; SSTORE(slot 1, 1)]; STOP
     const pre = '5b335f541415';
-    const rest = `6004355f55${extraStores ? '6001600155' : ''}00`;
+    // v9 (c): the stored value must be exactly and(calldataload(4), 2^160-1)
+    const rest = `600435${'73'}${'ff'.repeat(20)}165f55${extraStores ? '6001600155' : ''}00`;
     const R = Y + (pre.length + 6 + 2 + rest.length) / 2;
     const hex = (n) => n.toString(16).padStart(4, '0');
     return `0x${head(hex(X), hex(Y))}5b00${pre}61${hex(R)}57${rest}5b5f5ffd`;
@@ -103,4 +105,7 @@ test('v8 transferOwnership(address) is plumbing only in the Ownable shape (one S
   assert.deepEqual([ok.ownershipPlumbing, ok.callerGatedUnknown, ok.dangerSetter], [['0xf2fde38b'], [], false]);
   const bad = analyzeCode(build(true));
   assert.deepEqual([bad.ownershipPlumbing, bad.callerGatedUnknown, bad.dangerSetter], [[], ['0xf2fde38b'], true]);
+  // v9 (c): the unmasked calldata word (upper bits could carry data) is not plumbing
+  const raw = analyzeCode(build(false).replace(`600435${'73'}${'ff'.repeat(20)}165f55`, `6004355f55${'00'.repeat(22)}`));
+  assert.deepEqual([raw.ownershipPlumbing, raw.callerGatedUnknown], [[], ['0xf2fde38b']]);
 });
