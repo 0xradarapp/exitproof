@@ -212,18 +212,31 @@ every shard.
 Each shard sends with **its own attester key**, created on the server, so the shards never race for a nonce and your
 main key never leaves this machine. Type your server login after `SRV=` (for example `you@<server-ip>`) and the
 shard count after `N=`, and paste the block. It copies the repo (without `.env` and `node_modules`), installs the
-dependencies, creates one key per shard in files only you can read (`~/.exitproof-shard<i>.key`, mode 600), and
-prints their addresses into `ATT`. The server needs Node ≥ 22 and Foundry, as in [docs/OPERATIONS.md](docs/OPERATIONS.md).
+dependencies, and creates one key per shard, `~/.exitproof-shard0.key` to `~/.exitproof-shard<N-1>.key`, readable by
+you only (mode 600). An existing key file is kept, so the block is safe to run again. The server needs Node ≥ 22 and
+Foundry, as in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ```zsh
 SRV=
 N=5
-[ -n "$SRV" ] || { echo "set SRV=user@<server-ip> first"; false; } && rsync -a --exclude .git --exclude node_modules --exclude .env --exclude refs --exclude .superpowers --exclude scanner/state --exclude scanner/reports ./ "$SRV:exitproof/" && ssh "$SRV" 'cd ~/exitproof && npm ci && cd scanner && npm ci' && ATT=$(ssh "$SRV" "umask 077 && for i in \$(seq 0 $((N-1))); do [ -s ~/.exitproof-shard\$i.key ] || { ~/.foundry/bin/cast wallet new > ~/.exitproof-shard\$i.txt && awk '/Private key/{print \$3}' ~/.exitproof-shard\$i.txt > ~/.exitproof-shard\$i.key && awk '/Address/{print \$2}' ~/.exitproof-shard\$i.txt > ~/.exitproof-shard\$i.addr && rm ~/.exitproof-shard\$i.txt; }; done && cat ~/.exitproof-shard*.addr | paste -sd, -")
-echo "$ATT"
+[ -n "$SRV" ] || { echo "set SRV=user@<server-ip> first"; false; } && rsync -a --exclude .git --exclude node_modules --exclude .env --exclude refs --exclude .superpowers --exclude scanner/state --exclude scanner/reports ./ "$SRV:exitproof/" && ssh "$SRV" 'cd ~/exitproof && npm ci && cd scanner && npm ci' && ssh "$SRV" "umask 077 && for i in \$(seq 0 $((N-1))); do f=\$HOME/.exitproof-shard\$i.key; [ -s \$f ] || ~/.foundry/bin/cast wallet new | awk '/Private key/{print \$3}' > \$f; chmod 600 \$f; done"
+```
+
+Read the shard addresses into `ATT`. The server derives each address from its key file (the key is read inside the
+server's shell and never printed). The second line checks that there are exactly `N` addresses and prints them, or
+clears `ATT`. The third line must print `600` for every key file.
+
+```zsh
+ATT=$(ssh "$SRV" "for i in \$(seq 0 $((N-1))); do ~/.foundry/bin/cast wallet address --private-key \"\$(cat \$HOME/.exitproof-shard\$i.key)\" || exit 1; done | paste -sd, -")
+[ "$(printf '%s' "$ATT" | tr ',' '\n' | grep -c '^0x')" = "$N" ] && echo "$ATT" || { echo "expected $N shard addresses, got: $ATT"; ATT=; }
+ssh "$SRV" "for i in \$(seq 0 $((N-1))); do stat -c '%a %n' \$HOME/.exitproof-shard\$i.key; done"
 ```
 
 Register those addresses as attesters and give each 0.001 OKB for gas (a shard of 190 tokens needs about 0.0003),
-sent from your deployer, the registry owner. Dry run first; it prints the plan and sends nothing.
+sent from your deployer, the registry owner. Dry run first; it prints the plan, the total and the deployer's balance,
+and sends nothing. The script caps funding at 0.01 OKB per address and 0.05 OKB in total, refuses the zero address,
+the registry, the router and your own deployer, and skips anything already done. To register again without sending
+any more OKB (for example after a re-run), put `FUND_OKB=0` in front.
 
 ```zsh
 ATTESTERS="$ATT" DEPLOYER_KEY="$(k)" node scripts/add-attesters.mjs
@@ -234,11 +247,13 @@ ATTESTERS="$ATT" DEPLOYER_KEY="$(k)" SEND=1 CONFIRM_MAINNET=yes node scripts/add
 ```
 
 Start one fork per shard on the server, in the background (they stay up when you log out), on ports 8551 and up, and
-pin every shard to the same block. Then a dry run of the 3 newest pairs of shard 0; it sends nothing and prints one
-line per token and the cost estimate.
+pin every shard to the same block. The second line waits until every fork answers (it gives up after about two
+minutes per fork). Then a dry run of the 3 newest pairs of shard 0; it sends nothing and prints one line per token and
+the cost estimate.
 
 ```zsh
 ssh "$SRV" "for i in \$(seq 0 $((N-1))); do nohup ~/.foundry/bin/anvil --fork-url https://xlayerrpc.okx.com --chain-id 196 --host 127.0.0.1 --port \$((8551+i)) --silent --retries 10 > ~/anvil-shard\$i.log 2>&1 < /dev/null & done"
+ssh "$SRV" "for i in \$(seq 0 $((N-1))); do n=0; until ~/.foundry/bin/cast chain-id --rpc-url http://127.0.0.1:\$((8551+i)) >/dev/null 2>&1; do n=\$((n+1)); [ \$n -ge 60 ] && { echo fork \$i did not start; exit 1; }; sleep 2; done; done; echo forks up"
 BLK=$(cast block-number --rpc-url https://xlayerrpc.okx.com)
 ssh "$SRV" "cd ~/exitproof && LIMIT=3 SHARD=0/$N BLOCK=$BLK SWEEP_BUDGET_S=600 FORK_RPC=http://127.0.0.1:8551 FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=$REG node scanner/src/cli.mjs backfill"
 ```
@@ -256,8 +271,8 @@ file pins the block), so only tokens that ended in an RPC error are retried. The
 
 ```zsh
 ssh "$SRV" 'tail -n 2 ~/exitproof/backfill-shard*.log'
-ssh "$SRV" 'pgrep -fc "cli.mjs backfill" || true'
-ssh "$SRV" 'pkill -f "anvil.*--port 85[5-9][0-9]" || true'
+ssh "$SRV" 'pgrep -fc "[c]li.mjs backfill" || true'
+ssh "$SRV" 'pkill -f "[a]nvil.*--port 85[5-9][0-9]" || true'
 ```
 
 ### 4c. The daemon (new pairs)
@@ -321,6 +336,19 @@ Registry ownership moves in two steps: the owner nominates a new owner with `tra
 takes over by calling `acceptOwnership()` from its own key. Until then the old owner stays in charge, so a typo
 cannot lock the registry.
 
+**If you ran the backfill, revoke the shard attesters first**, while your deployer is still the registry owner
+(after the ownership transfer only the new owner's key could do it). In the same terminal, with `SRV` and `N` set as
+in step 4b, run the step 4b block that reads `ATT` again (it re-reads the addresses from the server), then the dry
+run and the send below.
+
+```zsh
+REMOVE=1 ATTESTERS="$ATT" DEPLOYER_KEY="$(k)" node scripts/add-attesters.mjs
+```
+
+```zsh
+REMOVE=1 ATTESTERS="$ATT" DEPLOYER_KEY="$(k)" SEND=1 CONFIRM_MAINNET=yes node scripts/add-attesters.mjs
+```
+
 `cast` has no environment variable for a raw private key. To keep the key off the command line, import it once into
 an encrypted cast keystore. The `--interactive` flag asks you to paste the key, and then asks for a password.
 
@@ -345,5 +373,4 @@ cast call "$REG" 'owner()(address)' --rpc-url https://rpc.xlayer.tech
 cast call "$REG" 'pendingOwner()(address)' --rpc-url https://rpc.xlayer.tech
 ```
 
-After this, `attest` and the daemon need the new attester's key as `ATTESTER_KEY`. The backfill shards keep their own
-keys; to revoke them after the backfill, run the step 4b `add-attesters.mjs` send command again with `REMOVE=1` in front.
+After this, `attest` and the daemon need the new attester's key as `ATTESTER_KEY`.

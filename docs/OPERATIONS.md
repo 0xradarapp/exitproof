@@ -143,7 +143,9 @@ without `CONFIRM_MAINNET=yes`.
   newest first.
 - **One key per shard.** The shards send in parallel and the scanner does not coordinate nonces across processes,
   so give each shard its own attester key (`scripts/add-attesters.mjs` registers and funds them from the registry
-  owner; `REMOVE=1` revokes them afterwards). Never set `STATIC_ONLY=1` on mainnet.
+  owner, caps funding at 0.01 OKB per address and 0.05 OKB in total unless `FUND_CAP_OKB` is set, refuses the zero
+  address, the registry, the router and the deployer, and `REMOVE=1` revokes them; revoke them before any registry
+  ownership transfer). Never set `STATIC_ONLY=1` on mainnet.
 
 ```bash
 cd ~/exitproof
