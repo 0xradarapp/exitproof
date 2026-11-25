@@ -27,14 +27,14 @@
   "verified": {
     "netlistSha256": "a3d81e06cb23a74fd2bcec5ae8f57b9a50243b801f4ac10904cabe37afdd983b",
     "evals": "2048/2048",
-    "at": "2026-11-25T18:24:50.220Z"
+    "at": "2026-11-25T18:37:21.119Z"
   },
   "spent": {
     "okb": "0.002933839579225936",
     "bem": "0.11"
   },
-  "tapeoutFactory": "0x1f09daefa827f02cbb40967cc91b259763760761",
-  "bem": "0x60e62efa9405d6873c5deabd4e6cc91c25363952",
+  "tapeoutFactory": "0x1f09DAeFA827f02CBb40967cc91b259763760761",
+  "bem": "0x60e62Efa9405d6873C5deaBD4E6CC91c25363952",
   "nIn": 11,
   "nOut": 4,
   "gates": 54,

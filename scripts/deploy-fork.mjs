@@ -4,22 +4,21 @@
 //
 //   forge build && RPC_URL=http://127.0.0.1:8549 DEPLOYER_KEY=0x… node scripts/deploy-fork.mjs
 //
-// Env: DEPLOYER_KEY (required), RPC_URL (default http://127.0.0.1:8549), NETWORK (default fork),
+// The network is detected (anvil => "fork"); anything that is not an anvil node is refused.
+// Env: DEPLOYER_KEY (required), RPC_URL (default http://127.0.0.1:8549),
 //      FEE_RECIPIENT (default deployer), FEE_BPS (default 10), ATTESTER (extra attester; the deployer is always one).
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { createPublicClient, createWalletClient, http, defineChain, getAddress, encodeDeployData } from 'viem';
+import { createWalletClient, http, getAddress, encodeDeployData } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { ROOT, loadConstants, xlayerChain, detectNetwork, deploymentFile } from './lib/net.mjs';
 
-const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const K = loadConstants();
 const RPC_URL = process.env.RPC_URL || 'http://127.0.0.1:8549';
-const NETWORK = process.env.NETWORK || 'fork';
-const OUT_FILE = path.join(ROOT, 'deployments', NETWORK + '.json');
-const WOKB = '0xe538905cf8410324e03A5A23C1c177a474D59b2b';
-const POTATO_FACTORY = '0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF';
-const POTATO_FEE_BPS = 25;
+const WOKB = K.wokb;
+const POTATO_FACTORY = K.potatoFactory;
+const POTATO_FEE_BPS = K.potatoFeeBps;
 
 main().catch((e) => { console.error('\nSTOPPED: ' + (e.shortMessage || e.message)); process.exit(1); });
 
@@ -31,14 +30,18 @@ function artifact(file, name) {
 }
 
 async function main() {
-  if (!/^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(RPC_URL)) throw new Error('deploy-fork.mjs only targets a local fork (got ' + RPC_URL + ')');
   const key = process.env.DEPLOYER_KEY;
   if (!key || !/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error('Set DEPLOYER_KEY=0x… in the environment');
   const account = privateKeyToAccount(key);
-  const chain = defineChain({ id: 196, name: 'X Layer fork', nativeCurrency: { name: 'OKB', symbol: 'OKB', decimals: 18 }, rpcUrls: { default: { http: [RPC_URL] } } });
-  const pub = createPublicClient({ chain, transport: http(RPC_URL) });
-  const wallet = createWalletClient({ chain, transport: http(RPC_URL), account });
-  if ((await pub.getChainId()) !== 196) throw new Error('not a chain-196 fork');
+  const { network, pub, client } = await detectNetwork(RPC_URL, K);
+  if (network !== 'fork') throw new Error('deploy-fork.mjs only targets an anvil fork; ' + RPC_URL + ' is "' + network + '" (client "' + client + '")');
+  console.log('Network: fork (detected, client "' + client + '")');
+  const OUT_FILE = deploymentFile(network);
+  const wallet = createWalletClient({ chain: xlayerChain(RPC_URL, K), transport: http(RPC_URL), account });
+  for (const [label, a] of [['PotatoSwap factory', POTATO_FACTORY], ['WOKB', WOKB]]) {
+    const code = await pub.getCode({ address: a });
+    if (!code || code === '0x') throw new Error(label + ' ' + a + ' has no code on this fork');
+  }
 
   const dep = JSON.parse(fs.readFileSync(OUT_FILE, 'utf8'));
   if (!dep.processor || !dep.circuitId || !dep.verified) throw new Error(path.relative(ROOT, OUT_FILE) + ' has no verified circuit — run scripts/tapeout.mjs first');

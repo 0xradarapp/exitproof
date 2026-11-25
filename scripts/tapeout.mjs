@@ -1,47 +1,43 @@
 // ExitProof tape-out on X Layer, in one resumable command.
 //
 //   0. re-verify circuit/netlist.json locally against circuit/truth.json (all 2048 inputs) — before any spending
-//   a. find or create our processor on the TapeOut factory ("ExitProof Guard", BEM deployFee via exact approve)
-//   b. BEM approvals: exactly what each step pulls, nothing more
+//   a. find (adopt) or create our processor on the TapeOut factory ("ExitProof Guard", BEM deployFee via exact approve)
+//   b. BEM approvals: exactly what each step pulls, only to the factory or our transistors contract
 //   c. mint the NAND transistors still needed (gates - balance)
 //   d. tapeout(netlist, 11, 4) paying TAPEOUT_FEE in OKB
 //   e. verify on chain: netlist bytes, circuitInfo == (11, 4, 0, gates), all 2048 evals == truth.json
 //   f. write deployments/<network>.json {processor, transistors, circuitId, createTx, mintTx, tapeoutTx, ...}
 //
-// Every transaction is simulated against the chain right before it is sent. Progress is saved after every step
-// (STATE, default deployments/<network>.json), so re-running continues where it stopped.
+// The network is DETECTED, not configured: an anvil node is "fork" (deployments/fork.json), any other chain-196
+// node is "xlayer" mainnet (deployments/xlayer.json). Every transaction is simulated right before it is sent; progress
+// is saved after every step so re-running continues where it stopped. A dry run writes no files at all.
 //
-//   node scripts/tapeout.mjs                         dry run against X Layer mainnet (sends nothing)
-//   SEND=1 node scripts/tapeout.mjs                  really send
-//   RPC_URL=http://127.0.0.1:8549 SEND=1 node scripts/tapeout.mjs     rehearsal on a local anvil fork (network "fork")
+//   node scripts/tapeout.mjs                                        dry run (sends nothing, writes nothing)
+//   RPC_URL=http://127.0.0.1:8549 SEND=1 node scripts/tapeout.mjs   rehearsal on a local anvil fork
+//   SEND=1 CONFIRM_MAINNET=yes node scripts/tapeout.mjs             mainnet (prints the exact spend first)
 //
-// Env: DEPLOYER_KEY (required, 0x + 64 hex; read from the environment only), RPC_URL (default https://rpc.xlayer.tech),
-//      SEND=1, NETWORK (default: "fork" for localhost RPCs, else "xlayer"), STATE (progress file),
-//      CPU_SUFFIX (appended to the processor name/symbol if "ExitProof Guard" is taken),
-//      PROCESSOR (adopt an existing processor you created instead of creating one).
+// Env: DEPLOYER_KEY (required, 0x + 64 hex; environment only), RPC_URL (default https://rpc.xlayer.tech), SEND=1,
+//      CONFIRM_MAINNET=yes (mainnet only), CPU_SUFFIX (only if "ExitProof Guard" is taken by someone else),
+//      PROCESSOR (adopt a processor this deployer created).
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 import {
-  createPublicClient, createWalletClient, http, parseAbi, formatEther, decodeEventLog, defineChain,
-  decodeErrorResult, getAddress
+  createWalletClient, http, parseAbi, formatEther, decodeEventLog, decodeErrorResult, getAddress
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
+import { ROOT, loadConstants, xlayerChain, detectNetwork, deploymentFile } from './lib/net.mjs';
 
-const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const FACTORY = '0x1f09daefa827f02cbb40967cc91b259763760761';
-const BEM = '0x60e62efa9405d6873c5deabd4e6cc91c25363952';
-const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
+const K = loadConstants();
+const FACTORY = K.tapeoutFactory;
+const BEM = K.bem;
 const NAND = 0n;
+const MAX_CPU_SCAN = 5000; // bound on the processor scan (453 processors at block 76,861,306)
+const GAS_BUDGET = 2_000_000n; // ~1.61M gas for approve+createCPU+approve+mint+tapeout in the rehearsal
 
 const SEND = process.env.SEND === '1';
 const RPC_URL = process.env.RPC_URL || 'https://rpc.xlayer.tech';
-const LOCAL = /^https?:\/\/(127\.0\.0\.1|localhost|0\.0\.0\.0)(:|\/|$)/.test(RPC_URL);
-const NETWORK = process.env.NETWORK || (LOCAL ? 'fork' : 'xlayer');
-const OUT_FILE = path.join(ROOT, 'deployments', NETWORK + '.json');
-const STATE_FILE = process.env.STATE || OUT_FILE;
 const SUFFIX = process.env.CPU_SUFFIX || '';
 const CPU = {
   name: 'ExitProof Guard' + SUFFIX,
@@ -62,7 +58,7 @@ const ABI = parseAbi([
   'function createCPU(string name, string symbol, string story, uint256 transistorSupply, uint256 mintPrice) payable returns (address, address)',
   'event CPUCreated(address indexed circuits, address indexed transistors, address indexed creator, string name, uint256 supply, uint256 mintPrice)',
   'function name() view returns (string)',
-  'function factory() view returns (address)',
+  'function creator() view returns (address)',
   'function transistors() view returns (address)',
   'function TAPEOUT_FEE() view returns (uint256)',
   'function tapeout(bytes nl, uint32 nIn, uint32 nOut) payable returns (uint256)',
@@ -87,7 +83,8 @@ const bem = (x) => (x === undefined || x === null ? '?' : (Number(x) / 1e8).toSt
 
 main().catch((err) => {
   console.error('\nSTOPPED: ' + (err.shortMessage || err.message));
-  console.error('Progress so far is saved in ' + path.relative(ROOT, STATE_FILE) + '. Fix the issue and run the same command again.');
+  console.error(SEND ? 'Progress so far is saved in deployments/. Fix the issue and run the same command again.'
+    : 'Dry run: nothing was sent or written.');
   process.exit(1);
 });
 
@@ -100,20 +97,18 @@ async function main() {
   const key = process.env.DEPLOYER_KEY;
   if (!key || !/^0x[0-9a-fA-F]{64}$/.test(key)) throw new Error('Set DEPLOYER_KEY=0x… (64 hex chars) in the environment');
   const account = privateKeyToAccount(key);
-  const chain = defineChain({
-    id: 196, name: 'X Layer', nativeCurrency: { name: 'OKB', symbol: 'OKB', decimals: 18 },
-    rpcUrls: { default: { http: [RPC_URL] } }, contracts: { multicall3: { address: MULTICALL3 } }
-  });
-  const pub = createPublicClient({ chain, transport: http(RPC_URL, { timeout: 60_000 }) });
-  const wallet = createWalletClient({ chain, transport: http(RPC_URL), account });
-  const chainId = await pub.getChainId();
-  if (chainId !== 196) throw new Error('RPC is chain ' + chainId + ', expected 196 (X Layer or a fork of it)');
+  const { network: NETWORK, pub, chainId, client } = await detectNetwork(RPC_URL, K);
+  const MAINNET = NETWORK === 'xlayer';
+  const STATE_FILE = deploymentFile(NETWORK);
+  const wallet = createWalletClient({ chain: xlayerChain(RPC_URL, K), transport: http(RPC_URL), account });
   const read = (address, functionName, args = []) => pub.readContract({ address, abi: ABI, functionName, args });
   const bemOf = (a) => pub.readContract({ address: BEM, abi: ERC20, functionName: 'balanceOf', args: [a] });
 
   const state = fs.existsSync(STATE_FILE) && fs.readFileSync(STATE_FILE, 'utf8').trim()
     ? JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) : {};
+  // A dry run never writes: not the state, not the artifact, not an adoption.
   const save = () => {
+    if (!SEND) return;
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + '\n');
   };
@@ -125,22 +120,116 @@ async function main() {
   if (code && code !== '0x') {
     throw new Error('wallet ' + account.address + ' has contract code (EIP-7702); NAND mint would fail with ERC1155InvalidReceiver. Use a plain EOA.');
   }
-  const [okb0, bem0, deployFee, cpuCount] = await Promise.all([
-    pub.getBalance({ address: account.address }), bemOf(account.address), read(FACTORY, 'deployFee'), read(FACTORY, 'cpuCount')
+  const [okb0, bem0, deployFee, cpuCount, gasPrice] = await Promise.all([
+    pub.getBalance({ address: account.address }), bemOf(account.address), read(FACTORY, 'deployFee'),
+    read(FACTORY, 'cpuCount'), pub.getGasPrice()
   ]);
   if (state.start === undefined) {
     state.network = NETWORK; state.chainId = chainId; state.deployer = account.address;
     state.start = { okb: okb0.toString(), bem: bem0.toString(), block: (await pub.getBlockNumber()).toString() };
   }
-  console.log('Network        ' + NETWORK + ' (chain ' + chainId + ', ' + RPC_URL + ')');
+  console.log('Network        ' + NETWORK + ' (detected: chain ' + chainId + ', client "' + client + '", ' + RPC_URL + ')');
   console.log('Deployer       ' + account.address);
   console.log('Balances       ' + formatEther(okb0) + ' OKB · ' + bem(bem0) + ' BEM');
   console.log('Factory        ' + FACTORY + ' · ' + cpuCount + ' processors · createCPU fee ' + bem(deployFee) + ' BEM');
-  console.log('State          ' + path.relative(ROOT, STATE_FILE));
-  // TAPEOUT_FEE is read from the processor once it exists; 0.0013 OKB on every processor so far (Nov 2026).
-  const okbNeed = state.circuitId ? 0n : 1_300_000_000_000_000n + 2_000_000_000_000_000n;
-  if (okb0 < okbNeed) throw new Error('Not enough OKB: need about ' + formatEther(okbNeed) + ' (tapeout fee + gas), have ' + formatEther(okb0));
-  console.log(SEND ? '\nSENDING for real.\n' : '\nDRY RUN — simulating only. Run with SEND=1 to send.\n');
+  console.log('State          ' + path.relative(ROOT, STATE_FILE) + (SEND ? '' : ' (dry run: read only)'));
+
+  // ---- a(1). find our processor before ever considering createCPU
+  if (!state.processor && process.env.PROCESSOR) {
+    const p = getAddress(process.env.PROCESSOR);
+    if (!(await read(FACTORY, 'isCPU', [p]))) throw new Error('PROCESSOR ' + p + ' is not a TapeOut processor');
+    const tr = getAddress(await read(p, 'transistors'));
+    const creator = getAddress(await read(tr, 'creator'));
+    if (creator !== account.address) throw new Error('PROCESSOR ' + p + ' was created by ' + creator + ', not by ' + account.address);
+    Object.assign(state, { processor: p, transistors: tr, cpuName: await read(p, 'name'), adopted: true });
+    save();
+    console.log('Adopted        processor ' + p + ' ("' + state.cpuName + '") from PROCESSOR=');
+  }
+  let cpus = null;
+  if (!state.processor) {
+    // Scan every processor (newest first, bounded): name + creator (transistors().creator()).
+    const n = Number(cpuCount < BigInt(MAX_CPU_SCAN) ? cpuCount : BigInt(MAX_CPU_SCAN));
+    const idx = Array.from({ length: n }, (_, i) => cpuCount - 1n - BigInt(i));
+    const addrs = await pub.multicall({ contracts: idx.map((i) => ({ address: FACTORY, abi: ABI, functionName: 'cpuAt', args: [i] })), allowFailure: false });
+    const [names, trs] = await Promise.all(['name', 'transistors'].map((fn) =>
+      pub.multicall({ contracts: addrs.map((a) => ({ address: a, abi: ABI, functionName: fn })) })));
+    const creators = await pub.multicall({
+      contracts: trs.map((t) => ({ address: t.result || FACTORY, abi: ABI, functionName: 'creator' }))
+    });
+    cpus = addrs.map((a, i) => ({
+      addr: getAddress(a), name: names[i].result, transistors: trs[i].result && getAddress(trs[i].result),
+      creator: creators[i].result && getAddress(creators[i].result)
+    }));
+    const mine = cpus.filter((c) => c.creator === account.address);
+    const ours = mine.find((c) => c.name === CPU.name);
+    if (ours) {
+      Object.assign(state, { processor: ours.addr, transistors: ours.transistors, cpuName: ours.name, adopted: true });
+      save();
+      console.log('Adopted        processor ' + ours.addr + ' ("' + ours.name + '") — already created by this deployer');
+    } else {
+      if (mine.length) console.log('Note           this deployer created: ' + mine.map((c) => c.addr + ' "' + c.name + '"').join(', '));
+      const clash = cpus.find((c) => c.name === CPU.name);
+      if (clash) {
+        throw new Error('a processor named "' + CPU.name + '" already exists at ' + clash.addr + ' (created by ' + clash.creator +
+          '). Check it on the explorer first: if it is yours (e.g. from an earlier run whose receipt was lost), adopt it with PROCESSOR=' +
+          clash.addr + '. Only if it is NOT yours, pick another name with CPU_SUFFIX (that spends a new createCPU fee).');
+      }
+      console.log('Name           "' + CPU.name + '" is free among ' + cpus.length + ' processors');
+    }
+  }
+
+  // Never tape out twice. HEURISTIC: circuit ids are assumed dense from 1, so the scan stops after 3 consecutive
+  // empty/reverting ids (bounded at 1000); an identical netlist owned by the deployer is reused.
+  if (state.processor && !state.circuitId) {
+    for (let i = 1n, misses = 0; i < 1000n && misses < 3; i++) {
+      let nl;
+      try { nl = (await read(state.processor, 'netlist', [i])).toLowerCase(); } catch { misses++; continue; }
+      if (!nl || nl === '0x') { misses++; continue; }
+      misses = 0;
+      if (nl === C.netlist && getAddress(await read(state.processor, 'ownerOf', [i])) === account.address) {
+        console.log('Found          netlist already taped out as circuit #' + i + ' — skipping mint and tapeout');
+        state.circuitId = i.toString(); state.found = true; save(); break;
+      }
+    }
+  }
+
+  // ---- plan: exact fees, read on chain, checked before anything is sent
+  const needCreate = !state.processor;
+  const refProc = state.processor || (cpuCount > 0n ? await read(FACTORY, 'cpuAt', [cpuCount - 1n]) : null);
+  if (!refProc) throw new Error('no processor to read TAPEOUT_FEE from');
+  const refTr = state.transistors || await read(refProc, 'transistors');
+  const [tapeFee, pfee] = await Promise.all([read(refProc, 'TAPEOUT_FEE'), read(refTr, 'protocolFee').catch(() => 0n)]);
+  let mintAmount = 0n;
+  let mintPrice = CPU.mintPrice;
+  if (!state.circuitId) {
+    const have = needCreate ? 0n : await read(state.transistors, 'balanceOf', [account.address, NAND]);
+    mintAmount = BigInt(C.gates) > have ? BigInt(C.gates) - have : 0n;
+    if (!needCreate) mintPrice = await read(state.transistors, 'mintPrice').catch(() => 0n);
+  }
+  const plan = {
+    bem: (needCreate ? deployFee : 0n) + (mintAmount > 0n ? pfee : 0n), // one mint call
+    okbFees: (state.circuitId ? 0n : tapeFee) + mintPrice * mintAmount,
+    gas: state.circuitId ? 0n : gasPrice * GAS_BUDGET
+  };
+  const steps = [needCreate && 'createCPU "' + CPU.name + '" (' + bem(deployFee) + ' BEM)',
+    mintAmount > 0n && 'mint ' + mintAmount + ' NAND (' + bem(pfee) + ' BEM' + (mintPrice ? ' + ' + formatEther(mintPrice * mintAmount) + ' OKB' : '') + ')',
+    !state.circuitId && 'tapeout (' + formatEther(tapeFee) + ' OKB)'].filter(Boolean);
+  console.log('Plan           ' + (steps.length ? steps.join(' → ') : 'nothing to send; verify only'));
+  console.log('Will spend     ' + bem(plan.bem) + ' BEM · ' + formatEther(plan.okbFees) + ' OKB fees + ≈' + formatEther(plan.gas) + ' OKB gas');
+  if (bem0 < plan.bem) throw new Error('Not enough BEM: need ' + bem(plan.bem) + ', have ' + bem(bem0) + ' (token ' + BEM + ')');
+  if (okb0 < plan.okbFees + plan.gas) throw new Error('Not enough OKB: need ≈' + formatEther(plan.okbFees + plan.gas) + ', have ' + formatEther(okb0));
+
+  if (SEND && MAINNET && steps.length) {
+    console.log('\n' + '='.repeat(72));
+    console.log('  X LAYER MAINNET — real funds');
+    console.log('  deployer   ' + account.address);
+    console.log('  processor  ' + (state.processor ? state.processor + ' ("' + state.cpuName + '")' : 'NEW "' + CPU.name + '" (' + CPU.symbol + ')'));
+    console.log('  steps      ' + steps.join(' → '));
+    console.log('  spend      ' + bem(plan.bem) + ' BEM + ' + formatEther(plan.okbFees) + ' OKB fees + ≈' + formatEther(plan.gas) + ' OKB gas');
+    console.log('='.repeat(72));
+    if (process.env.CONFIRM_MAINNET !== 'yes') throw new Error('mainnet send needs CONFIRM_MAINNET=yes in addition to SEND=1 (nothing was sent)');
+  }
+  console.log(SEND ? '\nSENDING' + (MAINNET ? ' on MAINNET' : ' on the fork') + '.\n' : '\nDRY RUN — simulating only. Run with SEND=1 to send.\n');
 
   // ---- tx helpers: simulate -> (send) -> receipt
   const sim = (address, abi, functionName, args, value = 0n) =>
@@ -167,9 +256,11 @@ async function main() {
     state.gas[label] = r.gasUsed.toString();
     return r;
   }
-  // Approve exactly `amount` of BEM to `spender` if the current allowance is short. Returns false in a dry run when
-  // an approval is needed (later steps cannot be simulated before it exists).
+  // Approve exactly `amount` of BEM to `spender` (factory or our transistors only) if the allowance is short.
+  // Returns false in a dry run when an approval is needed (later steps cannot be simulated before it exists).
   async function ensureBem(label, spender, amount) {
+    const allowed = [FACTORY, state.transistors].filter(Boolean).map((a) => getAddress(a));
+    if (!allowed.includes(getAddress(spender))) throw new Error(label + ': refusing to approve BEM to unexpected spender ' + spender);
     if (amount === 0n) return true;
     const allowance = await pub.readContract({ address: BEM, abi: ERC20, functionName: 'allowance', args: [account.address, spender] });
     if (allowance >= amount) { console.log('  ✓ BEM        allowance ' + bem(allowance) + ' ≥ ' + bem(amount) + ' for ' + label); return true; }
@@ -200,31 +291,13 @@ async function main() {
     try { return decodeEventLog({ abi: ABI, data: l.data, topics: l.topics }); } catch { return null; }
   }).find((e) => e && e.eventName === name);
   const dryEnd = (why) => {
-    console.log('\nDry run OK up to here. ' + why);
-    console.log('When ready:  SEND=1 node scripts/tapeout.mjs');
+    console.log('\nDry run OK up to here (nothing sent, nothing written). ' + why);
+    console.log('When ready:  SEND=1' + (MAINNET ? ' CONFIRM_MAINNET=yes' : '') + ' node scripts/tapeout.mjs');
   };
 
-  // ---- a. processor
-  if (!state.processor && process.env.PROCESSOR) {
-    const p = getAddress(process.env.PROCESSOR);
-    if (!(await read(FACTORY, 'isCPU', [p]))) throw new Error('PROCESSOR ' + p + ' is not a TapeOut processor');
-    state.processor = p; state.transistors = await read(p, 'transistors'); state.cpuName = await read(p, 'name');
-    state.adopted = true; save();
-    console.log('Step a  adopted processor ' + p + ' ("' + state.cpuName + '")');
-  }
+  // ---- a(2). create the processor
   if (!state.processor) {
     console.log('Step a  create processor "' + CPU.name + '" (' + CPU.symbol + ')');
-    const names = await pub.multicall({
-      contracts: Array.from({ length: Number(cpuCount) }, (_, i) => ({ address: FACTORY, abi: ABI, functionName: 'cpuAt', args: [BigInt(i)] })),
-      allowFailure: false
-    }).then((addrs) => pub.multicall({ contracts: addrs.map((a) => ({ address: a, abi: ABI, functionName: 'name' })) })
-      .then((ns) => ns.map((n, i) => ({ addr: addrs[i], name: n.result }))));
-    const clash = names.find((n) => n.name === CPU.name);
-    if (clash) {
-      throw new Error('a processor named "' + CPU.name + '" already exists at ' + clash.addr +
-        '. If it is yours, run with PROCESSOR=' + clash.addr + '; otherwise set CPU_SUFFIX (e.g. CPU_SUFFIX=" 2").');
-    }
-    console.log('  ✓ name free  among ' + names.length + ' processors');
     if (!(await ensureBem('createCPU', FACTORY, deployFee))) return dryEnd('createCPU is simulated once the approval exists.');
     const r = await send('createCPU', FACTORY, 'createCPU', [CPU.name, CPU.symbol, CPU.story, CPU.supply, CPU.mintPrice], 0n);
     if (!r) return dryEnd('Steps c–e need the processor.');
@@ -245,31 +318,17 @@ async function main() {
   if (!(await read(FACTORY, 'isCPU', [state.processor]))) throw new Error('factory.isCPU(' + state.processor + ') is false');
   console.log('  processor    ' + state.processor + ' · transistors ' + state.transistors);
 
-  // Never tape out twice: if this exact netlist already lives on our processor (owned by us), use it.
-  if (!state.circuitId) {
-    for (let i = 1n, misses = 0; i < 1000n && misses < 3; i++) {
-      let nl;
-      try { nl = (await read(state.processor, 'netlist', [i])).toLowerCase(); } catch { misses++; continue; }
-      if (!nl || nl === '0x') { misses++; continue; }
-      misses = 0;
-      if (nl === C.netlist && getAddress(await read(state.processor, 'ownerOf', [i])) === account.address) {
-        console.log('  netlist already taped out as circuit #' + i + ' — skipping mint and tapeout');
-        state.circuitId = i.toString(); state.found = true; save(); break;
-      }
-    }
-  }
-
   // ---- b+c. NAND
   if (!state.circuitId) {
     const have = await read(state.transistors, 'balanceOf', [account.address, NAND]);
     const need = BigInt(C.gates);
     if (have < need) {
       const amount = need - have;
-      const [pfee, price] = await Promise.all([
+      const [fee, price] = await Promise.all([
         read(state.transistors, 'protocolFee').catch(() => 0n), read(state.transistors, 'mintPrice').catch(() => 0n)
       ]);
-      console.log('Step c  mint ' + amount + ' NAND (have ' + have + ') · protocol fee ' + bem(pfee) + ' BEM · mint price ' + formatEther(price * amount) + ' OKB');
-      if (!(await ensureBem('NAND mint', state.transistors, pfee))) return dryEnd('The mint is simulated once the approval exists.');
+      console.log('Step c  mint ' + amount + ' NAND (have ' + have + ') · protocol fee ' + bem(fee) + ' BEM · mint price ' + formatEther(price * amount) + ' OKB');
+      if (!(await ensureBem('NAND mint', state.transistors, fee))) return dryEnd('The mint is simulated once the approval exists.');
       const r = await send('mint ' + amount + ' NAND', state.transistors, 'mint', [NAND, amount], price * amount);
       if (!r) return dryEnd('tapeout needs the NAND first.');
       state.mintTx = r.transactionHash; save();
@@ -323,21 +382,13 @@ async function main() {
   console.log('  ✓ eval       ' + ok + '/' + C.truth.length + ' ✓');
   state.verified = { netlistSha256: C.sha256, evals: ok + '/' + C.truth.length, at: new Date().toISOString() };
 
-  // ---- f. artifact
+  // ---- f. artifact (the state file IS deployments/<network>.json)
   const [okb1, bem1] = await Promise.all([pub.getBalance({ address: account.address }), bemOf(account.address)]);
-  state.spent = {
-    okb: formatEther(BigInt(state.start.okb) - okb1),
-    bem: bem(BigInt(state.start.bem) - bem1)
-  };
+  state.spent = { okb: formatEther(BigInt(state.start.okb) - okb1), bem: bem(BigInt(state.start.bem) - bem1) };
   Object.assign(state, { tapeoutFactory: FACTORY, bem: BEM, nIn: C.nIn, nOut: C.nOut, gates: C.gates });
   save();
-  if (STATE_FILE !== OUT_FILE) {
-    const out = fs.existsSync(OUT_FILE) ? JSON.parse(fs.readFileSync(OUT_FILE, 'utf8')) : {};
-    fs.mkdirSync(path.dirname(OUT_FILE), { recursive: true });
-    fs.writeFileSync(OUT_FILE, JSON.stringify({ ...out, ...state }, null, 2) + '\n');
-  }
-  console.log('\nSpent          ' + state.spent.okb + ' OKB (fees + gas) · ' + state.spent.bem + ' BEM');
-  console.log('Wrote          ' + path.relative(ROOT, OUT_FILE));
+  console.log('\nSpent          ' + state.spent.okb + ' OKB (fees + gas) · ' + state.spent.bem + ' BEM (since the first run)');
+  console.log(SEND ? 'Wrote          ' + path.relative(ROOT, STATE_FILE) : 'Dry run: nothing written.');
   console.log('\nPROCESSOR=' + state.processor + ' CIRCUIT_ID=' + state.circuitId);
 }
 

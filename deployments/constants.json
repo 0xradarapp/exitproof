@@ -1,0 +1,10 @@
+{
+  "chainId": 196,
+  "tapeoutFactory": "0x1f09DAeFA827f02CBb40967cc91b259763760761",
+  "bem": "0x60e62Efa9405d6873C5deaBD4E6CC91c25363952",
+  "bemDecimals": 8,
+  "potatoFactory": "0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF",
+  "potatoFeeBps": 25,
+  "wokb": "0xe538905cf8410324e03A5A23C1c177a474D59b2b",
+  "multicall3": "0xcA11bde05977b3631167028862bE2a173976CA11"
+}
