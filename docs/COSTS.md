@@ -55,13 +55,25 @@ are the same on both.
 `RiskRegistry.attest` writes one struct and a report URI per codehash, roughly 50–80k gas, which is about 0.0000015 OKB
 at 0.02 gwei. Attesting every new PotatoSwap pair at about 100 pairs a day costs well under 0.001 OKB a day.
 
-## DeWEB (optional, see OPERATIONS.md; storage is an estimate)
+## DeWEB (`scripts/build-deweb.mjs` + `scripts/publish-deweb.mjs`; mainnet figures are estimates)
 
-Read from mainnet on 2026-11-25:
+Fees, read from mainnet on 2026-11-25:
 
 - **Opening the circuit's ERC-6551 container:** a one-time `FEE()` of **0.08 OKB (≈ $6.50)**, paid to the opener `0x536a…0106`.
-- **`.tape` name:** `monthlyFee()` on DomainBinding is **0**.
-- **Storage:** about 720 gas per byte, plus about 120k gas per 24 KB chunk. A single-file build with ethers and the fonts inlined is about 650 KB. That is about 470M gas, or about **0.01 OKB** at 0.02 gwei.
+- **`.tape` name:** `monthlyFee()` on DomainBinding is **0**, so a 12-month binding costs nothing beyond gas.
+
+Gas, **measured** on a fork of block 76,869,339 (publish of `dist/deweb/`: 12 files, 673,977 bytes):
+
+| Step | Gas |
+|---|---:|
+| open container | 167,256 |
+| 35 upload txs (putFile/appendChunk, 24,000-byte chunks, ≈224 gas/byte; a full chunk is 5,366,591) | ≈153.57M |
+| setFallback("index.html") | 114,238 |
+| bind(name, container, 12) | 185,482 |
+| **Total (38 txs)** | **154,038,564** |
+
+- At 0.02 gwei this is about 0.00308 OKB of gas, so the publish costs about **0.0831 OKB (≈ $6.73)** and 0 BEM *(estimate)*.
+- A re-publish of changed files pays only the upload gas for those files; the container fee is paid once.
 
 ## Mainnet budget recommendation (estimate)
 
@@ -71,14 +83,14 @@ Read from mainnet on 2026-11-25:
 | Registry + router | 0.0001 | – |
 | Demo buys (a few × 0.01 OKB) + gas | 0.03 | – |
 | Attestations for the demo and the daemon's first days | 0.001 | – |
-| DeWEB container + storage (optional) | 0.09 | – |
+| DeWEB: container fee + upload gas (optional) | 0.0831 | – |
 | Headroom (gas spikes, a retry) | 0.02 | 0.01 |
 | **Total without DeWEB** | **≈0.05** | **0.12** |
-| **Total with DeWEB** | **≈0.15** | **0.12** |
+| **Total with DeWEB** | **≈0.14** | **0.12** |
 
 On 2026-11-25 the deployer `0x2ef6…c92c` held 0.01802 OKB and 0 BEM.
 
 - **Before the tape-out:** top up to **at least 0.05 OKB**, and buy **at least 0.12 BEM**: swap about 0.015 OKB on the BEM/WOKB pool, or bridge BEM from BSC through tapeout.net. `tapeout.mjs` checks both balances before sending anything.
-- **Before DeWEB:** add about 0.09 OKB.
+- **Before DeWEB:** add about 0.09 OKB (0.0831 plus headroom).
 
-In US dollars, everything except the demo buys and DeWEB comes to **about $1**. With DeWEB, the total is **about $13**.
+In US dollars, everything except the demo buys and DeWEB comes to **about $1**. With DeWEB, the total is **about $12**.

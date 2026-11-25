@@ -180,11 +180,24 @@ async function main() {
     }
     if (!address && await hasCode(p.address)) address = getAddress(p.address);
     if (!address) {
+      // A recorded tx is only given up when the node POSITIVELY says it does not know it. An RPC error, or a tx the
+      // node still knows (pending), means it may still land: refuse. (Nonce counts alone are not enough: on an L2 RPC
+      // "pending" can equal "latest" while the sequencer still holds the tx.)
+      if (p.tx) {
+        let known;
+        try { known = await pub.getTransaction({ hash: p.tx }); } catch (e) {
+          if (e && e.name === 'TransactionNotFoundError') known = null;
+          else throw new Error('could not look up ' + name + ' tx ' + p.tx + ' (' + (e.shortMessage || e.message).split('\n')[0] + '): it may still land, so nothing was sent. Re-run later');
+        }
+        if (known) throw new Error(name + ' tx ' + p.tx + ' is known to the node but not mined yet: wait for it, then re-run. Nothing was sent');
+      }
       const n = await nonces();
       if (n.pending > p.nonce || n.latest > p.nonce) {
         throw new Error('nonce ' + p.nonce + ' is used or pending but ' + p.address + ' has no code yet: wait for that transaction (check the explorer), then re-run. Nothing was sent');
       }
-      console.log('               nonce ' + p.nonce + ' was never used: the earlier send did not reach the chain; it will be sent again with the same nonce');
+      console.log('               ' + (p.tx ? 'tx not found on the node and ' : '') + 'nonce ' + p.nonce + ' unused: the earlier send did not reach the chain; it will be sent again with exactly nonce ' + p.nonce);
+      dep.clearedNonce = dep.clearedNonce || {};
+      dep.clearedNonce[name] = p.nonce;
       delete dep.pending[name]; save();
       return;
     }
@@ -211,11 +224,18 @@ async function main() {
     return true;
   };
 
+  const routerArgsOf = () => [processor, circuitId, getAddress(dep.registry), K.wokb, feeRecipient, FEE_BPS, FACTORIES, FACTORY_FEES];
+  const fillRecord = () => Object.assign(dep, {
+    wokb: K.wokb, factory: K.potatoFactory, factoryFeeBps: FACTORY_FEES[0], feeRecipient, feeBps: FEE_BPS,
+    routerConstructorArgs: encodeAbiParameters(ROUTER_CTOR, routerArgsOf())
+  });
+
   // ---- what already exists
   if (dep.router) {
     if (!(await hasCode(dep.router))) throw new Error(rel + ' lists router ' + dep.router + ' but it has no code on this node (stale state; fresh anvil?)');
     await verifyRouter(dep.router, dep.registry);
     console.log('Already deployed: router ' + dep.router + ' · registry ' + dep.registry + ' (recorded in ' + rel + '). Nothing to send.');
+    if (!dep.routerConstructorArgs || !dep.feeBps) { fillRecord(); delete dep.pending; save(); } // e.g. a router adopted on resume
     writeConfig();
     printVerify(network, dep);
     return;
@@ -289,6 +309,10 @@ async function main() {
   async function deploy(name, label, art, args) {
     const n = await nonces();
     if (n.pending !== n.latest) throw new Error('deployer has a pending transaction: wait for it, then re-run (nothing sent for ' + label + ')');
+    const cleared = dep.clearedNonce && dep.clearedNonce[name];
+    if (cleared !== undefined && n.latest !== cleared) {
+      throw new Error(label + ': a cleared earlier send used nonce ' + cleared + ', but the next nonce is now ' + n.latest + ' (something else was sent): inspect ' + rel + ' and the explorer by hand. Nothing was sent');
+    }
     const address = getContractAddress({ from: deployer, nonce: BigInt(n.latest) });
     const data = encodeDeployData({ abi: art.abi, bytecode: art.bytecode, args });
     await pub.call({ account: account.address, data });
@@ -309,6 +333,7 @@ async function main() {
     dep[name] = getAddress(r.contractAddress);
     dep[name + 'Tx'] = hash;
     delete dep.pending[name];
+    if (dep.clearedNonce) { delete dep.clearedNonce[name]; if (!Object.keys(dep.clearedNonce).length) delete dep.clearedNonce; }
     save();
     return dep[name];
   }
@@ -334,11 +359,8 @@ async function main() {
   if (!(await pub.readContract({ address: registry, abi: Registry.abi, functionName: 'isAttester', args: [deployer] }))) throw new Error('deployer is not an attester');
   console.log('  ✓ router immutables read back · deployer is attester');
   const okb1 = await pub.getBalance({ address: deployer });
-  Object.assign(dep, {
-    wokb: K.wokb, factory: K.potatoFactory, factoryFeeBps: FACTORY_FEES[0], attester: deployer,
-    feeRecipient, feeBps: FEE_BPS, routerConstructorArgs: encodeAbiParameters(ROUTER_CTOR, finalArgs),
-    deploySpentOkb: formatEther(BigInt(dep.deployStartOkb) - okb1)
-  });
+  fillRecord();
+  Object.assign(dep, { attester: deployer, deploySpentOkb: formatEther(BigInt(dep.deployStartOkb) - okb1) });
   delete dep.pending;
   save();
   console.log('Wrote          ' + rel);
@@ -349,7 +371,10 @@ async function main() {
 }
 
 function printVerify(network, dep) {
-  const args = dep.routerConstructorArgs || '<abi-encoded constructor args>';
+  const args = dep.routerConstructorArgs || encodeAbiParameters(ROUTER_CTOR, [
+    getAddress(dep.processor), BigInt(dep.circuitId), getAddress(dep.registry), K.wokb,
+    getAddress(dep.feeRecipient || dep.deployer), Number(dep.feeBps ?? FEE_BPS), FACTORIES, FACTORY_FEES
+  ]);
   const common = '--chain 196 --compiler-version 0.8.24 --optimizer-runs 200 --evm-version cancun';
   const oklink = '--verifier oklink --verifier-url https://www.oklink.com/api/v5/explorer/contract/verify-source-code-plugin/XLAYER';
   console.log('\nSource verification (not run automatically' + (network === 'fork' ? '; only meaningful on mainnet' : '') + '):');

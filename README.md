@@ -2,7 +2,7 @@
 
 **Don't buy what you can't sell.** ExitProof is a buy router on X Layer. It buys a token, sells the whole position back
 in the same transaction, and lets a TapeOut circuit decide whether the buy goes through. If the circuit says no, the
-transaction reverts and your OKB stays where it was.
+transaction reverts: the buy amount and fee are never taken, and only the gas of the reverted transaction is spent.
 
 **English** · [Türkçe özet](#türkçe-özet)
 
@@ -11,12 +11,12 @@ transaction reverts and your OKB stays where it was.
 | | |
 |---|---|
 | **Live app** | `TBD (mainnet pending)`. Until then, the same static app runs against a local mainnet fork (`web/`, see [Run it yourself](#run-it-yourself)); screenshots are in [docs/screenshots/](docs/screenshots/) |
-| **On DeWEB** | `TBD (mainnet pending)`: `<circuit>.2.<processor index>.tape` on TapeKit; the plan is in [docs/OPERATIONS.md](docs/OPERATIONS.md#publishing-web-to-deweb--tapekit) |
+| **On DeWEB** | DeWEB-ready: ethers and fonts vendored, zero external hosts, publish script rehearsed on a fork. Gateway URL `TBD (after mainnet publish)`: `https://<circuitId>-2-<processorIndex>.tapekit.org/` (`<circuitId>.2.<processorIndex>.tape`). See [docs/OPERATIONS.md](docs/OPERATIONS.md#publishing-web-to-deweb--tapekit) |
 | **Demo video (≤ 3 min)** | `TBD (video link)`; the script is [docs/DEMO_SCRIPT.md](docs/DEMO_SCRIPT.md) |
 | **TapeOut processor** | `TBD (mainnet pending)`: ExitProof's own processor "ExitProof Guard" (EXITP), created by `scripts/tapeout.mjs` |
 | **Circuit ID** | `TBD (mainnet pending)`: the policy chip. 54 NAND, 11 inputs, 4 outputs. It decides allow/deny and a reason code on every guarded buy. |
 | **Contracts** | ExitProofRouter `TBD (mainnet pending)` · RiskRegistry `TBD (mainnet pending)` · trades on PotatoSwap V2 (factory [`0x630D…7fcF`](https://www.oklink.com/xlayer/address/0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF), 25 bps) with WOKB `0xe538…9b2b` |
-| **TapeOut features used** | **Circuits:** every `buyETH`, `buy` and `inspect` call runs `processor.eval(circuitId, facts)` inside the transaction. The router has no other allow/deny logic, and Solidity only adds money checks (minOut, deadline, fee cap). **Own processor + tape-out:** createCPU, NAND mint and tapeout, all scripted and rehearsed (`scripts/tapeout.mjs`). **DeWEB/TapeKit:** the app is static with no build step; the on-chain DeWEB publish is pending (ethers gets vendored first, see [docs/OPERATIONS.md](docs/OPERATIONS.md)). |
+| **TapeOut features used** | **Circuits:** every `buyETH`, `buy` and `inspect` call runs `processor.eval(circuitId, facts)` inside the transaction. The router has no other allow/deny logic, and Solidity only adds money checks (minOut, deadline, fee cap). **Own processor + tape-out:** createCPU, NAND mint and tapeout, all scripted and rehearsed (`scripts/tapeout.mjs`). **DeWEB/TapeKit:** DeWEB-ready. `scripts/build-deweb.mjs` vendors ethers and the fonts (zero external hosts; TapeKit's "100% on-chain" rule checked), and `scripts/publish-deweb.mjs` stores the site in the circuit's ERC-6551 container and binds the `.tape` name; the publish was rehearsed on a fork. Gateway URL TBD after the mainnet publish ([docs/OPERATIONS.md](docs/OPERATIONS.md)). |
 | **Business** | 10 bps on routed buys, with an immutable cap of 30 bps. Paid scanner API and bulk attestations for launchpads and wallets. An "ExitProof verified" launch badge. See [Revenue](#revenue) and [SUBMISSION.md](SUBMISSION.md). |
 | **Usage** | Allowed buys emit `Checked`; scanner verdicts emit `Attested`. The web feed reads both from chain. Blocked buys revert, so they never show up as events, and we don't claim on-chain "blocked" counts. |
 | **Verified source** | `TBD (mainnet pending)`. `scripts/deploy.mjs` prints the exact `forge verify-contract … --verifier sourcify --chain 196` and OKLink commands after deploying. |
@@ -44,7 +44,7 @@ you: buyETH(PotatoSwap, token, minOut, mode, to, deadline) + OKB
              (owner() staticcall, on-chain bytecode scan cached per codehash, RiskRegistry flags)
  └─ EVAL     processor.eval(circuitId, 11 bits) → 1 byte: allow | reason << 1
  └─ allow    send the tokens to `to` (minOut checked on what actually arrived) → event Checked(...)
-    deny     revert Blocked(reason, facts)  → the whole transaction unwinds, the OKB never left your wallet
+    deny     revert Blocked(reason, facts)  → the whole tx unwinds; only its gas is spent
 ```
 
 `inspect(...)` runs the same path through `eth_call` and always reverts with `Report(facts, allow, reason, buyOut, sellOut)`.
@@ -273,12 +273,12 @@ MIT, see [LICENSE](LICENSE).
 **ExitProof: satamayacağın token'ı alma.** X Layer üzerinde bir alım router'ı. Token'ı PotatoSwap'ten alır, aynı
 işlemin içinde pozisyonun tamamını yeni bir cüzdan üzerinden havuza geri satmayı dener (bu deneme her zaman geri
 alınır), alım/satım vergisini ölçer, owner ve yükseltilebilirlik bilgilerini toplar ve kararı 54 NAND kapılı bir
-TapeOut devresine bırakır. Devre "hayır" derse işlemin tamamı geri alınır, OKB'n cüzdanından hiç çıkmaz.
+TapeOut devresine bırakır. Devre "hayır" derse işlemin tamamı geri alınır: alım tutarı ve ücret alınmaz, yalnızca geri alınan işlemin gas'ı harcanır.
 
 - **Modlar:** permissive (sadece honeypot kontrolü), **balanced** (varsayılan), strict (yalnızca izin listesindeki yüzey; çoğu yeni token'ı engeller).
 - **Devre:** Yosys ile 54 NAND'a sentezlendi. 2048 girdinin tamamı hem çevrimdışı hem de gerçek bir TapeOut işlemcisi üzerinde (mainnet fork) doğrulandı.
 - **Üç savunma katmanı:** zincir üstü satış denemesi ve bytecode taraması; scanner'ın codehash'e göre yazdığı RiskRegistry; fork üzerinde owner yetkilerinin simülasyonu (`ownerCanTrap`).
-- **Güvenlik:** her görev çekişmeli bir incelemeden geçti. Bulunan atlatma yolları (sahte CBOR trailer, PUSH taşması, ikinci adım kara listesi, gizli owner, bakiye kill-switch'i, sabit admin) düzeltildi ve testle sabitlendi.
+- **Güvenlik:** her görev çekişmeli bir incelemeden geçti. Bulunan atlatma yolları (sahte CBOR trailer, PUSH taşması, ikinci adım kara listesi, gizli owner, bakiye kill-switch'i, sabit admin) düzeltildi ve bir test ya da kayıtlı bir manuel kontrolle doğrulandı.
 - **Sınırlar:** taranmamış dürüst token'ların ≈%4'ünde sahte "upgradeable" (sebep 4), tx.origin'e veya router'a özel davranan token'lar, ProbeHolder'ın kontrat olarak tanınabilmesi, gas penceresi izi, alım sonrası owner işlemleri, izinli fonksiyonların içindeki mantık, attester güveni, simülasyonun atlatılabilmesi, gerçek bir tarayıcı cüzdanıyla test edilmemiş alım yolu, TapeOut factory'sinin henüz mühürlenmemiş olması.
 - **Gas:** fork üzerinde ilk alım ≈756k, önbellekli ≈503k. 24 KB'lık bir token'ın ilk alımı ≈5M'a çıkabilir. Cüzdanın gas limitini düşürme (≈8M pay bırak).
 - **Gelir:** yönlendirilen alımlardan 10 bps (değiştirilemez üst sınır 30 bps), launchpad ve cüzdanlar için ücretli scanner API'si ve toplu attestation, "ExitProof verified" rozeti.

@@ -79,6 +79,46 @@ It ends with `ROUTER=… REGISTRY=…`. It writes the addresses, tx hashes and c
 address, and it records the tx hash right after sending. A re-run first checks what actually landed, and it refuses
 to send anything while an earlier transaction may still be pending.
 
+## 2b. Publish the app to DeWEB (TapeKit)
+
+Do this **after** step 2. The DeWEB build reads the router and registry from `deployments/xlayer.json`. The publish
+script refuses a stale build, or one still in the "mainnet deployment pending" state, so run `build-deweb.mjs` after
+`deploy.mjs`. The build writes only `dist/deweb/` (12 files, about
+674 KB) and checks TapeKit's "100% on-chain" rule.
+
+```zsh
+node scripts/build-deweb.mjs
+```
+
+The dry run prints the `.tape` name, the gateway URL, the container, the plan and the exact OKB, and sends nothing.
+`MONTHS=3` binds the name for three months, because a one-month binding (the script's default) expires after 30 days
+and judging may take longer. The monthly fee is currently 0. Running the same send command later with `MONTHS=n`
+renews the binding. The script hard-caps its fees (open ≤ 0.1 OKB, bind ≤ 0.05 OKB, total ≤ 0.15 OKB) and stops if
+the chain asks for more.
+
+```zsh
+DEPLOYER_KEY="$(k)" MONTHS=3 node scripts/publish-deweb.mjs
+```
+
+Then send. Expect about 0.0831 OKB: the one-time container fee of 0.08 OKB plus about 154M gas. It stops at a banner
+unless `CONFIRM_MAINNET=yes` is set. If it stops halfway, run the same command again; it resumes and skips the files
+it has already verified.
+
+```zsh
+DEPLOYER_KEY="$(k)" MONTHS=3 SEND=1 CONFIRM_MAINNET=yes node scripts/publish-deweb.mjs
+```
+
+It ends with `DONE https://<id>-2-<index>.tapekit.org/`. Print the name and the URL again from the progress file,
+open the URL in a browser, and check one token on the page.
+
+```zsh
+node -p "require('./deployments/deweb-xlayer.json').name + '  ' + require('./deployments/deweb-xlayer.json').url"
+```
+
+Put that URL and the `.tape` name in the README judges table (the "On DeWEB" row) and in SUBMISSION.md (the
+"Access link" field), replacing their `TBD`. Commit `deployments/deweb-xlayer.json` together with the other mainnet
+artifacts in step 5.
+
 ## 3. Source verification (Sourcify, then OKLink)
 
 `deploy.mjs` prints the exact commands at the end of a successful run. To print them again, re-run the dry run. It
@@ -159,7 +199,7 @@ Back at the repo root (`cd ..`), check a clean token and the FUT token in the br
 (0.01 OKB) through the app, and let the wallet use its own gas estimate. Then commit the mainnet artifacts:
 
 ```zsh
-git add deployments/xlayer.json web/config.json && git commit -m "chore: mainnet deployment"
+git add deployments/xlayer.json deployments/deweb-xlayer.json web/config.json README.md SUBMISSION.md && git commit -m "chore: mainnet deployment"
 ```
 
 ## 6. Google Form
@@ -185,14 +225,14 @@ an encrypted cast keystore. The `--interactive` flag asks you to paste the key, 
 cast wallet import exitproof-deployer --interactive
 ```
 
-Then fill in the two addresses and send the three transactions. Each one asks for the keystore password.
+Then type the two addresses after `NEW_ATTESTER=` and `NEW_OWNER=` and run the block. If either is left empty, the
+block prints a message and sends nothing. The three transactions run one after another, each asks for the keystore
+password, and the chain stops at the first failure.
 
 ```zsh
-NEW_ATTESTER=0x0000000000000000000000000000000000000000
-NEW_OWNER=0x0000000000000000000000000000000000000000
-cast send "$REG" 'setAttester(address,bool)' "$NEW_ATTESTER" true --account exitproof-deployer --rpc-url https://rpc.xlayer.tech
-cast send "$REG" 'setAttester(address,bool)' "$ME" false --account exitproof-deployer --rpc-url https://rpc.xlayer.tech
-cast send "$REG" 'transferOwnership(address)' "$NEW_OWNER" --account exitproof-deployer --rpc-url https://rpc.xlayer.tech
+NEW_ATTESTER=
+NEW_OWNER=
+[ -n "$NEW_ATTESTER" ] && [ -n "$NEW_OWNER" ] && [ -n "$REG" ] && [ -n "$ME" ] || { echo "set NEW_ATTESTER, NEW_OWNER (and run the Setup and step 4 blocks for ME and REG) first"; false; } && cast send "$REG" 'setAttester(address,bool)' "$NEW_ATTESTER" true --account exitproof-deployer --rpc-url https://rpc.xlayer.tech && cast send "$REG" 'setAttester(address,bool)' "$ME" false --account exitproof-deployer --rpc-url https://rpc.xlayer.tech && cast send "$REG" 'transferOwnership(address)' "$NEW_OWNER" --account exitproof-deployer --rpc-url https://rpc.xlayer.tech
 ```
 
 After this, the scanner and the daemon need the new attester's key as `ATTESTER_KEY`.

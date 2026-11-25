@@ -6,8 +6,8 @@ has them once `scripts/tapeout.mjs` and `scripts/deploy.mjs` have run with `SEND
 ## One line
 
 Don't buy what you can't sell: ExitProof buys a token on X Layer, sells the whole position back in the same
-transaction, and lets a TapeOut circuit decide whether the buy stands. If the answer is no, the transaction reverts
-and the OKB never leaves your wallet.
+transaction, and lets a TapeOut circuit decide whether the buy stands. If the answer is no, the transaction reverts:
+the buy amount is never taken, and only the gas of the reverted transaction is spent.
 
 ## Form fields
 
@@ -18,13 +18,13 @@ and the OKB never leaves your wallet.
   - ExitProofRouter `TBD (mainnet pending)`
   - RiskRegistry `TBD (mainnet pending)`
   - The router trades on PotatoSwap V2 (factory `0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF`).
-- **Access link:** `TBD (live app URL)`. On DeWEB: `TBD (<circuit>.2.<processor index>.tape via TapeKit)`.
+- **Access link:** `TBD (live app URL)`. On DeWEB: `TBD (after mainnet publish: https://<circuitId>-2-<processorIndex>.tapekit.org/)`.
 - **Repo:** `TBD (repo URL)`
 - **Demo video (≤ 3 min):** `TBD (video link)`
 
 ### Product / service
 
-ExitProof is a buy router for X Layer memecoins that refuses to let you buy a honeypot.
+ExitProof is a buy router for X Layer memecoins that blocks any buy whose full exit fails at the moment of purchase. The known residuals are listed in the README.
 
 When you buy through ExitProof, the router does four things inside your transaction:
 
@@ -33,7 +33,7 @@ When you buy through ExitProof, the router does four things inside your transact
 3. It measures the buy and sell tax, reads `owner()`, scans the bytecode for upgrade or self-destruct paths, and reads the ExitProof scanner's registry flags for the token's codehash.
 4. It feeds these 11 facts to a 54-gate TapeOut circuit, which answers allow or deny with a reason code.
 
-On deny, the whole transaction reverts with the reason, and the user's OKB never moves. On allow, the tokens go to the
+On deny, the whole transaction reverts with the reason, and only the gas of the reverted transaction is spent; the buy amount and fee are never taken. On allow, the tokens go to the
 buyer, and `minOut` is checked on what actually arrived.
 
 Users pick a mode:
@@ -79,7 +79,7 @@ with an active owner is blocked with reason 6.
 - **The circuit decides every trade.**
   - `buyETH`, `buy` and `inspect` call `processor.eval(circuitId, facts)` inside the transaction, and the router acts on the answer.
   - Solidity adds only the money checks: minOut, deadline and the fee cap. The circuit isn't there for decoration; deny means revert.
-- **DeWEB / TapeKit:** the web app is static, with no build step. The on-chain DeWEB publish is pending, because ethers gets vendored into the page first. The target is the circuit's ERC-6551 container, served as `<circuit>.2.<processor index>.tape` (plan in `docs/OPERATIONS.md`). `TBD: link once published.`
+- **DeWEB / TapeKit:** DeWEB-ready. ethers and the fonts are vendored, so the page loads from zero external hosts and passes TapeKit's "100% on-chain" rule. `scripts/publish-deweb.mjs` stores it in the circuit's own ERC-6551 container and binds `<circuitId>.2.<processorIndex>.tape`; the publish was rehearsed on a fork (38 txs, ≈0.0831 OKB estimated on mainnet). Gateway URL `TBD` after the mainnet publish.
 - **OKX Agentic Wallet:** `agent/SKILL.md`. The CLI prepares the `buyETH` call, and the agent signs it with `onchainos wallet contract-call` after the user confirms.
 
 ### What was built during the event

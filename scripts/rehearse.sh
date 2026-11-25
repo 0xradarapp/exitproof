@@ -101,13 +101,22 @@ DEPLOYER_KEY="$DEPLOYER_KEY" node scripts/deploy.mjs
 [ "$before" = "$(shasum deployments/fork.json web/config.json)" ] || fail "deploy.mjs dry run wrote files"
 echo "dry run wrote nothing ✓"
 
-echo "-- interrupted deploy: kill deploy.mjs after the RiskRegistry send, before its receipt"
+echo "-- recorded registry tx the node has never seen (lost send): only a positive not-found may clear it"
 N0=$(cast nonce "$DEPLOYER" --rpc-url "$RPC")
+node -e 'const fs=require("fs");const f="deployments/fork.json";const d=JSON.parse(fs.readFileSync(f));
+  d.pending={registry:{nonce:Number(process.argv[1]),address:process.argv[2],tx:"0x"+"de".repeat(32)}};fs.writeFileSync(f,JSON.stringify(d,null,2)+"\n")' \
+  "$N0" "$(cast compute-address "$DEPLOYER" --nonce "$N0" | awk '{print $NF}')"
+LOST=$(DEPLOYER_KEY="$DEPLOYER_KEY" node scripts/deploy.mjs 2>&1 || true)
+grep -E "Resume|not found" <<<"$LOST" || true
+grep -q "tx not found on the node and nonce $N0 unused" <<<"$LOST" || fail "a lost registry tx was not recognised as not-found"
+echo "   dry run: lost tx recognised, would re-send with exactly nonce $N0 (the record stays until a SEND run) ✓"
+echo "-- interrupted deploy: kill deploy.mjs after the RiskRegistry send, before its receipt"
 cast rpc evm_setAutomine false --rpc-url "$RPC" >/dev/null
 DEPLOYER_KEY="$DEPLOYER_KEY" SEND=1 node scripts/deploy.mjs >"$WORK/deploy-killed.log" 2>&1 &
 DPID=$!
-pend() { node -e 'const d=require("./deployments/fork.json");const p=(d.pending||{}).registry;console.log(p&&p.tx?p.address:"")'; }
-for _ in $(seq 1 120); do [ -n "$(pend)" ] && break; sleep 1; done
+# wait for a REAL registry tx: the run first clears the lost-tx record above (positive not-found), then sends
+pend() { node -e 'const d=require("./deployments/fork.json");const p=(d.pending||{}).registry;console.log(p&&p.tx&&!/^0x(de)+$/.test(p.tx)?p.address:"")'; }
+for _ in $(seq 1 300); do [ -n "$(pend)" ] && break; sleep 1; done
 PENDING_REG=$(pend)
 [ -n "$PENDING_REG" ] || { cat "$WORK/deploy-killed.log"; fail "deploy.mjs did not record a registry tx"; }
 kill "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null || true
@@ -115,7 +124,7 @@ echo "   killed with registry tx recorded and unmined; predicted registry $PENDI
 echo "-- re-run while that tx is still pending: must refuse and send nothing"
 RERUN=$(DEPLOYER_KEY="$DEPLOYER_KEY" SEND=1 node scripts/deploy.mjs 2>&1 || true)
 grep -E "Resume|STOPPED" <<<"$RERUN" || true
-grep -q "used or pending" <<<"$RERUN" || fail "re-run with a pending registry tx did not refuse"
+grep -qE "known to the node but not mined|used or pending|could not look up" <<<"$RERUN" || fail "re-run with a pending registry tx did not refuse"
 [ "$(cast rpc txpool_status --rpc-url "$RPC" | node -p 'parseInt(JSON.parse(require("fs").readFileSync(0,"utf8")).pending)')" = 1 ] \
   || fail "a second transaction was sent while the first was pending"
 echo "   refused, still exactly 1 pending tx ✓"
