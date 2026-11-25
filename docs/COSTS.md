@@ -64,7 +64,8 @@ measured **79,041 gas** on anvil (the scanner budgets 80,000), which is about 0.
 
 - **Launch-day backfill** of the existing pairs, about 950 with a live pool: 950 × 80k gas ≈ **0.0015 OKB**
   *(estimate)*. The cost is time, not money: the fork simulation takes about 69 s per token, so about 18 hours for
-  all of them on one fork (MORNING.md step 4b).
+  all of them on one fork, or roughly 4–6 hours in 5 shards (MORNING.md step 4b). Each shard sends with its own
+  attester key, funded with 0.001 OKB (0.005 OKB for 5 shards, mostly left over).
 - **Daemon:** attesting every new PotatoSwap pair at about 100 pairs a day costs well under 0.001 OKB a day.
 
 ## DeWEB (`scripts/build-deweb.mjs` + `scripts/publish-deweb.mjs`; mainnet figures are estimates)

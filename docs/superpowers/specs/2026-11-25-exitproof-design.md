@@ -112,3 +112,66 @@ Exact tax-bucket math, gas tuning, UI copy, scanner selector list, fixture detai
 
 ## Needs the user (end of build)
 Funded deployer key on X Layer (≈0.05 OKB est.), demo video recording/voice, Google-form submission, X posts.
+
+---
+
+## Final state (2026-11-26)
+
+The sections above are the original design, kept as history. After two independent final audits (security and
+functional) the contracts, scanner and front-ends changed as follows; this section wins where they differ. The
+circuit interface and policy above are unchanged (11 inputs, 4 outputs, same bit layout, same netlist).
+
+### Router (`ExitProofRouter`)
+- **Order of a buy:** buy leg → sell probe → **delivery to `to`** → facts → `eval` → settle. `inspect` delivers to
+  `msg.sender`. `to == pair` reverts `BadTo`.
+- **Measured delivery (F-01).** `_deliver` transfers `buyOut` to `to` and measures `delivered` as the balance diff at
+  `to` (a failed transfer or unreadable balance counts as 0). The buy-tax bucket is the worst of the probe hop
+  (router → holder) and the delivery (router → `to`). `minOut` is checked on `delivered` (and `delivered != 0`);
+  `buyETH`/`buy` return it and `Checked(..., out = delivered)`. A deny reverts everything, the delivery included.
+- **6-field Report.** `error Report(uint16 facts, bool allow, uint8 reason, uint256 buyOut, uint256 sellOut,
+  uint256 delivered)` (selector `0x00c11b8a`). `buyOut` = pair → router; `delivered` = what the buyer receives.
+- **`transferFrom` probe from a code-less holder (F-02 + mitigation C).** The position is sent to a predicted CREATE2
+  address (salt from token, amount, block number, gasleft) that has no code and nonce 0; a constructor-only
+  `ProbeHolder` is deployed there, calls `token.approve(router, max)` and returns empty runtime code; the router then
+  sells with `transferFrom(holder, pair, held)`, as a V2 router does for a wallet. The holder has EXTCODESIZE 0
+  before, during and after the sale. It is never `tx.origin`.
+- **Post-transfer swap semantics (Flap false positive).** `_probeSwap` mirrors
+  `swapExactTokensForTokensSupportingFeeOnTransferTokens`: after the tokens reach the pair it reads the reserves
+  fresh, takes `amountIn = balanceOf(pair) - reserveToken` and asks for `getAmountOut` on the post-transfer reserves.
+  The **sell tax** is priced on a computed honest post-buy baseline (pre-buy reserves and the bound swap amounts,
+  known before any token code runs), so a token cannot lower its bucket by moving the reserves.
+- **Eval backstop (F-10).** Besides `allow ⇔ reason == 0`: `allow && (!sellOk || sellTax > 1 || buyTax > 1)` reverts
+  `BadEval`. It can only turn an allow into a revert.
+- **EIP-7702 (F-07).** `BytecodeScan.scan`: exactly 23 bytes starting `0xef0100` ⇒ `hasDelegatecall` (upgradeable,
+  reason 4 in balanced/strict when unscanned); the designator is not scanned as code.
+- I-01: assembly helpers mask address arguments.
+
+### Registry (`RiskRegistry`)
+- **Keyed by token address (F-06).** `attest(address token, bytes32 codehash, Flags f, string reportURI)`
+  (onlyAttester; `scanned` forced true; `token == 0` reverts), `flagsOf(address token) → (Flags f, bytes32 codehash)`,
+  `event Attested(address indexed token, bytes32 indexed codehash, Flags f, string reportURI, address attester)`.
+- **Codehash check.** The router treats a token as scanned only if `f.scanned && codehash == token.codehash`;
+  otherwise the entry is ignored entirely and the on-chain scan applies. Fact bit 8 (`unscanned`) therefore means
+  "no registry entry for this token whose codehash matches its current code".
+- **Two-step ownership (F-12).** `transferOwnership(newOwner)` only nominates (`pendingOwner`,
+  `OwnershipTransferStarted`); `acceptOwnership()` by the pending owner completes it.
+- Flag monotonicity is enforced by the scanner (never lowers a flag for the same codehash without `--force`), not
+  on chain.
+
+### Scanner (v6)
+Allowlist static model plus `block-context` / `env-fingerprint` rules; simulation on an anvil fork whose coinbase,
+block gas limit and base fee match the forked block; router-stand-in sells (approve + `transferFrom`, user as
+`tx.origin`) priced on post-transfer reserves; immediate, delayed (+1 block … +30 d) and interleaved (third-party
+trade) sells; dangerous-setter and unknown-setter sweeps (magic arguments, two-step pairs) that fail closed when
+incomplete on owned tokens; per-token decision (new / code-changed / raised / version / known); daemon scans at first
+liquidity and never drops a pending pair; sharded `backfill`; every send needs `FORK_RPC` (unless `STATIC_ONLY=1`) and
+`CONFIRM_MAINNET=yes` on mainnet. Residuals: `scanner/README.md`.
+
+### Scripts and front-ends
+- `deploy.mjs` re-runs all 2048 evals on chain before deploying and records `deployBlock` (router receipt block) in
+  `deployments/<network>.json` and `web/config.json`.
+- Web: three-state verdict (green / amber for reasons 4–7 / red), `delivered` shown as "you would receive", circuit
+  explorer calling `processor.eval` live, new PotatoSwap pairs, totals since `deployBlock` instead of a short feed,
+  `?network=` parameter and auto-pick of a local fork, "not deployed" instead of a false verdict, RPC fallback
+  (`xlayerrpc.okx.com`, also in the DeWEB CSP), EN/TR/中文. Ethers is vendored (no CDN).
+- CLI: `check|buy|tx|stats`, three-state and `delivered` output, token metadata only as `untrustedSymbol`.

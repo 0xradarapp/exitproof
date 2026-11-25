@@ -8,7 +8,8 @@
 #   2. scripts/tapeout.mjs   create the processor, mint 54 NAND, tape out, verify 2048/2048 on the forked processor
 #   3. scripts/deploy.mjs    dry run, then SEND=1: RiskRegistry + setAttester + ExitProofRouter
 #   4. scripts/demo-fork.mjs six fixture tokens with real PotatoSwap pairs + one allowed buy
-#   5. CLI verdicts: clean / blacklist / sellTax99 / secondHop / timebomb (before and after a scanner attestation)
+#   5. CLI verdicts: clean / blacklist / sellTax99 / secondHop / timebomb (before and after a scanner attestation,
+#      simulated on this fork)
 #   6. one CLI buy through the router
 #   7. cost summary, then "REHEARSAL OK"
 #
@@ -178,9 +179,12 @@ expect FeeToken       strict     blocked 2
 expect TimeBombToken  balanced   blocked 6
 expect TimeBombToken  permissive allow   0
 
-echo "  scanner attest TimeBombToken (scanner/src/cli.mjs attest, SEND=1, attester = deployer)"
-REGISTRY="$REGISTRY" ATTESTER_KEY="$DEPLOYER_KEY" SEND=1 REPORTS_DIR="$WORK/reports" \
-  node scanner/src/cli.mjs attest "$(tok TimeBombToken)" >"$WORK/attest.json" 2>"$WORK/attest.err" \
+echo "  scanner attest TimeBombToken (scanner/src/cli.mjs attest, SEND=1, attester = deployer, simulation on this fork)"
+# The scanner refuses to send without the sell simulation (FORK_RPC + pair). It runs on this same anvil: simulate
+# works between evm_snapshot / evm_revert and always rewinds the node, so the later steps see the same state.
+TB_PAIR=$(node -p "require('./deployments/fork-demo.json').tokens.TimeBombToken.pair")
+REGISTRY="$REGISTRY" ATTESTER_KEY="$DEPLOYER_KEY" FORK_RPC="$RPC" SEND=1 REPORTS_DIR="$WORK/reports" \
+  node scanner/src/cli.mjs attest "$(tok TimeBombToken)" "$TB_PAIR" >"$WORK/attest.json" 2>"$WORK/attest.err" \
   || { cat "$WORK/attest.err"; fail "scanner attest"; }
 grep -E "attested .* status success" "$WORK/attest.err" >/dev/null || { cat "$WORK/attest.err"; fail "attest tx not successful"; }
 node -e 'const j=require(process.argv[1]);console.log("  flags: privileged="+j.privileged+" upgradeable="+j.upgradeable+" dangerSetter="+j.dangerSetter+" ownerCanTrap="+j.ownerCanTrap)' "$WORK/attest.json"

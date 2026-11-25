@@ -21,10 +21,10 @@ trap classes are left to the off-chain scanner, whose verdicts reach the router 
 
 | Trap | Who catches it |
 |---|---|
-| Sell only in the block or transaction you received the tokens (block number, timestamp, transient storage), cooldowns | **Scanner only:** delayed sells at +1 block, +60 s, +1 h and +1 d, plus a static `block-context` rule |
+| Sell only in the block or transaction you received the tokens (block number, timestamp, transient storage), cooldowns, a tax that jumps later | **Scanner only:** delayed sells at +1 block, +60 s, +1 h, +1 d, +7 d and +30 d on a fork whose block environment matches mainnet, plus static `block-context` and `env-fingerprint` rules |
 | An owner flips a switch after your buy (trading off, fee to 99%, blacklist) | **Scanner only:** dangerous-setter list, owner-power simulation, a sweep of unknown setters; `balanced` and `strict` act on it |
 | Seller must not be `tx.origin` (the probe holder never is) | **Scanner only:** its simulated sells use the user as `tx.origin` |
-| A sell allowed only as the very next transfer after receipt, kept open by the attacker's own bot | **Nobody.** No on-chain or off-chain design of this kind catches a state-sequenced trap |
+| A sell allowed only as the very next transfer after receipt | **Scanner, naive form only:** it lets a third address trade before the holder sells (`sequence-trap`). A trap that reacts only to specific counterparties, amounts or trade counts, kept open by the attacker's own bot, is caught by **nobody** |
 | A token that treats ExitProof's router (the probe's spender) or PotatoSwap's router specially | **Nobody on chain.** The scanner fences caller-vs-literal checks statically; its simulator uses its own router stand-in |
 
 So read a green verdict as "you can get out right now", not as "this token is safe forever". The full list is in
@@ -45,7 +45,7 @@ So read a green verdict as "you can get out right now", not as "this token is sa
 | **Usage** | The app shows totals since the deploy block: tokens scanned, flagged, guarded buys and OKB routed, from the router's `Checked` and the registry's `Attested` events (`node cli/exitproof.mjs stats` prints the same). Blocked buys revert, so they never show up as events, and we don't claim on-chain "blocked" counts. |
 | **Census** | ExitProof measured live PotatoSwap tokens on a mainnet fork; see [docs/CENSUS.md](docs/CENSUS.md) for the latest run and [Token Safety Census](#token-safety-census) below. |
 | **Verified source** | `TBD (mainnet pending)`. `scripts/deploy.mjs` prints the exact `forge verify-contract … --verifier sourcify --chain 196` and OKLink commands after deploying. |
-| **Assurance** | Circuit checked on all 2048 inputs off chain and again on a real TapeOut processor (fork of mainnet) · test counts at commit `2ed1b9f`: 119 offline Foundry tests (unit, fuzz, invariant, gas, audit regressions), 35 fork tests on real PotatoSwap pairs and the real processor (including a 37-step stress run and 10 real Flap and honeypot tokens), 110 scanner tests, 12 CLI/web-logic tests · adversarial reviews after every task plus two independent final audits, with every bypass they found fixed ([Security review history](#security-review-history)) · one-command fork rehearsal of the whole mainnet flow (`scripts/rehearse.sh`) |
+| **Assurance** | Circuit checked on all 2048 inputs off chain and again on a real TapeOut processor (fork of mainnet) · test counts at commit `2ed1b9f`: 119 offline Foundry tests (unit, fuzz, invariant, gas, audit regressions), 35 fork tests on real PotatoSwap pairs and the real processor (including a 37-step stress run and 10 real Flap and honeypot tokens), 124 scanner tests (at `f475f0c`), 12 CLI/web-logic tests · adversarial reviews after every task plus two independent final audits, with every bypass they found fixed ([Security review history](#security-review-history)) · one-command fork rehearsal of the whole mainnet flow (`scripts/rehearse.sh`) |
 | **AI agents** | [`agent/SKILL.md`](agent/SKILL.md): an OKX Agentic Wallet skill. `cli/exitproof.mjs check` gives a JSON verdict (green / amber / red); `tx` prepares a `buyETH` call for `onchainos wallet contract-call`. Agents get a check they can read by machine, and the same check is enforced on chain when they buy. Token names are passed to agents only as labelled untrusted data. |
 | **Built during the event** | All of it. First commit 2026-11-25. |
 
@@ -150,18 +150,24 @@ The reason is the first check that fails, in this order. The reference model is 
    deterministic scanner (`scanner/`). For a scanned token, the registry's `upgradeable` replaces the on-chain scan,
    because the scanner checks reachability and the on-chain scan is a linear heuristic. Ownership moves in two steps
    (`transferOwnership`, then `acceptOwnership` by the new owner).
-3. **Simulation on a fork:** the scanner buys and sells through a router stand-in (approve + `transferFrom`, the user
-   as `tx.origin`), sells again at +1 block, +60 s, +1 h and +1 d, impersonates the owner and calls every dangerous
-   setter with worst-case arguments, and calls every unknown setter with six argument patterns, retrying the sell
-   after each. Any trap sets `ownerCanTrap` or `dangerSetter`, plus `privileged`.
+3. **Simulation on a fork:** the fork's coinbase, block gas limit and base fee are set to the forked mainnet block's,
+   so a token cannot tell it from X Layer by those. The scanner buys and sells through a router stand-in (approve +
+   `transferFrom`, the user as `tx.origin`), priced on the reserves after the transfer like PotatoSwap's router (so
+   Flap-style tokens that swap their tax back sell correctly). It sells again at +1 block, +60 s, +1 h, +1 d, +7 d and
+   +30 d, and once after a third address has traded (sequence traps). It impersonates the owner and every other
+   admin it can find and calls every dangerous setter with worst-case arguments, then sweeps every unknown setter with
+   generic and "magic" arguments and two-step setter pairs, retrying the sell after each. A sweep it cannot complete
+   fails closed when the token has an owner or a caller check. Any trap sets `ownerCanTrap` or `dangerSetter`, plus
+   `privileged`.
 
 ## Scanner model (allowlist)
 
-`scanner/` (v5) follows the dispatcher chain from offset 0 and checks every external selector against a SAFE list:
+`scanner/` (v6) follows the dispatcher chain from offset 0 and checks every external selector against a SAFE list:
 the ERC-20 surface, permit/EIP-712, ERC-165, `owner`/`getOwner`/`renounceOwnership`, and a few pair/router getters.
 Any other selector, a non-trivial fallback, caller-vs-storage or caller-vs-literal comparisons (hidden or constant
 admins), live calls to non-literal targets, BALANCE/SELFBALANCE/EXTCODE* reads of foreign state, NUMBER, TIMESTAMP,
-ORIGIN or TLOAD on a transfer path (`block-context`), or a live owner makes the token `privileged`. Strict mode
+ORIGIN or TLOAD on a transfer path (`block-context`), or a live owner makes the token `privileged`; COINBASE,
+PREVRANDAO, BASEFEE, BLOCKHASH or GASPRICE on a transfer path (`env-fingerprint`) also sets `dangerSetter`. Strict mode
 therefore has an allowlist guarantee. Balanced mode uses `dangerSetter`, which comes from a list of dangerous
 selectors, live SELFDESTRUCT and the simulation signals above. A dispatcher the scanner does not recognize fails
 closed. EIP-1167 and ERC-7511 clones are resolved to their implementation. Every report records the token, pair,
@@ -170,9 +176,10 @@ block, codehash, flags and evidence, and can be published as static files. Detai
 
 The daemon (`node scanner/src/cli.mjs daemon`) watches PotatoSwap `PairCreated` in 100-block windows and attests each
 new token at its first liquidity; a pair created before its token has code is kept pending, never dropped.
-`backfill` attests the pairs that already exist, newest first, and refuses to send without the fork simulation.
-Every send path (`attest`, `daemon`, `backfill`) refuses mainnet without `CONFIRM_MAINNET=yes` and takes the key only
-from the environment or a `chmod 600` file. That is how strict and balanced modes work for fresh launches.
+`backfill` attests the pairs that already exist, newest first, in parallel shards (`SHARD=i/N`, each with its own
+fork) with a configurable simulation budget (`SWEEP_BUDGET_S`). Every send path (`attest`, `daemon`, `backfill`)
+refuses to send without the fork simulation (unless `STATIC_ONLY=1` is set explicitly, which the operator steps never
+do), refuses mainnet without `CONFIRM_MAINNET=yes`, and takes the key only from the environment or a `chmod 600` file. That is how strict and balanced modes work for fresh launches.
 
 ## Token Safety Census
 
@@ -210,7 +217,8 @@ are the real bypasses the reviews found:
 | **Web/CLI: a fork router with a mainnet wallet** (same chain id 196) | `buyEnabled` per network, plus `getCode(router)` and chainId on the wallet's own provider before every send |
 | **Final audit F-01 (critical): the delivery hop was not measured.** A token that skims only the router → buyer transfer passed strict with both taxes at 0, and the front-ends took `minOut` from that same skimmed transfer | The router delivers before it asks the circuit, measures `delivered` at the recipient, folds the loss into the buy-tax bucket and checks `minOut` on it. `Report` carries `delivered` as a sixth field |
 | **Final audit F-02 (high): the probe sold with `transfer`, real sells use `approve` + `transferFrom`.** A token whose `transferFrom` into the pair fails passed everything | The holder is a code-less CREATE2 address that approves the router in its constructor; the router sells with `transferFrom`, like a DEX router. The scanner sells through a router stand-in the same way |
-| **Final audit F-03 (high): "sell only in the block you received" passes a same-transaction probe,** and the simulator discarded the failed later sell | Not fixable on chain. The scanner now sells at +1 block, +60 s, +1 h and +1 d, flags `delayed-sell-trap` (danger + privileged, so balanced blocks it without an owner), and fences NUMBER/TIMESTAMP/ORIGIN/TLOAD on transfer paths statically |
+| **Final audit F-03 (high): "sell only in the block you received" passes a same-transaction probe,** and the simulator discarded the failed later sell | Not fixable on chain. The scanner now sells at +1 block up to +30 d, flags `delayed-sell-trap` (danger + privileged, so balanced blocks it without an owner), and fences NUMBER/TIMESTAMP/ORIGIN/TLOAD on transfer paths statically |
+| **Scanner re-review (v6):** the simulator could be told apart from mainnet (coinbase, gas limit, base fee), missed sequence traps, tax jumps and long delays, its unknown-setter sweep accepted an incomplete run as clean, and its simulated sells had the same stale-reserve bug as the Flap false positive | Fork environment copied from the forked block; interleaved third-party trade, `delayed-tax-jump`, sells up to +30 d; magic arguments, two-step setter pairs, more admin sources, and an incomplete sweep fails closed; simulated sells priced on post-transfer reserves; `FORK_RPC` required for every send |
 | **Final functional audit: Flap launchpad tokens read as honeypots.** Tokens that swap their collected tax inside a sell moved the reserves, and the probe priced its swap on stale reserves (`Potato: K`), so 3 of 26 live tokens were false "reason 1" | The probe swap mirrors PotatoSwap's fee-on-transfer router: it reads the pair after the transfer. The tax stays priced on reserves computed before any token code runs, so a token cannot game its bucket down. Fork test on the 10 real tokens: the 3 Flap tokens are allowed and really sellable, the 4 true honeypots stay blocked |
 | **Final audit F-06 (medium): attestations keyed by codehash** were reused by every instance of a template and could be poisoned by a hostile instance | The registry is keyed by token address and records the codehash; the router ignores an entry whose codehash differs from the token's current code. Two-step ownership |
 | **Final audit F-07 (medium): an EIP-7702 delegated account as a token** has 23 bytes of code, scanned clean, and can be re-delegated after the buy | `0xef0100` + 20 bytes ⇒ upgradeable (reason 4 in balanced and strict when unscanned) |
@@ -224,10 +232,13 @@ web/CLI wallet gates were checked by hand in a browser and on the fork CLI.
 ## Honest limitations
 
 - **Later blocks.** A same-transaction probe cannot prove that a sale works in any later block. Tokens that allow a sale only in the receiving block or transaction, or that refuse a `tx.origin` recorded on the buy in a later block (pinned in `test_txOriginTrap_known_limitation`), pass the probe. The scanner's delayed sells and its static `block-context` rule are the only defence, so for an unscanned token in permissive mode there is none.
-- **State-sequenced traps.** A token that allows a sale only as the next transfer after receipt, and keeps that condition armed with the attacker's own bot, defeats both the probe and the simulation. No part of this design catches it.
+- **State-sequenced traps.** The scanner catches the naive form (a sale that fails once anyone else has traded since receipt). A token that reacts only to specific counterparties, amounts or a trade count above one, kept armed by the attacker's own bot, defeats both the probe and the simulation. No part of this design catches it.
+- **Long delays.** The scanner sells up to +30 days after the buy. A sell window that closes later than that passes.
+- **The simulation's fork is not quite mainnet.** Coinbase, gas limit and base fee are matched, but `block.prevrandao`, the hashes of blocks mined on the fork, `tx.gasprice`, the stand-in router's own code and address, and `tx.origin` patterns still differ. Reading most of those on a transfer path is flagged statically (`env-fingerprint`), but a token that keys on them elsewhere can hide a trap.
 - **The seller is not `tx.origin`, and the spender is ExitProof's router.** The holder has no code before, during and after the sale (like an EOA), but it is never `tx.origin`, and the sale is initiated by ExitProof's router, not PotatoSwap's. A token that keys on either can behave differently for the probe. The holder approves the maximum allowance, as many wallets do.
 - **Gas-window fingerprint.** The probe runs with a recognizable amount of remaining gas, so a token can behave differently inside it.
-- **Owner actions after the buy.** ExitProof checks the token at the moment you buy. An owner who later flips a switch is covered only by the danger/owner facts (registry + simulation), not by the probe. The unknown-setter sweep is bounded (40 selectors, six argument patterns, 180 s); a sweep that runs out fails closed, but a setter that only traps with an argument combination outside those patterns is missed. X Layer has no public mempool, so there is no front-run exit either.
+- **Owner actions after the buy.** ExitProof checks the token at the moment you buy. An owner who later flips a switch is covered only by the danger/owner facts (registry + simulation), not by the probe. The unknown-setter sweep is bounded (40 selectors, generic and magic argument patterns, two-step pairs, 180 s by default); a setter that only traps with an argument combination outside those patterns, a three-step setter chain, or an effect that shows only after a delay is missed. A sweep that cannot finish fails closed when the token has an owner or a caller check, but a mapping admin on a token with no `owner()` and no detectable caller check, whose creator is not that admin, is still missed. X Layer has no public mempool, so there is no front-run exit either.
+- **The fail-closed sweep blocks some honest tokens.** An owned token with a function that reverts for every identity (a one-shot `init`, an already-called `initialize`, a function that needs value or a balance) is attested `sweep-incomplete` and blocked in balanced mode.
 - **Logic inside allowlisted functions.** The allowlist proves which functions a token exposes, not what they do. A `transfer()` whose behaviour depends on gas or its own counters passes the static rules; the simulation catches only what it triggers.
 - **Swap-back price impact counts.** A token that liquidates its collected tax during a sell moves the price in front of the seller. The probe counts that as sell loss, so a large pending liquidation relative to pool depth can raise the sell-tax bucket at that moment (on the real Flap tokens it is about 0.1%).
 - **Non-solc dispatchers fail closed.** Vyper, jump tables and hand-written dispatchers are marked `privileged` + `dangerSetter`, so honest tokens written that way are blocked in balanced and strict modes.
@@ -293,7 +304,7 @@ Full breakdown and a mainnet budget: [docs/COSTS.md](docs/COSTS.md).
 | `contracts/` | `ExitProofRouter.sol`, `RiskRegistry.sol`, `lib/BytecodeScan.sol` |
 | `test/` | Foundry unit tests, malicious token fixtures (`fixtures/Tokens.sol`, `fixtures/AuditTokens.sol`), audit regressions, fork tests (`fork/`) |
 | `scanner/` | Deterministic scanner, simulator, attester, daemon and backfill (Node + viem) |
-| `scripts/` | `tapeout.mjs`, `deploy.mjs` (canonical deployer), `rehearse.sh`, `demo-fork.mjs`, `build-deweb.mjs`, `publish-deweb.mjs`; `deploy-fork.mjs` is the older fork-only deployer, kept for reference |
+| `scripts/` | `tapeout.mjs`, `deploy.mjs` (canonical deployer), `rehearse.sh`, `demo-fork.mjs`, `build-deweb.mjs`, `publish-deweb.mjs`, `add-attesters.mjs` (extra attester keys, e.g. one per backfill shard); `deploy-fork.mjs` is the older fork-only deployer, kept for reference |
 | `deployments/` | `constants.json` (X Layer addresses), `fork.json` / `fork-demo.json` (rehearsal artifacts); `xlayer.json` appears after the mainnet run |
 | `web/` | Static app, no build: three-state checker, buy, totals since deploy, circuit explorer, new PotatoSwap pairs, EN/TR/中文, RPC fallback, self-hosted fonts, CSP |
 | `cli/`, `agent/` | `exitproof.mjs check|buy|tx|stats`, OKX Agentic Wallet skill |
@@ -318,7 +329,7 @@ bash scripts/rehearse.sh
 1. `forge test`: 119 offline tests pass. The 3 fork suites skip themselves when `XLAYER_RPC` is unset.
 2. The fork suites: 35 tests, at the pinned blocks 76,861,306 (including the 37-step stress run) and 76,871,779 (10 real Flap and honeypot tokens against PotatoSwap's own router as ground truth). The first run fetches state and takes a minute or two.
 3. The circuit test: 8 tests, all 2048 inputs against `spec.py`.
-4. The scanner: 110 tests. It needs anvil and `forge build`.
+4. The scanner: 124 tests (counted at commit `f475f0c`, scanner v6). It needs anvil and `forge build`.
 5. The CLI and the web logic: 12 tests.
 6. `scripts/rehearse.sh`: the whole mainnet flow on a fresh fork, ending in `REHEARSAL OK`. It takes about 7 minutes.
 
@@ -396,7 +407,7 @@ alınmaz, yalnızca geri alınan işlemin gas'ı harcanır.
 - **Neyi kanıtlar:** alım anında pozisyonun tamamı yeni bir adresten, router yolundan şimdi satılabiliyor. **Neyi kanıtlayamaz:** sonraki bir blokta satış (yalnızca scanner'ın gecikmeli satışları yakalar), alımdan sonra owner'ın bir anahtarı çevirmesi (scanner), sıralı durum tuzakları (hiçbir parça yakalayamaz).
 - **Modlar:** permissive (sadece honeypot kontrolü), **balanced** (varsayılan), strict (yalnızca izin listesindeki yüzey; çoğu yeni token'ı engeller). Uygulama üç durum gösterir: yeşil (çıkabilirsin), sarı (şimdi satılıyor ama riskli, sebep 4–7), kırmızı (çıkış yok, sebep 1–3).
 - **Devre:** Yosys ile 54 NAND'a sentezlendi. 2048 girdinin tamamı hem çevrimdışı hem de gerçek bir TapeOut işlemcisi üzerinde (mainnet fork) doğrulandı; uygulamadaki devre gezgini `eval`'i canlı çağırır.
-- **Üç savunma katmanı:** zincir üstü satış denemesi ve bytecode taraması (EIP-7702 dahil); token adresine göre tutulan ve codehash'i kontrol edilen RiskRegistry; fork üzerinde router yolu ve gecikmeli satış simülasyonu, owner yetkileri ve bilinmeyen setter taraması.
+- **Üç savunma katmanı:** zincir üstü satış denemesi ve bytecode taraması (EIP-7702 dahil); token adresine göre tutulan ve codehash'i kontrol edilen RiskRegistry; ortamı mainnet'e eşlenmiş bir fork üzerinde scanner v6 simülasyonu: router yolu (Flap token'ları için doğru), +30 güne kadar gecikmeli satışlar, sıralı durum tuzağı, owner yetkileri ve tamamlanamazsa kapalı kalan bilinmeyen setter taraması.
 - **Güvenlik:** her görev çekişmeli bir incelemeden geçti; iki bağımsız son denetim (güvenlik + işlevsellik) mainnet öncesi yapıldı. Bulunan atlatma yolları (teslimat adımında kesinti, `transferFrom` tuzağı, aynı blokta satış, Flap token'larında yanlış honeypot, codehash'e göre kayıt, EIP-7702, sahte CBOR trailer, ikinci adım kara listesi, gizli owner, sabit admin) düzeltildi ve testle doğrulandı.
 - **Sınırlar:** sonraki bloklar ve sıralı durum tuzakları, tx.origin'e veya router'a özel davranan token'lar, gas penceresi izi, alım sonrası owner işlemleri, taranmamış proxy'lerde sahte "upgradeable" (sebep 4), attester ve anahtar güveni, gerçek bir tarayıcı cüzdanıyla test edilmemiş alım yolu, TapeOut factory'sinin henüz mühürlenmemiş olması.
 - **Gas:** fork üzerinde ilk alım ≈0,7M, önbellekli ≈0,45M. 24 KB'lık bir token'ın ilk alımı ≈5M'a çıkabilir. Cüzdanın gas limitini düşürme (≈8M pay bırak).

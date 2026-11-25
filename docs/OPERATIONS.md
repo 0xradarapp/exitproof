@@ -33,6 +33,7 @@ attested fail-closed. Progress is kept in `scanner/state/daemon.json`, so a rest
 | `START_BLOCK` | First block to scan on the first run. Use the router's deploy block (`deployBlock` in `deployments/xlayer.json`). |
 | `SEND=1` | Actually send attestations. Without it the daemon is a dry run. |
 | `CONFIRM_MAINNET=yes` | Required with `SEND=1` on X Layer mainnet; without it the daemon prints a banner and refuses to send. An RPC that claims to be anvil counts as a fork only when its URL is loopback. |
+| `SWEEP_BUDGET_S` | Wall-clock budget of one token's simulation, default 180; use 600 |
 | `POLL_MS` | Poll interval, default 10000 |
 | `STATE_FILE` | Optional override for `scanner/state/daemon.json`. The daemon always writes its reports to `scanner/reports/`. |
 
@@ -62,6 +63,7 @@ REGISTRY=0x...
 ATTESTER_KEY_FILE=/home/exitproof/.attester.key
 FORK_RPC=http://127.0.0.1:8547
 START_BLOCK=...
+SWEEP_BUDGET_S=600
 SEND=1
 CONFIRM_MAINNET=yes
 ```
@@ -121,8 +123,8 @@ Notes:
 - **Bind anvil to 127.0.0.1 only.** Its RPC can impersonate any account and reset state.
 - **Do a dry run first.** Run once without `SEND=1` and read the reports in `scanner/reports/`, then enable sending.
 - **One-off attestations:** `REGISTRY=… ATTESTER_KEY_FILE=… FORK_RPC=… SEND=1 CONFIRM_MAINNET=yes node scanner/src/cli.mjs attest <token> <pair>`. Give the pair so the attestation includes the simulation. `--force` is the only way to lower a flag (for example for a launch-pending token that was attested `baseline-sell-failed` before trading opened).
-- **One key, one sender.** The daemon and a backfill must not send with the same attester key at the same time; their transactions would race for nonces. Run the backfill first, or give one of them its own attester key.
-- **Known daemon limits** (scanner/README.md): no confirmation depth (X Layer has a central sequencer). A simulation that keeps failing is attested as `ownerCanTrap` after 5 attempts, so it fails closed. The unknown-setter sweep is bounded by a 180 s budget per token; a slow fork can make it incomplete, which also fails closed (`unknown-sweep-incomplete`).
+- **One key, one sender.** Two processes must not send with the same attester key at the same time; their transactions would race for nonces. The backfill shards each get their own key (below).
+- **Known daemon limits** (scanner/README.md): no confirmation depth (X Layer has a central sequencer). A simulation that keeps failing is attested as `ownerCanTrap` after 5 attempts, so it fails closed. The simulation is bounded by `SWEEP_BUDGET_S` (default 180 s; 600 recommended); a slow fork can make the sweep incomplete, which fails closed (`sweep-incomplete`) on owned tokens.
 - **Reports:** `node scanner/src/publish-reports.mjs` bundles `scanner/reports/*.json` into a static directory with an `index.json`; set `REPORT_BASE_URL` to its published URL and new attestations point their `reportURI` there.
 - **Spend:** a first attestation is about 79k gas, a fraction of a cent at X Layer gas prices. Watch the attester's balance.
 
@@ -134,20 +136,23 @@ re-run resumes. With `SEND=1` it refuses to run without `FORK_RPC` (unless `ALLO
 without `CONFIRM_MAINNET=yes`.
 
 - **Cost:** about 950 live pairs × 80k gas ≈ 0.0015 OKB at 0.02 gwei.
-- **Time:** about 69 s per token with the simulation on a cold fork, so about 18 hours for all of them on one fork.
-  The command has no sharding or parallel mode. Run it in batches with `LIMIT` (300 is about 6 hours); a later run
-  with a larger `LIMIT` skips the finished tokens. Partial coverage is fine: the newest pairs come first, and they are
-  the ones people buy.
-- **Where:** the Linux server, next to its own anvil fork. `FORK_UPSTREAM` re-pins that fork to the backfill's block.
+- **Time:** about 69 s per token with the simulation on a cold fork, so about 18 hours on one fork. Split it into
+  `N` shards (`SHARD=i/N`, 4–6 on the 32 GB server), each with its own anvil fork, all pinned to the same `BLOCK`;
+  each shard keeps its own state file (`STATE_DIR` moves them). Set `SWEEP_BUDGET_S=600`: a cold fork otherwise cuts
+  sweeps short, and an incomplete sweep fails closed (`sweep-incomplete`). Partial coverage is fine: every shard works
+  newest first.
+- **One key per shard.** The shards send in parallel and the scanner does not coordinate nonces across processes,
+  so give each shard its own attester key (`scripts/add-attesters.mjs` registers and funds them from the registry
+  owner; `REMOVE=1` revokes them afterwards). Never set `STATIC_ONLY=1` on mainnet.
 
 ```bash
 cd ~/exitproof
-LIMIT=5 FORK_RPC=http://127.0.0.1:8547 FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=0x... node scanner/src/cli.mjs backfill
-LIMIT=300 FORK_RPC=http://127.0.0.1:8547 FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=0x... ATTESTER_KEY_FILE=$HOME/.attester.key SEND=1 CONFIRM_MAINNET=yes nohup node scanner/src/cli.mjs backfill > backfill.log 2>&1 &
+LIMIT=3 SHARD=0/5 BLOCK=<n> SWEEP_BUDGET_S=600 FORK_RPC=http://127.0.0.1:8551 FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=0x... node scanner/src/cli.mjs backfill
+for i in 0 1 2 3 4; do SHARD=$i/5 BLOCK=<n> SWEEP_BUDGET_S=600 FORK_RPC=http://127.0.0.1:$((8551+i)) FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=0x... ATTESTER_KEY_FILE=$HOME/.exitproof-shard$i.key SEND=1 CONFIRM_MAINNET=yes nohup node scanner/src/cli.mjs backfill > backfill-shard$i.log 2>&1 & sleep 30; done
 ```
 
-The first line is a dry run of the 5 newest pairs; the second is a live batch in the background. MORNING.md step 4b
-has the same steps as copy-paste blocks run from the Mac over ssh.
+The first line is a dry run of 3 pairs of shard 0; the loop starts the live shards. MORNING.md step 4b has the same
+steps as copy-paste blocks run from the Mac over ssh, including the forks and the shard keys.
 
 ## Publishing web/ to DeWEB / TapeKit
 

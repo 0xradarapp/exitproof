@@ -58,10 +58,12 @@ that never buys. The web app (EN/TR/中文, with a second RPC as fallback), the 
 use it.
 
 An open-source scanner daemon attests every new PotatoSwap pair at its first liquidity, and a launch-day backfill
-covers the existing ones, newest first. It runs a static allowlist analysis and simulates on a fork: router-path
-sells, sells one block, one minute, one hour and one day later, the owner's dangerous setters, and a sweep of unknown
-setters. That catches time bombs such as an owner who can disable trading later, and tokens that only let you sell in
-the block you bought. Until a token is attested, balanced mode treats it as unscanned: an unscanned token with an
+covers the existing ones, newest first, in parallel shards. Scanner v6 runs a static allowlist analysis and simulates
+on a fork whose coinbase, gas limit and base fee match the forked mainnet block: router-path sells priced like
+PotatoSwap's router (correct for Flap tokens that swap their tax back), sells from one block up to 30 days later, a
+sell after a third party has traded (sequence traps), the owner's dangerous setters, and a sweep of unknown setters
+with magic arguments and two-step pairs that fails closed when it cannot finish. That catches time bombs such as an
+owner who can disable trading later, and tokens that only let you sell in the block you bought. Until a token is attested, balanced mode treats it as unscanned: an unscanned token with an
 active owner is held back with reason 6.
 
 ### Target users
@@ -108,8 +110,9 @@ All of it. First commit 2026-11-25.
   - 119 offline tests: unit, fuzz, invariant, gas and the final-audit regressions;
   - 35 fork tests against the real PotatoSwap and a real TapeOut processor on a fork of mainnet, including a 37-step
     stress run and 10 real launchpad and honeypot tokens checked against PotatoSwap's own router.
-- The deterministic scanner (v5: allowlist model, router-path and delayed sells, unknown-setter sweep, backfill,
-  mainnet send gate), covered by 110 tests.
+- The deterministic scanner (v6: allowlist model, mainnet-matched fork environment, Flap-correct router-path sells,
+  delayed sells up to +30 d, sequence-trap and tax-jump signals, a fail-closed unknown-setter sweep, sharded backfill,
+  mainnet send gate), covered by 124 tests (at commit `f475f0c`).
 - The static web app (three-state verdict, circuit explorer, new-pairs list, totals since launch, EN/TR/中文, RPC
   fallback), the CLI and the agent skill, with 12 tests.
 - The mainnet-gated tape-out, deploy and DeWEB scripts, and a one-command fork rehearsal of the whole flow
@@ -125,7 +128,10 @@ All of it. First commit 2026-11-25.
 
 One transaction proves the exit at the moment of purchase, from a fresh address, through the router path. It cannot
 prove a sale in a later block: tokens that allow a sale only in the receiving block are caught by the scanner's
-delayed sells, and a state-sequenced trap kept open by the attacker's own bot is caught by nothing in this design. An
+delayed sells (up to +30 d), the naive sequence trap by its third-party trade, and a sequence trap that reacts only to
+chosen counterparties or amounts, kept open by the attacker's own bot, by nothing in this design. The simulation's
+fork still differs from mainnet in `prevrandao`, fork block hashes and gas price, and its sweep misses some hidden
+admins and argument combinations. An
 owner action after the buy is stopped only if the scanner flagged that power. A token that treats the router or
 `tx.origin` differently can still pass the probe. Unscanned proxies (including launchpad clones) are read as
 upgradeable until scanned. The first buy of a very large token can cost up to about 5M gas. TapeOut's factory isn't

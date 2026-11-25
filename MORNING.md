@@ -32,8 +32,9 @@ prefix or a comment line makes `ME` come out empty, and nothing can be sent.
 
 ## 0. Balances (read-only)
 
-You need about **0.14 OKB** in total: about 0.05 OKB for the tape-out, the deploy, the attestations and a few demo
-buys, plus about 0.09 OKB for the DeWEB publish in step 2b. You also need at least 0.12 BEM, which is `12000000` in
+You need about **0.15 OKB** in total: about 0.05 OKB for the tape-out, the deploy, the attestations and a few demo
+buys, about 0.09 OKB for the DeWEB publish in step 2b, and 0.005 OKB of gas money for the backfill shard keys in
+step 4b. You also need at least 0.12 BEM, which is `12000000` in
 BEM's 8 decimals.
 
 ```zsh
@@ -200,64 +201,83 @@ scanned". The backfill scans and attests the existing PotatoSwap pairs (about 95
 at one pinned block, and records every finished token in a state file, so a stopped run resumes where it stopped.
 
 Time is the limit, not money: 950 attestations cost about 0.0015 OKB, but the simulation takes about 69 s per token
-on a cold fork, so the whole set is about 18 hours. The backfill has no sharding or parallel mode, and its per-token
-simulation budget (180 s) is fixed in the scanner (`DEFAULT_BUDGET_MS`, not an environment variable yet). A token
-whose owner-power sweep runs out of that budget is attested fail-closed (`unknown-sweep-incomplete`): it stays
-blocked in balanced and strict, never allowed by mistake. Partial coverage is fine: the newest pairs are the ones
-people buy, and they come first.
+on a cold fork, about 18 hours on one fork. So run it on the Linux home server (Tailscale `<server-ip>`) in
+**shards**: `SHARD=i/N` takes only the pairs whose factory index is `i` mod `N`, with its own state file, and each
+shard gets its own anvil fork. With `N=5` that is about 190 tokens per shard, roughly 4–6 hours. Use `N=4` if the
+fork logs show HTTP 403/429 from the RPC, `N=6` if the server is idle. `SWEEP_BUDGET_S=600` gives each token 10
+minutes of simulation instead of 3: on a cold fork a sweep cut short by the budget is attested fail-closed
+(`sweep-incomplete`), which is safe but blocks honest tokens. Partial coverage is fine: the newest pairs come first in
+every shard.
 
-The plan: run it on the Linux home server (Tailscale `<server-ip>`) so it can run overnight, in batches of 300
-tokens (about 6 hours each). Type your server login after `SRV=` (for example `you@<server-ip>`) and paste the
-block. It copies the repo (without `.env` and `node_modules`), writes the attester key into a file that only you can
-read on the server (through ssh's input, never on a command line), and installs the dependencies. The server needs
-Node ≥ 22 and Foundry's `anvil`, as in [docs/OPERATIONS.md](docs/OPERATIONS.md).
+Each shard sends with **its own attester key**, created on the server, so the shards never race for a nonce and your
+main key never leaves this machine. Type your server login after `SRV=` (for example `you@<server-ip>`) and the
+shard count after `N=`, and paste the block. It copies the repo (without `.env` and `node_modules`), installs the
+dependencies, creates one key per shard in files only you can read (`~/.exitproof-shard<i>.key`, mode 600), and
+prints their addresses into `ATT`. The server needs Node ≥ 22 and Foundry, as in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ```zsh
 SRV=
-[ -n "$SRV" ] || { echo "set SRV=user@<server-ip> first"; false; } && rsync -a --exclude .git --exclude node_modules --exclude .env --exclude refs --exclude .superpowers --exclude scanner/state --exclude scanner/reports ./ "$SRV:exitproof/" && k | ssh "$SRV" 'umask 077 && cat > ~/.exitproof-attester.key' && ssh "$SRV" 'cd ~/exitproof && npm ci && cd scanner && npm ci'
+N=5
+[ -n "$SRV" ] || { echo "set SRV=user@<server-ip> first"; false; } && rsync -a --exclude .git --exclude node_modules --exclude .env --exclude refs --exclude .superpowers --exclude scanner/state --exclude scanner/reports ./ "$SRV:exitproof/" && ssh "$SRV" 'cd ~/exitproof && npm ci && cd scanner && npm ci' && ATT=$(ssh "$SRV" "umask 077 && for i in \$(seq 0 $((N-1))); do [ -s ~/.exitproof-shard\$i.key ] || { ~/.foundry/bin/cast wallet new > ~/.exitproof-shard\$i.txt && awk '/Private key/{print \$3}' ~/.exitproof-shard\$i.txt > ~/.exitproof-shard\$i.key && awk '/Address/{print \$2}' ~/.exitproof-shard\$i.txt > ~/.exitproof-shard\$i.addr && rm ~/.exitproof-shard\$i.txt; }; done && cat ~/.exitproof-shard*.addr | paste -sd, -")
+echo "$ATT"
 ```
 
-Start the server's fork in the background (it stays up when you log out), then a dry run of the 5 newest pairs.
-The dry run sends nothing; it prints one line per token and the cost estimate.
+Register those addresses as attesters and give each 0.001 OKB for gas (a shard of 190 tokens needs about 0.0003),
+sent from your deployer, the registry owner. Dry run first; it prints the plan and sends nothing.
 
 ```zsh
-ssh "$SRV" 'nohup ~/.foundry/bin/anvil --fork-url https://xlayerrpc.okx.com --chain-id 196 --host 127.0.0.1 --port 8547 --silent --retries 10 > ~/anvil-backfill.log 2>&1 < /dev/null &'
-ssh "$SRV" "cd ~/exitproof && LIMIT=5 FORK_RPC=http://127.0.0.1:8547 FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=$REG node scanner/src/cli.mjs backfill"
+ATTESTERS="$ATT" DEPLOYER_KEY="$(k)" node scripts/add-attesters.mjs
 ```
 
-Then the first live batch of 300, in the background on the server. It shows the mainnet banner in its log and sends
-one attestation per token whose entry is new or changed.
-
 ```zsh
-ssh "$SRV" "cd ~/exitproof && nohup env LIMIT=300 FORK_RPC=http://127.0.0.1:8547 FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=$REG ATTESTER_KEY_FILE=\$HOME/.exitproof-attester.key SEND=1 CONFIRM_MAINNET=yes node scanner/src/cli.mjs backfill > backfill.log 2>&1 < /dev/null &"
+ATTESTERS="$ATT" DEPLOYER_KEY="$(k)" SEND=1 CONFIRM_MAINNET=yes node scripts/add-attesters.mjs
 ```
 
-Follow it with the next line (Ctrl-C stops only the viewer, not the backfill). To continue after a batch, run the
-batch block again with a larger `LIMIT` (600, then 1000): finished tokens are skipped, because the state file pins the
-block.
+Start one fork per shard on the server, in the background (they stay up when you log out), on ports 8551 and up, and
+pin every shard to the same block. Then a dry run of the 3 newest pairs of shard 0; it sends nothing and prints one
+line per token and the cost estimate.
 
 ```zsh
-ssh "$SRV" 'tail -f ~/exitproof/backfill.log'
+ssh "$SRV" "for i in \$(seq 0 $((N-1))); do nohup ~/.foundry/bin/anvil --fork-url https://xlayerrpc.okx.com --chain-id 196 --host 127.0.0.1 --port \$((8551+i)) --silent --retries 10 > ~/anvil-shard\$i.log 2>&1 < /dev/null & done"
+BLK=$(cast block-number --rpc-url https://xlayerrpc.okx.com)
+ssh "$SRV" "cd ~/exitproof && LIMIT=3 SHARD=0/$N BLOCK=$BLK SWEEP_BUDGET_S=600 FORK_RPC=http://127.0.0.1:8551 FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=$REG node scanner/src/cli.mjs backfill"
+```
+
+Then all shards live, in the background on the server, started 30 s apart. Each one shows the mainnet banner in its
+log and sends one attestation per token whose entry is new or changed, with its own key.
+
+```zsh
+ssh "$SRV" "cd ~/exitproof && for i in \$(seq 0 $((N-1))); do nohup env SHARD=\$i/$N BLOCK=$BLK SWEEP_BUDGET_S=600 FORK_RPC=http://127.0.0.1:\$((8551+i)) FORK_UPSTREAM=https://xlayerrpc.okx.com REGISTRY=$REG ATTESTER_KEY_FILE=\$HOME/.exitproof-shard\$i.key SEND=1 CONFIRM_MAINNET=yes node scanner/src/cli.mjs backfill > backfill-shard\$i.log 2>&1 < /dev/null & sleep 30; done"
+```
+
+Check progress with the first line below (the last lines of each shard's log) and how many shards are still running
+with the second. When none is running, run the live block again once: every finished token is skipped (each state
+file pins the block), so only tokens that ended in an RPC error are retried. Then stop the forks with the last line.
+
+```zsh
+ssh "$SRV" 'tail -n 2 ~/exitproof/backfill-shard*.log'
+ssh "$SRV" 'pgrep -fc "cli.mjs backfill" || true'
+ssh "$SRV" 'pkill -f "anvil.*--port 85[5-9][0-9]" || true'
 ```
 
 ### 4c. The daemon (new pairs)
 
-The daemon and the backfill must not send with the same key at the same time (their transactions would race for
-nonces). Start the live daemon once the backfill batch has finished. It begins at the router's deploy block, so it
-catches up on every pair created in the meantime. First a dry run, **without** `SEND=1`: it scans, simulates and
+The daemon sends with your deployer key, and the backfill shards with their own keys, so they can run at the same
+time. The daemon begins at the router's deploy block, so it catches up on every pair created in the meantime. It reads
+`SWEEP_BUDGET_S` too. First a dry run, **without** `SEND=1`: it scans, simulates and
 writes reports to `scanner/reports/`, but sends nothing. When a few pairs have been processed and the reports look
 right, stop it with **Ctrl-C**.
 
 ```zsh
 START=$(node -p "require('./deployments/xlayer.json').deployBlock")
-REGISTRY="$REG" START_BLOCK="$START" FORK_RPC=http://127.0.0.1:8547 ATTESTER_KEY="$(k)" node scanner/src/cli.mjs daemon
+REGISTRY="$REG" START_BLOCK="$START" SWEEP_BUDGET_S=600 FORK_RPC=http://127.0.0.1:8547 ATTESTER_KEY="$(k)" node scanner/src/cli.mjs daemon
 ```
 
 Then run it live. This sends an attestation for every new pair; stop it with Ctrl-C. To run it permanently on the
 Linux server, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ```zsh
-REGISTRY="$REG" START_BLOCK="$START" FORK_RPC=http://127.0.0.1:8547 ATTESTER_KEY="$(k)" SEND=1 CONFIRM_MAINNET=yes node scanner/src/cli.mjs daemon
+REGISTRY="$REG" START_BLOCK="$START" SWEEP_BUDGET_S=600 FORK_RPC=http://127.0.0.1:8547 ATTESTER_KEY="$(k)" SEND=1 CONFIRM_MAINNET=yes node scanner/src/cli.mjs daemon
 ```
 
 ## 5. Web config check
@@ -325,5 +345,5 @@ cast call "$REG" 'owner()(address)' --rpc-url https://rpc.xlayer.tech
 cast call "$REG" 'pendingOwner()(address)' --rpc-url https://rpc.xlayer.tech
 ```
 
-After this, the scanner, the backfill and the daemon need the new attester's key as `ATTESTER_KEY` (or in the
-server's key file).
+After this, `attest` and the daemon need the new attester's key as `ATTESTER_KEY`. The backfill shards keep their own
+keys; to revoke them after the backfill, run the step 4b `add-attesters.mjs` send command again with `REMOVE=1` in front.
