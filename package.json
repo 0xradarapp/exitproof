@@ -1,0 +1,17 @@
+{
+  "name": "exitproof",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ExitProof tape-out and deployment tooling (X Layer)",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "tapeout": "node scripts/tapeout.mjs",
+    "deploy:fork": "node scripts/deploy-fork.mjs"
+  },
+  "dependencies": {
+    "viem": "^2.58.6"
+  }
+}
