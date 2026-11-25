@@ -78,8 +78,9 @@
   --plate: #ffffff;
   --rule: #c5d1cb;
   --focus: #0a58ca;
-  --sign: "Barlow Condensed", "Arial Narrow", "Roboto Condensed", sans-serif;
-  --text: "Barlow", "Segoe UI", system-ui, sans-serif;
+  /* CJK falls through to the system's Chinese faces (no web font is fetched for it) */
+  --sign: "Barlow Condensed", "Arial Narrow", "Roboto Condensed", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --text: "Barlow", "Segoe UI", system-ui, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans SC", sans-serif;
   --hex: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 
@@ -196,6 +197,7 @@ h1 {
 }
 .plate.allow { background: var(--exit); }
 .plate.deny { background: var(--stop); }
+.plate.policy { background: var(--caution); color: var(--ink); }
 .plate-icon { width: clamp(5rem, 12vw, 7.5rem); height: clamp(3.4rem, 8vw, 5rem); grid-row: span 2; }
 .plate-title { font: 800 clamp(2.1rem, 5vw, 3.3rem)/0.95 var(--sign); }
 .plate-why { font-size: 1.15rem; font-weight: 600; max-width: 46ch; }
@@ -248,10 +250,62 @@ h1 {
 .tag { display: inline-flex; align-items: center; gap: 0.4rem; font-weight: 600; }
 .tag::before { content: ""; width: 0.65rem; height: 0.65rem; border-radius: 50%; background: var(--exit); }
 .tag.bad::before { background: var(--stop); border-radius: 1px; }
-.tag.warn::before { background: var(--caution); }
+.tag.warn::before { background: var(--caution); clip-path: polygon(50% 0, 100% 100%, 0 100%); border-radius: 0; }
+.tag.none::before { background: transparent; border: 2px solid var(--ink-soft); }
 .meta { color: var(--ink-soft); font-size: 0.86rem; }
 .hex { font-family: var(--hex); font-size: 0.85em; }
 a { color: var(--exit-deep); }
 
 .foot { max-width: 76rem; margin: 0 auto; padding: 1.5rem clamp(1rem, 4vw, 3rem) 3rem; color: var(--ink-soft); font-size: 0.9rem; border-top: 1px solid var(--rule); display: grid; gap: 0.4rem; }
 .contracts { font-size: 0.82rem; }
+
+/* ------------------------------------------------------------------ result tools */
+.result-tools { margin-top: 1.25rem; display: flex; gap: 1.25rem; flex-wrap: wrap; align-items: baseline; }
+.btn-link { border: 0; background: none; padding: 0; color: var(--exit-deep); text-decoration: underline; text-underline-offset: 3px; cursor: pointer; font-weight: 600; font-size: 0.95rem; }
+.btn-small { border: 1.5px solid var(--ink); background: var(--plate); border-radius: 3px; padding: 0.2rem 0.65rem; font-weight: 600; font-size: 0.88rem; cursor: pointer; justify-self: start; }
+.btn-small:hover { background: var(--ink); color: #fff; }
+
+/* ------------------------------------------------------------------ totals */
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; margin: 0 0 0.5rem; }
+.stats:empty { display: none; }
+.stats div { background: var(--plate); border: 1px solid var(--rule); border-radius: 3px; padding: 0.55rem 0.7rem; display: grid; }
+.stats dt { font-size: 0.82rem; color: var(--ink-soft); }
+.stats dd { margin: 0; font: 800 1.7rem/1.1 var(--sign); }
+.stats-note { margin-bottom: 0.9rem; }
+.side h3 { font: 700 1.05rem/1.2 var(--sign); margin: 0 0 0.4rem; }
+
+/* ------------------------------------------------------------------ new pairs */
+.pair { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.pair-main { display: grid; min-width: 0; }
+.pair-sym { font-weight: 600; overflow-wrap: anywhere; }
+.pair .tag { grid-column: 1; font-weight: 400; font-size: 0.86rem; }
+.pair .btn-small { grid-column: 2; grid-row: 1 / span 2; }
+
+/* ------------------------------------------------------------------ circuit explorer */
+.xp { margin-top: 2.25rem; background: var(--plate); border: 1px solid var(--rule); border-radius: 4px; padding: 1.2rem 1.25rem; display: grid; gap: 0.8rem; }
+.xp h2 { font-size: 1.4rem; }
+.xp .side-note { margin: 0; }
+.xp-controls { display: flex; gap: 1rem; align-items: flex-end; flex-wrap: wrap; }
+.xp-controls select { border: 1px solid var(--rule); border-radius: 3px; background: var(--plate); padding: 0.35rem 0.5rem; color: var(--ink); }
+.xbits { display: grid; grid-template-columns: repeat(11, minmax(0, 1fr)); gap: 0.3rem; }
+.xbit {
+  display: grid; justify-items: center; gap: 0.15rem; padding: 0.4rem 0.1rem 0.3rem; min-width: 0;
+  border: 1.5px solid var(--rule); border-radius: 3px; background: var(--wall); cursor: pointer;
+}
+.xbit-v { font: 800 1.35rem/1 var(--hex); }
+.xbit-l { font-size: 0.7rem; line-height: 1.15; text-align: center; overflow-wrap: anywhere; color: var(--ink-soft); }
+.xbit-n { font: 0.65rem var(--hex); color: var(--ink-soft); }
+.xbit.on { background: var(--ink); border-color: var(--ink); color: #fff; }
+.xbit.on .xbit-l, .xbit.on .xbit-n { color: #cfe0d8; }
+.xout { display: flex; flex-wrap: wrap; gap: 0.5rem 1.75rem; margin: 0; align-items: end; }
+.xout div { display: grid; }
+.xout dt { font-size: 0.82rem; color: var(--ink-soft); }
+.xout dd { margin: 0; font-weight: 600; }
+.xbadge { display: inline-block; font-weight: 700; padding: 0.15rem 0.55rem; border-radius: 3px; }
+.xbadge.ok { background: var(--exit); color: #fff; }
+.xbadge.bad { background: var(--stop); color: #fff; }
+.xreason { font-size: 0.95rem; }
+@media (max-width: 40rem) {
+  .xbits { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .bar-tools { gap: 0.6rem; }
+}

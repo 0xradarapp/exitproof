@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- CSP: own files only (ethers is vendored), plus the RPC hosts listed in config.json (update both together) -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:8549 https://rpc.xlayer.tech; base-uri 'none'; form-action 'none'">
+<!-- CSP: own files only (ethers is vendored), plus the RPC hosts listed in config.json: rpc + rpcFallback (update both together) -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:8549 https://rpc.xlayer.tech https://xlayerrpc.okx.com; base-uri 'none'; form-action 'none'">
 <title>ExitProof: don't buy what you can't sell</title>
 <meta name="description" content="ExitProof buys a token on X Layer and proves in the same transaction that you can sell all of it back. If you can't, the buy reverts.">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
@@ -33,6 +33,12 @@
       <path d="M15 11 L15 21 M15 12 L9 18 M15 12 L21 18 M15 21 L11 30 M15 21 L19 30"
         fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
     </symbol>
+    <!-- warning triangle: sellable now, but the mode's owner/upgrade/scan policy says no -->
+    <symbol id="i-caution" viewBox="0 0 48 32">
+      <path d="M24 2.5 L45 29.5 H3 Z" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linejoin="round"/>
+      <path d="M24 11 V20.5" stroke="currentColor" stroke-width="3.6" stroke-linecap="round"/>
+      <circle cx="24" cy="25.2" r="2.1" fill="currentColor"/>
+    </symbol>
   </defs>
 </svg>
 
@@ -49,6 +55,7 @@
     <div class="lang" role="group" aria-label="Language">
       <button type="button" data-lang="en" aria-pressed="true">EN</button>
       <button type="button" data-lang="tr" aria-pressed="false">TR</button>
+      <button type="button" data-lang="zh" aria-pressed="false" lang="zh-CN">中文</button>
     </div>
     <button type="button" id="connect" class="btn-quiet" data-i18n="connect">Connect wallet</button>
   </div>
@@ -59,7 +66,7 @@
     <h1 id="h1" data-i18n="tagline">Don't buy what you can't sell.</h1>
     <p class="lede" data-i18n="lede"></p>
 
-    <p id="pending" class="notice" hidden data-i18n="pending"></p>
+    <p id="pending" class="notice" hidden data-i18n="notDeployed"></p>
 
     <form id="form" class="form" novalidate>
       <label class="field">
@@ -107,6 +114,22 @@
       </div>
       <p id="buy-status" class="buy-status" aria-live="polite"></p>
     </section>
+
+    <section id="explorer" class="xp" aria-labelledby="xp-h">
+      <h2 id="xp-h" data-i18n="xTitle">Circuit explorer</h2>
+      <p class="side-note" data-i18n="xBody"></p>
+      <div class="xp-controls">
+        <label class="field slip">
+          <span class="field-label" data-i18n="xMode">Mode</span>
+          <select id="xmode"><option value="0"></option><option value="1"></option><option value="2"></option><option value="3"></option></select>
+        </label>
+        <p id="xdecoded" class="meta"></p>
+      </div>
+      <div id="xbits" class="xbits" role="group" aria-labelledby="xp-h"></div>
+      <dl id="xout" class="xout" aria-live="polite"></dl>
+      <p id="xreason" class="xreason"></p>
+      <p id="xproc" class="meta"></p>
+    </section>
   </section>
 
   <aside class="side">
@@ -121,9 +144,18 @@
     </section>
 
     <section class="feed" aria-labelledby="feed-h">
-      <h2 id="feed-h" data-i18n="feedTitle">On chain right now</h2>
-      <p class="side-note" data-i18n="feedBody"></p>
+      <h2 id="feed-h" data-i18n="statsTitle">Since launch</h2>
+      <p class="side-note" data-i18n="statsBody"></p>
+      <dl id="stats" class="stats"></dl>
+      <p id="stats-note" class="meta stats-note" aria-live="polite"></p>
+      <h3 data-i18n="recentTitle">Latest on chain</h3>
       <ul id="feed" class="list"></ul>
+    </section>
+
+    <section class="pairs" aria-labelledby="pairs-h">
+      <h2 id="pairs-h" data-i18n="pairsTitle">New on PotatoSwap</h2>
+      <p class="side-note" data-i18n="pairsBody"></p>
+      <ul id="pairs" class="list"></ul>
     </section>
 
     <section class="local" aria-labelledby="local-h">
