@@ -1,0 +1,19 @@
+{
+  "name": "exitproof-scanner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ExitProof deterministic token scanner, fork owner-power simulation, RiskRegistry attester daemon",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "exitproof-scan": "src/cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "viem": "^2.58.6"
+  }
+}

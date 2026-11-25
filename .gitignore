@@ -6,3 +6,6 @@ cache/
 *.key
 broadcast/
 .superpowers/
+scanner/reports/
+scanner/node_modules/
+scanner/state/
