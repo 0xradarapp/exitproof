@@ -27,6 +27,9 @@ import {
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { POTATOSWAP_FACTORY, BASE_TOKENS, processToken } from './daemon.mjs';
+import { sweepBudgetMs } from './simulate.mjs';
+
+export { sweepBudgetMs };
 import { sendGate, attesterKey } from './send-gate.mjs';
 
 export const XLAYER_RPCS = Object.freeze(['https://rpc.xlayer.tech', 'https://xlayerrpc.okx.com']);
@@ -288,14 +291,6 @@ export function parseShard(v) {
   const n = m ? Number(m[2]) : NaN;
   if (!m || !(n >= 1) || !(i >= 0 && i < n)) throw new Error(`SHARD must be i/N with 0 <= i < N (got ${v})`);
   return { i, n };
-}
-
-/** SWEEP_BUDGET_S (default 180): wall-clock budget of one token's simulation, in seconds. */
-export function sweepBudgetMs(env = process.env) {
-  if (env.SWEEP_BUDGET_S === undefined || env.SWEEP_BUDGET_S === '') return 180_000;
-  const s = Number(env.SWEEP_BUDGET_S);
-  if (!(s > 0)) throw new Error(`SWEEP_BUDGET_S must be a positive number of seconds (got ${env.SWEEP_BUDGET_S})`);
-  return Math.round(s * 1000);
 }
 
 function resumeNote(state) {

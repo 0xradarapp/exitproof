@@ -34,7 +34,7 @@ test('cli scan prints the scan JSON (with the block it was pinned to)', async ()
   const r = JSON.parse(stdout);
   assert.equal(r.dangerSetter, true);
   assert.equal(r.privileged, true);
-  assert.equal(r.scannerVersion, 6);
+  assert.equal(r.scannerVersion, 7);
   assert.equal(r.block, Number(await env.pub.getBlockNumber({ cacheTime: 0 })));
 });
 
@@ -54,7 +54,7 @@ test('cli attest refuses to downgrade a flag of the same codehash unless --force
   const codehash = keccak256(await env.pub.getCode({ address: t.address }));
   const w = createWalletClient({ chain: foundry, transport: viemHttp(env.rpc), account: privateKeyToAccount(KEY2) });
   const hash = await attest(w, registry.address, t.address, {
-    codehash, privileged: true, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 6,
+    codehash, privileged: true, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 7,
   });
   await env.pub.waitForTransactionReceipt({ hash });
   const reports = tmp('exitproof-cli-');
@@ -81,7 +81,7 @@ test('cli attest: an entry for another codehash (code changed) is not a downgrad
   const t = await deployToken(env, 'CleanToken');
   const w = createWalletClient({ chain: foundry, transport: viemHttp(env.rpc), account: privateKeyToAccount(KEY2) });
   await env.pub.waitForTransactionReceipt({ hash: await attest(w, registry.address, t.address, {
-    codehash: `0x${'77'.repeat(32)}`, privileged: true, upgradeable: true, dangerSetter: true, ownerCanTrap: true, scannerVersion: 6,
+    codehash: `0x${'77'.repeat(32)}`, privileged: true, upgradeable: true, dangerSetter: true, ownerCanTrap: true, scannerVersion: 7,
   }) });
   const cliEnv = { ...process.env, RPC_URL: env.rpc, REGISTRY: registry.address, ATTESTER_KEY: KEY2, SEND: '1', STATIC_ONLY: '1', REPORTS_DIR: tmp('exitproof-cli-') };
   const { stderr } = await run('node', [CLI, 'attest', t.address], { env: cliEnv });
@@ -207,7 +207,7 @@ test('publish-reports bundles reports/<token>.json into a static index', () => {
   const out = tmp('exitproof-pub-');
   const tok = '0x00000000000000000000000000000000000000aa';
   writeFileSync(path.join(src, `${tok}.json`), JSON.stringify({
-    token: tok, codehash: `0x${'11'.repeat(32)}`, block: 7, scannerVersion: 6, flags: { privileged: true },
+    token: tok, codehash: `0x${'11'.repeat(32)}`, block: 7, scannerVersion: 7, flags: { privileged: true },
     evidence: { reasons: ['owner-getter'], simulation: { signals: ['delayed-sell-trap'] } }, reportURI: 'x',
   }));
   writeFileSync(path.join(src, 'junk.json'), '{}');

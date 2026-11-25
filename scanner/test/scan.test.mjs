@@ -15,11 +15,11 @@ const FLAGS = (r) => ({
   privileged: r.privileged, upgradeable: r.upgradeable, dangerSetter: r.dangerSetter, ownerCanTrap: r.ownerCanTrap,
 });
 
-test('CleanToken: all flags false, codehash = keccak(runtime), version 6', async () => {
+test('CleanToken: all flags false, codehash = keccak(runtime), version 7', async () => {
   const t = await deployToken(env, 'CleanToken');
   const r = await scan(env.pub, t.address);
   assert.deepEqual(FLAGS(r), { privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
-  assert.equal(r.scannerVersion, 6);
+  assert.equal(r.scannerVersion, 7);
   assert.equal(r.codehash, keccak256(await env.pub.getCode({ address: t.address })));
   assert.equal(r.evidence.owner, null);
   assert.ok(r.evidence.selectors.includes(selectorOf('transfer(address,uint256)')));

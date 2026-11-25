@@ -15,7 +15,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from '
 import path from 'node:path';
 import { createPublicClient, getAddress, http, keccak256, parseAbi, parseAbiItem } from 'viem';
 import { scan, SCANNER_VERSION } from './scan.mjs';
-import { simulate, mergeSimulation } from './simulate.mjs';
+import { simulate, mergeSimulation, sweepBudgetMs } from './simulate.mjs';
 import { attest, writeReport, reportURI, readEntry, decide, FLAG_KEYS } from './attest.mjs';
 
 export { FLAG_KEYS };
@@ -258,7 +258,7 @@ export async function runDaemon({ client, walletClient, env = process.env, baseD
     startBlock: env.START_BLOCK,
     send: env.SEND === '1',
     forkRpc: env.FORK_RPC || undefined,
-    simOpts: { budgetMs: env.SWEEP_BUDGET_S ? Math.round(Number(env.SWEEP_BUDGET_S) * 1000) : undefined },
+    simOpts: { budgetMs: sweepBudgetMs(env) },
     forkUpstream: env.FORK_RPC ? (env.FORK_UPSTREAM ?? env.RPC_URL ?? 'https://rpc.xlayer.tech') : undefined,
   };
   if (!opts.registry) throw new Error('REGISTRY is required');

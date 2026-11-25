@@ -31,7 +31,7 @@ import { keccak256, hexToBytes, bytesToHex, getAddress } from 'viem';
 import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS, CORE_ERC20, SAFE } from './selectors.mjs';
 import { readProxySlots, UPGRADE_SLOTS, isAddress20 } from './proxy.mjs';
 
-export const SCANNER_VERSION = 6;
+export const SCANNER_VERSION = 7;
 const OWNER_CALL_GAS = 100_000n;
 
 const JUMP = 0x56, JUMPI = 0x57, JUMPDEST = 0x5b, PUSH0 = 0x5f, EQ = 0x14;
@@ -57,6 +57,8 @@ set([0xf0], [3, 1]); set([0xf5], [4, 1]);
 set([CALL, CALLCODE], [7, 1]); set([DELEGATECALL, STATICCALL], [6, 1]);
 
 // Symbolic values: bigint literal | 'C' (CALLER/ORIGIN) | 'S' (SLOAD-derived) | 'A' (ADDRESS) | null (unknown).
+/** SLOAD-derived: 'S' (computed slot) or 'S:0x<slot>' (literal slot). */
+const isS = (v) => typeof v === 'string' && (v === 'S' || v.startsWith('S:'));
 const MASK_OPS = new Set([0x04, 0x16, 0x1c]); // DIV, AND, SHR keep taint
 const CMP_OPS = new Set([0x14, 0x03, 0x18, 0x01]); // EQ, SUB, XOR, ADD (solc -O: add(caller, not(c-1)) == 0)
 const MAX_PRECOMPILE = 0x0an;
@@ -114,8 +116,8 @@ function stepStack(x, stack, onCmp) {
   let out = fold(op, args);
   if (op === 0x33 || op === 0x32) out = 'C';
   else if (op === 0x30) out = 'A';
-  else if (op === 0x54) out = 'S';
-  else if (MASK_OPS.has(op) && out === null) out = args.find((v) => v === 'C' || v === 'S') ?? null;
+  else if (op === 0x54) out = typeof args[0] === 'bigint' ? `S:0x${args[0].toString(16)}` : 'S'; // v7: literal slot kept
+  else if (MASK_OPS.has(op) && out === null) out = args.find((v) => v === 'C' || isS(v)) ?? null;
   else if (CMP_OPS.has(op) && onCmp) onCmp(pc, args);
   stack.push(out);
 }
@@ -472,6 +474,7 @@ export function analyzeCode(codeHex) {
   const selectors = new Set(); // linear heuristic (dangerous-list matching only)
   const callerChecks = [];
   const callerLiteralChecks = [];
+  const callerCheckSlots = []; // per caller-vs-storage check: the literal storage slot compared, or null
   const callerLiterals = new Set(); // the admin addresses themselves (immutables / constants compared with CALLER)
   const externalCallOffsets = [];
   const externalStateOffsets = [];
@@ -486,9 +489,11 @@ export function analyzeCode(codeHex) {
   const df = computeEntries(ins);
   // v6: solc's CBOR metadata trailer is data. A 0x5b byte inside its hash would otherwise open a "live" run and
   // count random bytes as opcodes (EXTCODEHASH, BALANCE, ...). It is skipped only when the dataflow resolved every
-  // jump and no reached block starts inside it (so no code can execute there).
+  // jump and no executed instruction lies inside it (so no code can execute there).
   const metaFrom = metadataStart(bytes);
-  const skipMeta = metaFrom !== null && !df.unresolved && ![...df.entries.keys()].some((k) => ins[k].pc >= metaFrom);
+  // v7: no instruction the dataflow executed may start inside it (a fall-through or a PUSH whose immediate runs into
+  // the trailer reaches code there without any JUMPDEST)
+  const skipMeta = metaFrom !== null && !df.unresolved && ![...df.visited].some((k) => ins[k].pc >= metaFrom);
   const entries = df.unresolved ? new Map() : df.entries;
 
   let live = true;
@@ -501,7 +506,11 @@ export function analyzeCode(codeHex) {
   const litQualifies = (v) => (asSet(v) ?? []).some((x) => isAddrLit(x) || isAddrLit(((1n << 256n) - x) & M256));
   const onCmp = (pc, args) => {
     if (!args.includes('C')) return;
-    if (args.includes('S')) callerChecks.push(pc);
+    const sv = args.find(isS);
+    if (sv) {
+      callerChecks.push(pc);
+      callerCheckSlots.push(sv === 'S' ? null : sv.slice(2)); // null = computed slot (mapping, packed via SHA3, ...)
+    }
     else if (args.some(litQualifies)) {
       callerLiteralChecks.push(pc);
       for (const v of args) {
@@ -590,7 +599,9 @@ export function analyzeCode(codeHex) {
     jumpsResolved: !df.unresolved,
     callerChecks,
     callerLiteralChecks,
+    metadataSkipped: skipMeta,
     callerLiterals: [...callerLiterals].sort(sortStr),
+    callerCheckSlots: [...new Set(callerCheckSlots.map(String))].sort(sortStr).map((x) => (x === 'null' ? null : x)),
     selectorHints,
     envFingerprint,
     externalCalls: { count: externalCallOffsets.length, offsets: externalCallOffsets },
@@ -765,6 +776,8 @@ export async function scan(client, token, { blockNumber } = {}) {
       callerCodeChecks: a.callerCodeChecks,
       blockContext: a.blockContext,
       callerLiterals: [...new Set([...a.callerLiterals, ...(ia?.callerLiterals ?? [])])].sort(sortStr),
+      callerCheckSlots: [...new Set([...a.callerCheckSlots, ...(ia?.callerCheckSlots ?? [])].map(String))].sort(sortStr)
+        .map((x) => (x === 'null' ? null : x)),
       selectorHints: { ...(ia?.selectorHints ?? {}), ...a.selectorHints },
       proxySlots,
       implementation,

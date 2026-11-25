@@ -727,3 +727,39 @@ contract SwapBackToken is AuditERC20 {
         _move(from, to, amount);
     }
 }
+
+
+// ---- v6 re-review PoC fixtures (/tmp/ep-v6rr, I-1 / I-2), verbatim ----
+/// v6 re-review: "renounced" owner() == 0 plus a hidden storage admin packed next to a nonzero word (not address-shaped).
+contract RenouncedPackedAdmin is FeeOnSell {
+    uint96 private _nonce;         // packed with _ops in one slot => the slot word is not address-shaped
+    address private _ops;
+    address public owner;          // renounced: stays 0
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("RENPACK", p, liq, rest) {
+        _nonce = 1;
+        _ops = address(uint160(uint256(keccak256("hidden-admin"))));
+    }
+
+    function renounceOwnership() external { require(msg.sender == owner, "no"); owner = address(0); }
+
+    function setLaunchParam(uint256 v) external {
+        require(msg.sender == _ops, "na");
+        _sellFeeBps = v;
+    }
+}
+
+/// v6 re-review: MagicArgBomb with the key in the second word and a silent return instead of a revert.
+contract MagicSecondSilent is FeeOnSell {
+    address public owner;
+
+    constructor(address p, uint256 liq, uint256 rest) AuditERC20("MAGIC2", p, liq, rest) {
+        owner = tx.origin;
+    }
+
+    function setLaunchParam(uint256 v, uint256 key) external {
+        require(msg.sender == owner, "na");
+        if (key != 0x1234) return;
+        _sellFeeBps = v;
+    }
+}

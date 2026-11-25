@@ -71,7 +71,34 @@ export const MAX_UNKNOWN_SELECTORS = 40;
 export const UNKNOWN_PATTERNS = Object.freeze(['0', 'max', 'holder', 'pair', '1', '10000']);
 export const DEFAULT_BUDGET_MS = 180_000;
 const STORAGE_CALLER_SLOTS = 16;
-const MAX_STORAGE_CALLERS = 4;
+const MAX_STORAGE_CALLERS = 8;
+// byte offsets at which an address is tried inside a storage word (packed after bool/uint8/16/32/64/96)
+const PACK_OFFSETS = [0, 1, 2, 4, 8, 12];
+const MAX_HINT_PATTERNS = 32; // per selector: hint x argument position x {10000, max}
+
+/** SWEEP_BUDGET_S (default 180): wall-clock budget of one token's simulation, in ms. Validated. */
+export function sweepBudgetMs(env = process.env) {
+  if (env.SWEEP_BUDGET_S === undefined || env.SWEEP_BUDGET_S === '') return DEFAULT_BUDGET_MS;
+  const sec = Number(env.SWEEP_BUDGET_S);
+  if (!(sec > 0)) throw new Error(`SWEEP_BUDGET_S must be a positive number of seconds (got ${env.SWEEP_BUDGET_S})`);
+  return Math.round(sec * 1000);
+}
+
+/**
+ * Address-shaped values inside a storage word. A word < 2^160 is a plain address. Otherwise two packings are tried:
+ * the low 160 bits (address declared first, small values after it) and the address as the highest packed variable at
+ * a byte offset 1, 2, 4, 8 or 12 (bool / uint8 / 16 / 32 / 64 / 96 declared before it). Values < 2^120 are ignored.
+ */
+export function packedAddresses(word) {
+  const w = BigInt(word ?? 0);
+  const M = (1n << 160n) - 1n;
+  const out = [];
+  const add = (v) => { if (v >= 1n << 120n) out.push(getAddress(`0x${v.toString(16).padStart(40, '0')}`)); };
+  if (w <= M) { add(w); return out; }
+  for (const off of PACK_OFFSETS.slice(1)) if (w >> BigInt(off * 8 + 160) === 0n) add((w >> BigInt(off * 8)) & M);
+  add(w & M);
+  return [...new Set(out)];
+}
 
 /** Owner "unlock" calls tried (in this order) when no sell passes, e.g. trading not yet enabled. */
 const UNLOCKS = [
@@ -164,15 +191,26 @@ const sellJson = (r) => (r ? {
   actualOut: r.actual.toString(),
 } : null);
 
-/** owner() or getOwner() returns exactly one zero word (ownership renounced), as opposed to no getter at all. */
-async function ownerRenounced(client, token) {
+/**
+ * owner() or getOwner() returns exactly one zero word at the pinned block (ownership renounced, as opposed to no
+ * getter at all), and the storage slots that getter reads (prestateTracer of the call): only caller-vs-storage
+ * checks on those slots belong to the renounced owner.
+ */
+async function ownerRenounced(client, rpc, token, blockNumber) {
   for (const data of ['0x8da5cb5b', '0x893d20e8']) {
+    let ret;
     try {
-      const { data: ret } = await client.call({ to: token, data, gas: 100_000n });
-      if (ret && ret.length === 66 && BigInt(ret) === 0n) return true;
-    } catch { /* no such getter */ }
+      ({ data: ret } = await client.call({ to: token, data, gas: 100_000n, blockNumber }));
+    } catch { continue; } // no such getter
+    if (!ret || ret.length !== 66 || BigInt(ret) !== 0n) continue;
+    let slots = [];
+    try {
+      const pre = await rpc('debug_traceCall', [{ to: token, data, gas: '0x186a0' }, toHex(blockNumber), { tracer: 'prestateTracer' }]);
+      slots = Object.keys(pre?.[token.toLowerCase()]?.storage ?? {}).map((k) => `0x${BigInt(k).toString(16)}`);
+    } catch { /* tracer unavailable: no slot is attributed to the owner (fail closed) */ }
+    return { renounced: true, slots };
   }
-  return false;
+  return { renounced: false, slots: [] };
 }
 
 const taxBucket = (r) => {
@@ -210,6 +248,7 @@ async function neutralizeEnv(client, rpc, blockNumber) {
  */
 async function findCreator(client, rpc, token, blockNumber) {
   const from = new Set();
+  const txs = new Set();
   let createdAt = null;
   let via = 'none';
   try {
@@ -219,6 +258,7 @@ async function findCreator(client, rpc, token, blockNumber) {
       const tx = await client.getTransaction({ hash: c.hash });
       from.add(getAddress(tx.from));
       createdAt = tx.blockNumber;
+      txs.add(c.hash);
       via = 'ots';
     }
   } catch { /* not supported */ }
@@ -239,6 +279,7 @@ async function findCreator(client, rpc, token, blockNumber) {
       const lc = token.toLowerCase();
       const creating = (receipts ?? []).filter((r) => r.contractAddress?.toLowerCase() === lc
         || r.logs?.some((l) => l.address.toLowerCase() === lc));
+      for (const r of creating) txs.add(r.transactionHash);
       const senders = creating.length ? creating.map((r) => r.from) : b.transactions.slice(0, 10).map((tx) => tx.from);
       for (const f of senders) if (f && !/^0xdeaddeaddeaddeaddeaddeaddeaddeaddead/i.test(f)) from.add(getAddress(f));
       via = creating.length ? 'bisect+receipt' : 'bisect';
@@ -250,7 +291,7 @@ async function findCreator(client, rpc, token, blockNumber) {
     });
     for (const l of mints) if (l.args.to) from.add(getAddress(l.args.to));
   } catch { /* best effort */ }
-  return { via, block: createdAt === null ? null : Number(createdAt), from: [...from].sort() };
+  return { via, block: createdAt === null ? null : Number(createdAt), from: [...from].sort(), txs: [...txs].sort() };
 }
 
 export async function assertAnvil(client) {
@@ -274,7 +315,7 @@ export function mergeSimulation(r, sim) {
 /**
  * simulate(forkRpc, token, pair, opts) -> { ownerCanTrap, dangerSetter, privileged, signals, evidence, timing }
  * opts: holder (override the derived holder; tests only), callers (extra privileged callers), budgetMs,
- * maxUnknown, unknown (false = skip the F-04 sweep).
+ * maxUnknown, unknown (false = skip the F-04 sweep); tests only: noHints, hintPositions.
  */
 export async function simulate(forkRpc, token, pairAddr, opts = {}) {
   const t0 = Date.now();
@@ -364,14 +405,26 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
     for (const a of s.evidence.callerLiterals ?? []) addCaller(a);
     const creator = opts.creator ? { from: [getAddress(opts.creator)], via: 'opts' } : await findCreator(client, rpc, token, blockNumber);
     for (const a of creator.from) addCaller(a);
+    // v7 (I-1): address-shaped values at the usual packing offsets of slots 0..15 and of every slot the
+    // constructor wrote (prestateTracer diff of the creation transaction, when the node can trace it)
     const storageCallers = [];
-    for (let i = 0; i < STORAGE_CALLER_SLOTS && storageCallers.length < MAX_STORAGE_CALLERS; i++) {
-      const w = BigInt(await client.getStorageAt({ address: token, slot: toHex(i, { size: 32 }), blockNumber }) ?? '0x0');
-      if (w >> 160n !== 0n || w < 1n << 120n) continue; // not address-shaped (amounts, flags, packed words)
-      const a = getAddress(`0x${w.toString(16).padStart(40, '0')}`);
-      if (exclude.has(a) || callers.includes(a)) continue;
-      storageCallers.push(a);
-      callers.push(a);
+    const words = [];
+    for (let i = 0; i < STORAGE_CALLER_SLOTS; i++) {
+      words.push(await client.getStorageAt({ address: token, slot: toHex(i, { size: 32 }), blockNumber }) ?? '0x0');
+    }
+    for (const h of creator.txs ?? []) {
+      try {
+        const d = await rpc('debug_traceTransaction', [h, { tracer: 'prestateTracer', tracerConfig: { diffMode: true } }]);
+        words.push(...Object.values(d?.post?.[token.toLowerCase()]?.storage ?? {}).slice(0, 64));
+      } catch { /* historic tx not traceable on this node */ }
+    }
+    for (const w of words) {
+      for (const a of packedAddresses(w)) {
+        if (storageCallers.length >= MAX_STORAGE_CALLERS) break;
+        if (exclude.has(a) || callers.includes(a)) continue;
+        storageCallers.push(a);
+        callers.push(a);
+      }
     }
 
     const reserves = async () => {
@@ -609,10 +662,12 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
         const overBudget = () => Date.now() - t0 > budgetMs;
         const patternsFor = (sel) => [
           ...UNKNOWN_PATTERNS.map((p) => [p, unknownCalldata(sel, p, ctx)]),
-          ...(hints[sel] ?? []).flatMap((k) => [
-            [`magic:${k}/10000`, `${sel}${[BigInt(k), 10000n, 10000n, 10000n].map(word).join('')}`],
-            [`magic:${k}/max`, `${sel}${[BigInt(k), maxUint256, maxUint256, maxUint256].map(word).join('')}`],
-          ]),
+          // v7 (I-2): every hint in every argument position, over a 10000 or a max background (bounded)
+          ...(hints[sel] ?? []).flatMap((k) => (opts.hintPositions ?? [0, 1, 2, 3]).flatMap((pos) => [10000n, maxUint256].map((bg) => {
+            const w = [bg, bg, bg, bg];
+            w[pos] = BigInt(k);
+            return [`magic:${k}@${pos}/${bg === 10000n ? '10000' : 'max'}`, `${sel}${w.map(word).join('')}`];
+          }))).slice(0, MAX_HINT_PATTERNS),
         ];
         const trap = (attempt) => {
           evidence.unknownAttempts.push(attempt);
@@ -634,6 +689,9 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
           sweep.tried++;
           let exercised = false;
           let firstStep = null;
+          // v7 (I-2): a selector with compared constants only counts as exercised once a call changed token storage
+          // (`if (key != K) return;` succeeds without doing anything)
+          const needsChange = (hints[selector] ?? []).length > 0;
           for (const [pattern, data] of patternsFor(selector)) {
             if (overBudget()) { sweep.complete = false; sweep.truncatedBy = `budget(${budgetMs}ms)`; break outer; }
             for (const caller of callers) {
@@ -641,13 +699,14 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
               const attempt = await inSnapshot(async () => {
                 const rc = await sendTx(caller, token, data);
                 if (!rc) return null;
-                const changed = firstStep === null && (pattern === 'max' || pattern === '10000' || pattern.startsWith('magic:'))
+                const changed = (needsChange && !exercised)
+                  || (firstStep === null && (pattern === 'max' || pattern === '10000' || pattern.startsWith('magic:')))
                   ? await changesTokenState(rc) : false;
                 const r = await routerSell();
                 return { selector, pattern, caller, sellOk: r.ok, out: r.actual.toString(), trapped: trappedBy(r), changed };
               });
               if (!attempt) continue;
-              exercised = true;
+              if (!needsChange || attempt.changed) exercised = true;
               if (attempt.changed && firstStep === null) firstStep = { selector, pattern, data, caller };
               if (attempt.trapped) trap(attempt);
               break; // first caller whose call succeeds
@@ -689,14 +748,21 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
         // fail closed when an admin exists that the sweep could not fully exercise
         // A caller-vs-storage gate on a token whose owner()/getOwner() explicitly returns 0 (renounced) is taken to be
         // the renounced owner's: its functions revert for everyone by design (hidden second admin: README residual).
-        const renounced = await ownerRenounced(client, token);
+        // v7 (I-1): only when EVERY caller-vs-storage check compares a literal slot that owner() itself reads.
+        const own = await ownerRenounced(client, rpc, token, blockNumber);
+        const ownerSlots = new Set(own.slots.map((x) => BigInt(x)));
+        const checkSlots = s.evidence.callerCheckSlots ?? [null];
+        const onlyOwnerChecks = own.renounced && checkSlots.length > 0
+          && checkSlots.every((x) => x !== null && ownerSlots.has(BigInt(x)));
         const why = [
           s.evidence.owner !== null && 'owner-active',
           s.evidence.reasons.includes('access-control') && 'access-control',
           s.evidence.reasons.includes('caller-vs-literal') && 'caller-vs-literal',
-          s.evidence.reasons.includes('caller-vs-storage') && !renounced && 'caller-vs-storage',
+          s.evidence.reasons.includes('caller-vs-storage') && !onlyOwnerChecks && 'caller-vs-storage',
         ].filter(Boolean);
-        sweep.ownerRenounced = renounced;
+        sweep.ownerRenounced = own.renounced;
+        sweep.ownerSlots = own.slots;
+        sweep.callerCheckSlots = checkSlots;
         if (!sweep.complete) sweep.failClosedBecause = why;
         if (!sweep.complete && why.length) {
           evidence.signals.push('sweep-incomplete');
