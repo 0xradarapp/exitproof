@@ -136,12 +136,26 @@ test('caller vs non-zero 20-byte literal (immutable admin) is a caller check', (
   assert.equal(A(`3373${'11'.repeat(20)}14`).privilegedCode, true);
 });
 
+test('caller vs literal through ADD (solc -O: add(caller, not(c-1)) for `msg.sender == CONST`)', () => {
+  // PUSH2 0xbeee NOT CALLER ADD  => caller - 0xbeef
+  assert.deepEqual(A('61beee193301').callerLiteralChecks, [5]);
+  // CALLER PUSH20 <-L mod 2^256 does not fit 20 bytes>, but L itself does
+  assert.deepEqual(A(`3373${'11'.repeat(20)}01`).callerLiteralChecks, [22]);
+  assert.deepEqual(A('335f01').callerLiteralChecks, [], 'add 0');
+  assert.deepEqual(A('5f3501').callerLiteralChecks, [], 'no caller');
+});
+
 test('external state reads: BALANCE/EXTCODESIZE/EXTCODEHASH/EXTCODECOPY', () => {
-  assert.deepEqual(A(`73${'be'.repeat(20)}31`).externalState, { count: 1, offsets: [21] });
+  assert.deepEqual(A(`73${'be'.repeat(20)}31`).externalState, { count: 1, offsets: [21], balance: 1 });
   assert.equal(A('5f353b').externalState.count, 1, 'EXTCODESIZE of calldata address');
   assert.equal(A('5f353f').externalState.count, 1, 'EXTCODEHASH');
   assert.equal(A('5f5f5f5f353c').externalState.count, 1, 'EXTCODECOPY');
-  assert.equal(A('3031').externalState.count, 0, 'BALANCE(ADDRESS)');
+  assert.equal(A('3031').externalState.count, 1, 'BALANCE(ADDRESS): force-sendable (v4)');
+  assert.equal(A('3031').externalState.balance, 1);
+  assert.deepEqual(A('3331').externalState, { count: 1, offsets: [1], balance: 1 }, 'BALANCE(CALLER) (v4)');
+  assert.deepEqual(A('47').externalState, { count: 1, offsets: [0], balance: 1 }, 'SELFBALANCE (v4)');
+  assert.equal(A('0047').externalState.count, 0, 'dead SELFBALANCE');
+  assert.equal(A('303b').externalState.count, 0, 'EXTCODESIZE(ADDRESS)');
   assert.equal(A('600131').externalState.count, 0, 'precompile literal');
   assert.equal(A('00' + '5f353b').externalState.count, 0, 'dead');
   assert.equal(A('5f353b').privilegedCode, true);
@@ -149,6 +163,7 @@ test('external state reads: BALANCE/EXTCODESIZE/EXTCODEHASH/EXTCODECOPY', () => 
   assert.equal(cc.externalState.count, 0);
   assert.deepEqual(cc.callerCodeChecks, { count: 1, offsets: [1] });
   assert.equal(cc.privilegedCode, false, 'msg.sender code-size (anti-bot) is evidence only');
+  assert.equal(A('333f').privilegedCode, false, 'EXTCODEHASH(CALLER) evidence only');
 });
 
 test('dangerous selector in dispatcher => dangerSetter; upgradeTo => upgradeable', () => {

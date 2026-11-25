@@ -21,15 +21,17 @@
 // 6. dangerSetter = dangerous-list selector OR live SELFDESTRUCT OR dispatcher-unrecognized (chain not followable
 //    or missing transfer/transferFrom/approve/balanceOf).
 // 7. privileged (ALLOWLIST model, v3) = owner()/getOwner() non-zero OR hasRole OR CALLER/ORIGIN compared with an
-//    SLOAD value or a non-zero 20-byte literal OR live CALL/STATICCALL to a non-precompile, non-ADDRESS target OR
-//    BALANCE/EXTCODESIZE/EXTCODEHASH/EXTCODECOPY of a non-ADDRESS/CALLER/precompile target (CALLER targets are
-//    evidence only: anti-bot code-size checks) OR any dispatcher selector outside SAFE (selectors.mjs) OR
+//    SLOAD value or a non-zero 20-byte literal (EQ/SUB/XOR/ADD; L or -L) OR live CALL/STATICCALL to a
+//    non-precompile, non-ADDRESS target OR EXTCODESIZE/EXTCODEHASH/EXTCODECOPY of a non-ADDRESS/CALLER/precompile
+//    target (CALLER targets are evidence only: anti-bot code-size checks) OR BALANCE of anything but a precompile
+//    (incl. CALLER/ADDRESS) or SELFBALANCE (forced ETH makes balances attacker-writable) OR any dispatcher
+//    selector outside SAFE (selectors.mjs) OR
 //    fallbackLogic OR dangerSetter. The owner probe is an eth_call capped at 100k gas.
 import { keccak256, hexToBytes, bytesToHex, getAddress } from 'viem';
 import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS, CORE_ERC20, SAFE } from './selectors.mjs';
 import { readProxySlots, UPGRADE_SLOTS, isAddress20 } from './proxy.mjs';
 
-export const SCANNER_VERSION = 3;
+export const SCANNER_VERSION = 4;
 const OWNER_CALL_GAS = 100_000n;
 
 const JUMP = 0x56, JUMPI = 0x57, JUMPDEST = 0x5b, PUSH0 = 0x5f, EQ = 0x14;
@@ -56,11 +58,12 @@ set([CALL, CALLCODE], [7, 1]); set([DELEGATECALL, STATICCALL], [6, 1]);
 
 // Symbolic values: bigint literal | 'C' (CALLER/ORIGIN) | 'S' (SLOAD-derived) | 'A' (ADDRESS) | null (unknown).
 const MASK_OPS = new Set([0x04, 0x16, 0x1c]); // DIV, AND, SHR keep taint
-const CMP_OPS = new Set([0x14, 0x03, 0x18]); // EQ, SUB, XOR
+const CMP_OPS = new Set([0x14, 0x03, 0x18, 0x01]); // EQ, SUB, XOR, ADD (solc -O: add(caller, not(c-1)) == 0)
 const MAX_PRECOMPILE = 0x0an;
 const isLiteralPrecompile = (v) => (typeof v === 'bigint' && v <= MAX_PRECOMPILE)
   || (v !== null && typeof v === 'object' && Array.isArray(v.set) && v.set.every((x) => x <= MAX_PRECOMPILE));
 
+const BALANCE = 0x31, SELFBALANCE = 0x47;
 const EXT_STATE_OPS = new Set([0x31, 0x3b, 0x3c, 0x3f]); // BALANCE, EXTCODESIZE, EXTCODECOPY, EXTCODEHASH
 const M256 = (1n << 256n) - 1n;
 
@@ -394,6 +397,7 @@ export function analyzeCode(codeHex) {
   const externalCallOffsets = [];
   const externalStateOffsets = [];
   const callerCodeOffsets = [];
+  let balanceReads = 0;
   let unsafeDelegate = false;
 
   // Entry stacks for every JUMPDEST from a small dataflow pass (constants / tags flow across internal jumps). If
@@ -405,10 +409,15 @@ export function analyzeCode(codeHex) {
   let live = true;
   let stack = []; // top = end; the floor below is unknown
   const peek = (d) => (d < stack.length ? stack[stack.length - 1 - d] : null);
+  // A literal L qualifies as an admin address if L or its two's-complement negation is non-zero and < 2^160
+  // (`caller == C` may be lowered to `add(caller, not(C-1))` = caller - C). Joined literal sets are checked per member.
+  const ADDR_LIMIT = 1n << 160n;
+  const isAddrLit = (v) => v > 0n && v < ADDR_LIMIT;
+  const litQualifies = (v) => (asSet(v) ?? []).some((x) => isAddrLit(x) || isAddrLit(((1n << 256n) - x) & M256));
   const onCmp = (pc, args) => {
     if (!args.includes('C')) return;
     if (args.includes('S')) callerChecks.push(pc);
-    else if (args.some((v) => typeof v === 'bigint' && v > 0n && v < 1n << 160n)) callerLiteralChecks.push(pc);
+    else if (args.some(litQualifies)) callerLiteralChecks.push(pc);
   };
 
   for (let i = 0; i < ins.length; i++) {
@@ -450,9 +459,17 @@ export function analyzeCode(codeHex) {
     }
     if (EXT_STATE_OPS.has(op)) {
       const target = peek(0);
-      if (target === 'C') callerCodeOffsets.push(pc);
-      else if (target !== 'A' && !isLiteralPrecompile(target)) externalStateOffsets.push(pc);
+      if (op === BALANCE && (target === 'C' || target === 'A')) {
+        // native balances of msg.sender / self are writable by anyone via forced ETH (SELFDESTRUCT): kill switch
+        externalStateOffsets.push(pc);
+        balanceReads++;
+      } else if (target === 'C') callerCodeOffsets.push(pc); // EXTCODE*(msg.sender): anti-bot, evidence only
+      else if (target !== 'A' && !isLiteralPrecompile(target)) {
+        externalStateOffsets.push(pc);
+        if (op === BALANCE) balanceReads++;
+      }
     }
+    if (op === SELFBALANCE) { externalStateOffsets.push(pc); balanceReads++; }
     if (op === SELFDESTRUCT) opcodes.selfdestruct++;
     if (TERMINATORS.has(op)) { live = false; stack = []; continue; }
     stepStack(ins[i], stack, onCmp);
@@ -475,7 +492,7 @@ export function analyzeCode(codeHex) {
     callerChecks,
     callerLiteralChecks,
     externalCalls: { count: externalCallOffsets.length, offsets: externalCallOffsets },
-    externalState: { count: externalStateOffsets.length, offsets: externalStateOffsets },
+    externalState: { count: externalStateOffsets.length, offsets: externalStateOffsets, balance: balanceReads },
     callerCodeChecks: { count: callerCodeOffsets.length, offsets: callerCodeOffsets },
     unsafeDelegatecall: unsafeDelegate,
     upgradeable: unsafeDelegate || upgradeSelector,

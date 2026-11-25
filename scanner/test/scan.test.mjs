@@ -19,7 +19,7 @@ test('CleanToken: all flags false, codehash = keccak(runtime), version 1', async
   const t = await deployToken(env, 'CleanToken');
   const r = await scan(env.pub, t.address);
   assert.deepEqual(FLAGS(r), { privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
-  assert.equal(r.scannerVersion, 3);
+  assert.equal(r.scannerVersion, 4);
   assert.equal(r.codehash, keccak256(await env.pub.getCode({ address: t.address })));
   assert.equal(r.evidence.owner, null);
   assert.ok(r.evidence.selectors.includes(selectorOf('transfer(address,uint256)')));
@@ -28,7 +28,7 @@ test('CleanToken: all flags false, codehash = keccak(runtime), version 1', async
   assert.deepEqual(r.evidence.unknownSelectors, []);
   assert.equal(r.evidence.dispatcher.fallbackLogic, false);
   assert.deepEqual(r.evidence.externalCalls, { count: 0, offsets: [] });
-  assert.deepEqual(r.evidence.externalState, { count: 0, offsets: [] });
+  assert.deepEqual(r.evidence.externalState, { count: 0, offsets: [], balance: 0 });
 });
 
 test('scan output is identical across runs', async () => {
@@ -192,6 +192,26 @@ test('BalanceOracleToken: BALANCE(0xBEEF) on the transfer path => privileged (ex
   assert.equal(r.privileged, true);
   assert.ok(r.evidence.externalState.count >= 1);
   assert.deepEqual(r.evidence.reasons, ['external-state']);
+});
+
+test('`address constant` admin: optimizer on and off, small and full literal => caller-vs-literal', async () => {
+  for (const n of ['CallerEqBeefToken', 'CallerEqBeefToken_noopt', 'CallerEqFullToken', 'CallerEqFullToken_noopt']) {
+    const t = await deployScannerFixture(env, n, [SUPPLY]);
+    const r = await scan(env.pub, t.address);
+    assert.ok(r.evidence.callerLiteralChecks.length >= 1, n);
+    assert.equal(r.privileged, true, n);
+    assert.deepEqual(r.evidence.reasons, ['caller-vs-literal'], n);
+  }
+});
+
+test('balance kill switches: BALANCE(msg.sender) and SELFBALANCE => privileged (external-state)', async () => {
+  for (const n of ['BalCallerToken', 'SelfBalToken']) {
+    const t = await deployScannerFixture(env, n, [SUPPLY]);
+    const r = await scan(env.pub, t.address);
+    assert.equal(r.privileged, true, n);
+    assert.ok(r.evidence.externalState.balance >= 1, n);
+    assert.deepEqual(r.evidence.reasons, ['external-state'], n);
+  }
 });
 
 test('PermitToken (OZ-shaped ERC20 + permit + eip712Domain) is not privileged', async () => {

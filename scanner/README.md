@@ -1,4 +1,4 @@
-# ExitProof scanner (v3)
+# ExitProof scanner (v4)
 
 This is the deterministic scanner behind `RiskRegistry`. It is open source so anyone can re-run the scan that set the flags for a codehash.
 
@@ -24,9 +24,14 @@ Strict mode only passes tokens whose whole external surface is known-safe. A tok
   Any other selector is listed in `evidence.unknownSelectors`.
 - The no-match and no-selector paths only REVERT or STOP (or accept value). Anything else is `fallback-logic`. The prologue before the selector may only set the free memory pointer and do callvalue or calldatasize checks.
 - `owner()`/`getOwner()` returns zero or reverts, and there is no AccessControl `hasRole`.
-- No CALLER/ORIGIN value is compared with an SLOAD-derived value (`caller-vs-storage`) or with a non-zero 20-byte literal, i.e. an immutable admin (`caller-vs-literal`).
+- No CALLER/ORIGIN value is compared (EQ, SUB, XOR or ADD) with an SLOAD-derived value (`caller-vs-storage`), or with a literal L where L or -L mod 2^256 is a non-zero 20-byte value (`caller-vs-literal`). That covers immutable and `address constant` admins: solc -O lowers `msg.sender == C` to `add(caller, not(C-1))`.
 - No live CALL/STATICCALL goes to a target that is not a literal precompile or ADDRESS (`external-call`).
-- No live BALANCE, EXTCODESIZE, EXTCODEHASH or EXTCODECOPY reads a target that is not ADDRESS, CALLER or a precompile (`external-state`). `EXTCODESIZE(msg.sender)`-style checks on CALLER are a common anti-bot pattern. They are recorded in `evidence.callerCodeChecks` but do **not** set `privileged`.
+- No live read of external state (`external-state`):
+  - BALANCE of anything other than a precompile, which includes `msg.sender.balance` and `address(this).balance`;
+  - SELFBALANCE;
+  - EXTCODESIZE, EXTCODEHASH or EXTCODECOPY of a target that is not ADDRESS, CALLER or a precompile.
+  `evidence.externalState.balance` counts the balance reads. **Forced ETH makes balance-dependent logic writable by anyone**: SELFDESTRUCT can send wei to the token, the router or a holder, so a balance check is a kill switch the owner (or anyone) can flip.
+  EXTCODE* reads of CALLER (`msg.sender.code.length` anti-bot checks) are recorded in `evidence.callerCodeChecks` and do **not** set `privileged`.
 - No dangerous setter or live SELFDESTRUCT (`dangerSetter`), and the dispatcher is recognized.
 
 `dangerSetter` (used by balanced mode) is still name based. It is set by any of:
@@ -48,6 +53,9 @@ Minimal proxies are resolved. A clone whose runtime is exactly EIP-1167 (`363d3d
 `evidence.reasons` lists which rules fired.
 
 ## Residual risks / limitations
+- **Obfuscated caller checks.** Caller checks hidden behind arithmetic or ranges are missed. Examples: `caller * k == x`, `caller > A && caller < A+2`, hashing the caller, or comparing a masked or shifted caller against a computed value.
+- **Caller taint lost in a merge.** When a calldata `from` and `msg.sender` flow through the same internal function (`_transfer(msg.sender, …)` vs `transferFrom`'s `from`), the dataflow join turns the value into "unknown", and a check on it inside the shared code is missed.
+- **Joined admin literal sets.** A literal joined from several call sites ({set}) is checked per member, but NOT or arithmetic applied after the join is not folded, so the check is missed.
 - **Logic inside allowlisted functions.** The allowlist proves the surface, not the behaviour. A `transfer()` whose result depends on `block.number`, `block.timestamp`, gas, or its own state (a counter, a launch timestamp) passes the static rules. The router's live sell probe and `simulate` are the only defence. An allowlisted getter name (for example `pair()`) could also be implemented as a state-changing function.
 - **Unrecognized dispatcher forms fail closed** (privileged + dangerSetter). That includes Vyper, jump tables, XOR/SUB/OR compares, and hand-written dispatchers. Honest tokens written that way are blocked in strict and balanced modes.
 - **Unknown selectors are not simulated.** `simulate` only calls the dangerous-list setters. Unknown functions only make the token `privileged`.

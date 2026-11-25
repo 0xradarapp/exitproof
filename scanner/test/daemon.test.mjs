@@ -44,7 +44,7 @@ test('attest writes the scan flags to RiskRegistry', async () => {
   assert.equal(rc.status, 'success');
   const f = await flagsOf(r.codehash);
   assert.deepEqual(f, {
-    scanned: true, privileged: true, upgradeable: false, dangerSetter: true, ownerCanTrap: false, scannerVersion: 3,
+    scanned: true, privileged: true, upgradeable: false, dangerSetter: true, ownerCanTrap: false, scannerVersion: 4,
   });
 });
 
@@ -89,7 +89,7 @@ test('daemon: windows PairCreated logs, scans non-base side, attests, persists c
   assert.equal(fp.upgradeable, true);
   const fc = await flagsOf(keccak256(await env.pub.getCode({ address: clean.address })));
   assert.deepEqual(fc, {
-    scanned: true, privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 3,
+    scanned: true, privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 4,
   });
   const rep = JSON.parse(readFileSync(path.join(reportsDir, `${bombHash}.json`), 'utf8'));
   assert.equal(rep.codehash, bombHash);

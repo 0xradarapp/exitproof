@@ -271,3 +271,51 @@ contract PermitToken {
         return true;
     }
 }
+
+/// @notice `address constant` admin (small literal): solc -O lowers `msg.sender == ADMIN` to add(caller, not(c-1)).
+contract CallerEqBeefToken is MiniERC20 {
+    address private constant ADMIN = address(0xbEEF);
+    bool private _paused;
+
+    constructor(uint256 supply) MiniERC20(supply) {}
+
+    function _transfer(address from, address to, uint256 a) internal override {
+        if (msg.sender == ADMIN) _paused = !_paused;
+        require(!_paused, "paused");
+        super._transfer(from, to, a);
+    }
+}
+
+/// @notice `address constant` admin (full 20-byte literal), checked inside an allowlisted function.
+contract CallerEqFullToken is MiniERC20 {
+    address private constant ADMIN = 0x5a3c5A3C5a3C5a3c5a3c5a3C5A3C5A3c5A3c5A3c;
+    bool private _paused;
+
+    constructor(uint256 supply) MiniERC20(supply) {}
+
+    function _transfer(address from, address to, uint256 a) internal override {
+        if (msg.sender == ADMIN) _paused = !_paused;
+        require(!_paused, "paused");
+        super._transfer(from, to, a);
+    }
+}
+
+/// @notice Kill switch anyone (incl. the owner via SELFDESTRUCT) can flip: msg.sender's native balance.
+contract BalCallerToken is MiniERC20 {
+    constructor(uint256 supply) MiniERC20(supply) {}
+
+    function _transfer(address from, address to, uint256 a) internal override {
+        require(msg.sender.balance != 1 wei, "gate");
+        super._transfer(from, to, a);
+    }
+}
+
+/// @notice Kill switch via the token's own native balance (force-sendable with SELFDESTRUCT).
+contract SelfBalToken is MiniERC20 {
+    constructor(uint256 supply) MiniERC20(supply) {}
+
+    function _transfer(address from, address to, uint256 a) internal override {
+        require(address(this).balance == 0, "gate");
+        super._transfer(from, to, a);
+    }
+}
