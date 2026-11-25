@@ -324,11 +324,10 @@ contract ExitProofRouterTest is Test {
     // ------------------------------------------------------------------ review focus
 
     function test_owner_probe_robust() public {
-        address[5] memory ts = [
+        address[4] memory ts = [
             address(new CleanToken(SUPPLY)),
             address(new OwnerRevertsToken(SUPPLY)),
             address(new OwnerShortToken(SUPPLY)),
-            address(new OwnerGarbageToken(SUPPLY)),
             address(new OwnerGasHogToken(SUPPLY))
         ];
         for (uint256 i = 0; i < ts.length; i++) {
@@ -338,6 +337,10 @@ contract ExitProofRouterTest is Test {
             assertEq(_f(r.facts, 5, 1), 0, "ownerActive must be 0");
             assertGt(_buy(ts[i], 1 ether, PERMISSIVE), 0);
         }
+        // fail closed: any non-zero 32-byte word from a successful owner() counts as an active owner
+        OwnerGarbageToken g = new OwnerGarbageToken(SUPPLY);
+        _list(address(g), false);
+        assertEq(_f(_inspect(address(g), 1 ether, PERMISSIVE).facts, 5, 1), 1, "dirty word = owner");
         OwnedCleanToken o = new OwnedCleanToken(SUPPLY);
         _list(address(o), false);
         assertEq(_f(_inspect(address(o), 1 ether, PERMISSIVE).facts, 5, 1), 1, "real owner");
@@ -372,6 +375,51 @@ contract ExitProofRouterTest is Test {
         (uint8 reason, uint16 facts) = _blocked(address(t), 1 ether, PERMISSIVE);
         assertEq(reason, 1);
         assertEq(_f(facts, 0, 1), 0);
+    }
+
+    function test_secondHopTrap_blocked_reason1() public {
+        // Reviewer PoC: the trap ignores pair hops and blacklists the receiver of any other transfer, so a probe
+        // that sells straight from the router passes and the buyer is trapped by the router -> buyer forward.
+        // The probe now mirrors the real path: router -> fresh holder -> pair.
+        SecondHopTrap t = new SecondHopTrap(SUPPLY);
+        _list(address(t), true);
+        (uint8 reason, uint16 facts) = _blocked(address(t), 1 ether, PERMISSIVE);
+        assertEq(reason, 1);
+        assertEq(_f(facts, 0, 1), 0);
+        // RESIDUAL LIMITATION (documented): the probe holder is a freshly deployed contract, so a token that treats
+        // EOA receivers differently from contract receivers on the second hop (extcodesize / code checks), keys on
+        // the remaining gas window, the router address, tx.origin or a later block can still pass the probe and
+        // trap the buyer afterwards.
+    }
+
+    function test_lyingBalance_saturates_not_panics() public {
+        LyingBalanceToken t = new LyingBalanceToken(SUPPLY);
+        _list(address(t), true);
+        (uint8 reason, uint16 facts) = _blocked(address(t), 1 ether, PERMISSIVE);
+        assertEq(reason, 2, "sell tax bucket 3, not a panic");
+        assertEq(_f(facts, 1, 2), 3);
+    }
+
+    function test_probe_gas_with_helper_deploy() public {
+        CleanToken t = new CleanToken(SUPPLY);
+        address pair = _list(address(t), false);
+        // forge-lint: disable-next-line(erc20-unchecked-transfer)
+        t.transfer(address(router), 1000e18);
+        vm.prank(address(router));
+        uint256 g = gasleft();
+        try router.probeSell(pair, address(t), address(wokb), 1000e18) {
+            revert("probe returned");
+        } catch (bytes memory err) {
+            uint256 used = g - gasleft();
+            (bytes4 sel, bytes memory rest) = _strip(err);
+            assertTrue(sel == ExitProofRouter.ProbeResult.selector);
+            (bool ok, uint256 out) = abi.decode(rest, (bool, uint256));
+            assertTrue(ok);
+            assertGt(out, 0);
+            emit log_named_uint("probeSell gas (incl. helper CREATE2)", used);
+            assertLt(used, router.PROBE_GAS());
+        }
+        assertEq(t.balanceOf(address(router)), 1000e18, "probe rolled back");
     }
 
     function test_no_dust_both_orderings() public {

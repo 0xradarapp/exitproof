@@ -157,15 +157,15 @@ contract MaxTxToken is PairAware {
     }
 }
 
-/// @notice No selling in the same block as a buy.
+/// @notice No selling in the same block in which the seller received tokens.
 contract CooldownToken is PairAware {
-    mapping(address => uint256) public lastBuy;
+    mapping(address => uint256) public lastIn;
 
     constructor(uint256 supply) BaseToken("Cooldown", "CD", supply) {}
 
     function _transfer(address from, address to, uint256 amount) internal override {
-        if (_isSell(from, to)) require(lastBuy[from] != block.number, "cooldown");
-        if (from == pair) lastBuy[to] = block.number;
+        if (_isSell(from, to)) require(lastIn[from] != block.number, "cooldown");
+        lastIn[to] = block.number;
         _move(from, to, amount);
     }
 }
@@ -462,5 +462,74 @@ contract ForgedProbeToken is PairAware {
             }
         }
         _move(from, to, amount);
+    }
+}
+
+/// @notice Second-hop trap (reviewer PoC): blacklists the receiver of any transfer that neither comes from nor goes
+///         to the pair. The router's forward to the buyer is such a hop, so the buyer is trapped after delivery.
+contract SecondHopTrap is PairAware {
+    mapping(address => bool) public blacklisted;
+
+    constructor(uint256 supply) BaseToken("SecondHop", "HOP", supply) {}
+
+    function _transfer(address from, address to, uint256 amount) internal override {
+        require(!blacklisted[from], "blacklisted");
+        if (from != pair && to != pair && from != deployer) blacklisted[to] = true;
+        _move(from, to, amount);
+    }
+}
+
+/// @notice Reports an astronomically large balance for anyone who bought from the pair, and only moves the real
+///         balance on transfer. Used to check that tax math saturates instead of panicking.
+contract LyingBalanceToken {
+    string public constant name = "Liar";
+    string public constant symbol = "LIE";
+    uint8 public constant decimals = 18;
+    uint256 public totalSupply;
+    address public immutable deployer;
+    address public pair;
+    mapping(address => uint256) internal real;
+    mapping(address => bool) public inflated;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+
+    constructor(uint256 supply) {
+        deployer = msg.sender;
+        totalSupply = supply;
+        real[msg.sender] = supply;
+    }
+
+    function initPair(address p) external {
+        require(msg.sender == deployer && pair == address(0), "initPair");
+        pair = p;
+    }
+
+    function balanceOf(address a) external view returns (uint256) {
+        return real[a] + (inflated[a] ? 1 << 250 : 0);
+    }
+
+    function approve(address s, uint256 a) external returns (bool) {
+        allowance[msg.sender][s] = a;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _transfer(msg.sender, to, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    function _transfer(address from, address to, uint256 amount) internal {
+        if (inflated[from] && amount > real[from]) amount = real[from];
+        if (from == pair) inflated[to] = true;
+        real[from] -= amount;
+        real[to] += amount;
+        emit Transfer(from, to, amount);
     }
 }

@@ -170,7 +170,8 @@ contract ExitProofRouter {
         revert Report(r.facts, r.allow, r.reason, r.buyOut, r.sellOut);
     }
 
-    /// @notice Sell probe: sells `amount` of `token` (held by this router) into `pair` for `tokenIn`.
+    /// @notice Sell probe: moves `amount` of `token` (held by this router) to a fresh holder, which sells its whole
+    ///         balance into `pair`; the `tokenIn` output is paid to this router and measured by balance diff.
     ///         Self-call only; ALWAYS reverts with `ProbeResult(ok, out)` so no state survives.
     /// @dev Never bubbles foreign revert data: every token/pair interaction is a low-level call whose result is
     ///      reduced to a bool, so a token cannot forge a ProbeResult.
@@ -179,10 +180,16 @@ contract ExitProofRouter {
         uint256 fee = _factoryFee[_pairFactory(pair)];
         if (fee == 0) revert ProbeResult(false, 0);
         fee -= 1;
-        // reserves BEFORE the token transfer (a hook cannot move the baseline)
+        // reserves BEFORE any token transfer (a hook cannot move the baseline)
         (bool ok, uint256 rTok, uint256 rIn) = _reserves(pair, token, tokenIn);
         if (!ok) revert ProbeResult(false, 0);
-        if (!_tryTransfer(token, pair, amount)) revert ProbeResult(false, 0);
+        // Mirror the real path (pair -> router -> buyer -> pair): hand the whole position to a freshly CREATE2-deployed
+        // holder, which then sells its entire balance. Everything (the holder included) is rolled back by the revert.
+        // The salt varies per call so the holder address is not a fixed, whitelistable constant.
+        bytes32 salt = keccak256(abi.encode(token, amount, block.number, gasleft()));
+        address holder = address(new ProbeHolder{salt: salt}(salt));
+        if (!_tryTransfer(token, holder, amount)) revert ProbeResult(false, 0);
+        if (!_tryCall(holder, abi.encodeCall(ProbeHolder.sellAll, (token, pair)))) revert ProbeResult(false, 0);
         uint256 bal;
         (ok, bal) = _tryBalanceOf(token, pair);
         if (!ok || bal <= rTok) revert ProbeResult(false, 0);
@@ -326,17 +333,15 @@ contract ExitProofRouter {
         }
     }
 
-    /// @dev owner() with a 50k gas cap; anything but a clean, non-zero, 32-byte address word counts as no owner.
+    /// @dev owner() with a 50k gas cap. Active iff the call succeeds and returns >= 32 bytes whose first word != 0.
     function _ownerActive(address token) internal view returns (bool active) {
         // a starved owner() call would read as "no owner": refuse instead (fail closed)
         if (gasleft() < OWNER_GAS + OWNER_GAS / 63 + 5_000) revert LowGas();
         assembly ("memory-safe") {
             mstore(0, shl(224, 0x8da5cb5b)) // owner()
             let success := staticcall(OWNER_GAS, token, 0, 4, 0, 32)
-            if and(success, gt(returndatasize(), 31)) {
-                let w := mload(0)
-                active := and(iszero(shr(160, w)), iszero(iszero(w)))
-            }
+            // fail closed: ANY non-zero word (even a dirty, non-address one) counts as an active owner
+            if and(success, gt(returndatasize(), 31)) { active := iszero(iszero(mload(0))) }
         }
     }
 
@@ -370,9 +375,16 @@ contract ExitProofRouter {
 
     function _bucket(uint256 expected, uint256 actual) internal pure returns (uint256) {
         if (expected == 0) return 3;
-        uint256 a = actual < expected ? actual : expected;
+        if (actual >= expected) return 0;
+        uint256 diff = expected - actual;
+        // saturate instead of overflowing on token-controlled huge values: scale both into 128 bits
+        if (expected > type(uint128).max) {
+            uint256 d = (expected >> 128) + 1;
+            diff /= d;
+            expected /= d;
+        }
         // round UP: a token taking exactly 5% (floored) must not land under the 5% line
-        uint256 bps = ((expected - a) * BPS + expected - 1) / expected;
+        uint256 bps = (diff * BPS + expected - 1) / expected;
         return bps < 500 ? 0 : bps < 1500 ? 1 : bps < 5000 ? 2 : 3;
     }
 
@@ -453,5 +465,44 @@ contract ExitProofRouter {
 
     function _transferFrom(address t, address from, address to, uint256 amount) internal {
         if (!_tryCall(t, abi.encodeWithSelector(0x23b872dd, from, to, amount))) revert TransferFailed();
+    }
+}
+
+/// @title ProbeHolder
+/// @notice Throwaway holder deployed by ExitProofRouter inside the always-reverting sell probe. It plays the buyer:
+///         receives the position over a non-pair hop, then sells its entire balance to the pair. Never persists.
+/// @dev The salt is baked into the runtime code (immutable), so each holder has a unique codehash too.
+contract ProbeHolder {
+    address private immutable router;
+    bytes32 private immutable nonce;
+
+    constructor(bytes32 n) {
+        router = msg.sender;
+        nonce = n;
+    }
+
+    /// @notice Transfers this holder's whole `token` balance to `pair`. Returns true on SafeTransfer success; never
+    ///         bubbles foreign returndata (at most 32 bytes are copied).
+    function sellAll(address token, address pair) external returns (bool ok) {
+        if (msg.sender != router) revert();
+        bytes32 n = nonce;
+        assembly ("memory-safe") {
+            pop(n)
+            mstore(0, shl(224, 0x70a08231)) // balanceOf(address(this))
+            mstore(4, address())
+            ok := staticcall(gas(), token, 0, 36, 0, 32)
+            ok := and(ok, gt(returndatasize(), 31))
+            let bal := mload(0)
+            ok := and(ok, gt(bal, 0))
+            if ok {
+                let p := mload(0x40)
+                mstore(p, shl(224, 0xa9059cbb)) // transfer(pair, bal)
+                mstore(add(p, 4), pair)
+                mstore(add(p, 36), bal)
+                ok := call(gas(), token, 0, p, 68, 0, 32)
+                let rds := returndatasize()
+                ok := and(ok, or(iszero(rds), and(gt(rds, 31), eq(mload(0), 1))))
+            }
+        }
     }
 }
