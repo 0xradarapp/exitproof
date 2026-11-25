@@ -9,3 +9,4 @@ broadcast/
 scanner/reports/
 scanner/node_modules/
 scanner/state/
+dist/

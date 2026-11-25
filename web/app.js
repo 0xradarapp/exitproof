@@ -1,4 +1,4 @@
-// ExitProof web app. No build step: plain ES module + ethers v6 UMD (window.ethers) from the pinned CDN script.
+// ExitProof web app. No build step: plain ES module + ethers v6 UMD (window.ethers) from vendor/ethers.min.js.
 // Read-only checks talk JSON-RPC to the configured RPC directly (no wallet). Buying uses the injected wallet.
 import { MODES, ROUTER_ERRORS, STRINGS, MODE_LABEL, fill, factRows, reasonText, errorText, decodeFacts, isLoopbackUrl } from './verdict.js';
 

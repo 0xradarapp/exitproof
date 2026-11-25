@@ -1,7 +1,7 @@
 # ExitProof operations
 
 This page covers two jobs that happen after the contracts are live: running the scanner daemon on a server, and
-publishing the web app to DeWEB/TapeKit. Neither has been run on mainnet yet.
+publishing the web app to DeWEB/TapeKit (scripts/build-deweb.mjs + scripts/publish-deweb.mjs, rehearsed on a fork). Neither has been run on mainnet yet.
 
 ## Scanner daemon on a Linux server
 
@@ -114,40 +114,83 @@ Notes:
 
 ## Publishing web/ to DeWEB / TapeKit
 
-TapeOut's DeWEB stores a site **inside a circuit's ERC-6551 container**, and TapeKit gateways serve it at
-`https://<circuitId>-2-<processorIndex>.tapekit.org/` under the name `<circuitId>.2.<processorIndex>.tape`. Latch did
-this (`2.2.435.tape`, circuit #2 on processor index 435). The flow below comes from reading its
-`scripts/publish-deweb.mjs`, `scripts/preflight-deweb.sh` and `scripts/check-onchain.mjs` in `refs/latch/`. ExitProof
-does not have a publish script yet. This is the plan, and nothing has been sent.
+DeWEB stores the site in our circuit NFT's ERC-6551 container (SiteRegistry). The name `<circuitId>.2.<processorIndex>.tape`
+is activated in DomainBinding, and TapeKit gateways serve it at `https://<circuitId>-2-<processorIndex>.tapekit.org/`. Latch's
+site, for example, is `2.2.435.tape`. The gateway's service worker reads every file from chain and checks its SHA-256.
+It refuses to serve if SiteRegistry or DomainBinding run an implementation other than the pinned ones. Nothing has been
+published on mainnet yet.
 
-### Contracts (X Layer mainnet; confirm on chain before using)
+Contracts (X Layer; `publish-deweb.mjs` checks how they are wired and which implementation each runs):
 
-| | Address | Used for |
-|---|---|---|
-| Opener (ERC-6551 container) | `0x536adD8F30f03b69f6fbF29d425A816A0dC50106` | `isOpened(processor, id)`, `accountOf(processor, id)`, `FEE()`, `open(processor, id)` payable |
-| SiteRegistry | `0xd6EFb7adCc9c83dC4924Ad56f6a8E4e969b9ADB6` | `putFile(container, path, contentType, sha256, data)`, `appendChunk(container, path, expectIndex, data)`, `setFallback(container, path)`, `fileInfo`, `readRange` |
-| DomainBinding | `0x68809Fd2fb343aA57D0aeB7f33Defe477c9666f9` | `monthlyFee()`, `bind(name, container, months)` payable, `isLive(name, container)` |
+| | Address |
+|---|---|
+| Opener | `0x536adD8F30f03b69f6fbF29d425A816A0dC50106` |
+| SiteRegistry | `0xd6EFb7adCc9c83dC4924Ad56f6a8E4e969b9ADB6` |
+| DomainBinding | `0x68809Fd2fb343aA57D0aeB7f33Defe477c9666f9` |
 
-Read on 2026-11-25: `FEE()` = **0.08 OKB**, `monthlyFee()` = **0**, `cpuCount()` = 453.
+On 2026-11-25: `FEE()` = 0.08 OKB, `monthlyFee()` = 0, gas price 0.02 gwei, and no BEM is involved.
 
-### Steps
+**1. Build.** This writes `dist/deweb/` and prints each file, its size, its sha256 and the total. The output has 12 files
+and 673,977 bytes. `index.html` has the CSS, `verdict.js` + `app.js` and the mainnet config inlined, and its CSP is
+hash-based. `vendor/ethers.min.js` is ethers 6.13.4, byte-identical to the npm tarball (sha384 checked). The 8 woff2
+fonts and the two license files are also in the output. The build fails on any off-chain `src`/`href`/`url()` (TapeKit's
+"100% on-chain" rule), on any unresolved or absolute reference, and on a loopback RPC. The config comes from
+`deployments/xlayer.json` when that file exists. Otherwise the page shows its "mainnet deployment pending" state, so
+**rebuild after `deploy.mjs`**.
 
-1. **Build one self-contained HTML file.** TapeKit's "100% on-chain" rule rejects any off-chain URL in `src`/`href`/`srcset`, CSS `url()` or `@import`, and meta refresh (see `refs/latch/scripts/check-onchain.mjs`). For ExitProof that means:
-   - bundle ethers into the page instead of loading it from cdnjs, and inline `app.js`, `verdict.js` and `style.css`;
-   - inline the Barlow woff2 files as `data:` URIs (latin + latin-ext, about 155 KB as base64), and inline `config.json` with only the `xlayer` network;
-   - update the CSP meta tag: inline scripts need a hash or `'unsafe-inline'`, and `connect-src` must list the RPCs the page uses. Latch kept to TapeKit's default X Layer nodes;
-   - check that no `127.0.0.1` or `localhost` string is left in the file, and check the file with the static rule.
-2. **Find the name.** Look up the processor's index *i* in the TapeOut factory (`cpuAt(i) == processor`). The name is `<circuitId>.2.<i>.tape`. If our processor were created right after block 76,861,306 it would get index 453, but read it from chain.
-3. **Holder check:** `processor.ownerOf(circuitId)` must be the publishing wallet. That is the deployer, which holds the circuit NFT after `tapeout.mjs`.
-4. **Open the container,** once: `open(processor, circuitId)` with `value = FEE()`. The container address is `accountOf(processor, circuitId)`.
-5. **Upload** in 24,000-byte chunks: `putFile(container, "index.html", "text/html; charset=utf-8", sha256(file), chunk0)`, then `appendChunk(container, "index.html", k, chunk_k)` for k = 1… This is resumable, because `fileInfo` gives the stored sha256 and the chunk count.
-6. `setFallback(container, "index.html")`.
-7. `bind(name, container, months)` with `value = monthlyFee() × months` (currently 0).
-8. **Read back** the whole file with `readRange` and compare the sha256. Check `isContainerLive(container)`. Open `https://<id>-2-<i>.tapekit.org/`.
-9. **Rehearse first** on an anvil fork with the same script (`RPC_URL=http://127.0.0.1:8549 SEND=1`), as Latch's `preflight-deweb.sh` does, then dry-run against mainnet to print the exact fees.
+```zsh
+node scripts/build-deweb.mjs
+```
 
-The cost is about 0.08 OKB for the container plus about 0.01 OKB of storage gas for a file of about 650 KB (see
-[COSTS.md](COSTS.md#deweb-optional-see-operationsmd-storage-is-an-estimate)). After publishing, put the `.tape` name and the gateway URL in
-the README judges table.
+**2. Dry run.** This needs `deployments/xlayer.json` from `tapeout.mjs`. It prints the name, the URL, the container, the
+plan and the exact OKB, and sends nothing.
 
-Latch's code is GPL-2.0, and ExitProof is MIT. Write our own publisher from the steps above instead of copying theirs.
+```zsh
+DEPLOYER_KEY="$(k)" node scripts/publish-deweb.mjs
+```
+
+**3. Send.** The script stops at a banner unless `CONFIRM_MAINNET=yes` is set. It runs these steps in order:
+
+1. open the container, paying the on-chain `FEE()`;
+2. check that the wallet can edit the container (the NFT holder is the owner, so no grant is needed);
+3. upload with `putFile`/`appendChunk` in 24,000-byte chunks, assets first and `index.html` last, reading every file
+   back and comparing its SHA-256;
+4. `setFallback("index.html")`;
+5. `bind(name, container, MONTHS)` (MONTHS defaults to 12);
+6. resolve the name the way the TapeKit kernel does.
+
+If it stops, run the same command again. It skips verified files, continues a half-uploaded file at the next chunk, and
+waits for any tx an earlier run left pending.
+
+```zsh
+DEPLOYER_KEY="$(k)" SEND=1 CONFIRM_MAINNET=yes node scripts/publish-deweb.mjs
+```
+
+Progress and every tx are recorded in `deployments/deweb-xlayer.json`. The script ends with
+`DONE https://<id>-2-<index>.tapekit.org/`. Put that URL and the `.tape` name in the README judges table.
+
+**Rehearsal on a fork** (run in a scratch copy of the repo, as `scripts/rehearse.sh` does, so the committed
+`deployments/fork.json` is not touched; anvil account #2):
+
+```zsh
+anvil --fork-url https://xlayerrpc.okx.com --chain-id 196 --port 8573 --silent &
+cast rpc anvil_setBalance 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC 0xDE0B6B3A7640000 --rpc-url http://127.0.0.1:8573
+cast rpc anvil_setStorageAt 0x60e62Efa9405d6873C5deaBD4E6CC91c25363952 "$(cast index address 0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC 5)" "$(cast to-uint256 12000000)" --rpc-url http://127.0.0.1:8573
+export RPC_URL=http://127.0.0.1:8573 DEPLOYER_KEY=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
+SEND=1 node scripts/tapeout.mjs && node scripts/build-deweb.mjs && node scripts/publish-deweb.mjs && SEND=1 node scripts/publish-deweb.mjs
+```
+
+Measured on a fork of block 76,869,339 (2026-11-25):
+
+- 38 txs: open 167,256 gas; 35 upload txs (a full 24,000-byte chunk is 5,366,591 gas, about 224 gas/byte); `setFallback` 114,238; `bind` 185,482.
+- Total: **154,038,564 gas**. At 0.02 gwei that is 0.00308 OKB, so the whole publish costs **≈0.0831 OKB** (0.08 open fee + gas) and 0 BEM.
+- The name came out as `1.2.453.tape` → `https://1-2-453.tapekit.org/` (processor index 453 on that fork).
+- A run killed during the ethers upload resumed at chunk 7/22. A third run sent nothing.
+
+On mainnet the processor index is whatever `cpuAt` gives for our processor at tape-out time.
+
+**Limits.** An *update* to a file that is already published is not atomic. From its `putFile` until its last chunk, the
+gateway refuses that file (its hash does not match), so a re-publish of `index.html` takes the page down for about 3
+blocks. `MONTHS` can be at most 120 (`MAX_AHEAD`). A separate upload key would need
+`setOperator(container, uploader, ttl ≤ 30 days)` from the holder. The script always publishes from the holder, so it
+never sends that.
