@@ -1,6 +1,7 @@
 // Deploy RiskRegistry + ExitProofRouter on a LOCAL anvil fork of X Layer, wired to the processor/circuit that
 // scripts/tapeout.mjs taped out (read from deployments/<network>.json), and merge the addresses into that file.
-// Mainnet deployment is Task 7's scripts/deploy.mjs; this script refuses non-local RPCs.
+// Superseded: scripts/deploy.mjs is the canonical deployer (fork and mainnet, same code path). Kept for reference;
+// this script refuses non-local RPCs.
 //
 //   forge build && RPC_URL=http://127.0.0.1:8549 DEPLOYER_KEY=0x… node scripts/deploy-fork.mjs
 //
