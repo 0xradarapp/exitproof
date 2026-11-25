@@ -44,7 +44,7 @@
   "demoBuy": {
     "token": "0xE7C2a73131dd48D8AC46dCD7Ab80C8cbeE5b410A",
     "buyer": "0x90F79bf6EB2c4f870365E785982E1f101E93b906",
-    "tx": "0x9cb1998934d6aa89fc94c8af539fedfceb5ce285da82e0992fb49b92720c0375",
+    "tx": "0x1b3ce520c4813f99d70e47b303e8d0cba7b19f7c17c8cda6ce6fe5932aea68cb",
     "block": "76861350",
     "gas": "755825",
     "out": "4933351528682886815808"

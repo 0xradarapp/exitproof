@@ -67,7 +67,7 @@ function parseArgs(argv) {
   if (!(o.mode in MODES)) die('--mode must be strict, balanced or permissive');
   try { o.value = parseEther(o.amount); } catch { die('--amount is not a number'); }
   if (o.value <= 0n) die('--amount must be above 0');
-  if (!Number.isInteger(o.slippageBps) || o.slippageBps < 0 || o.slippageBps > 5000) die('--slippage-bps must be 0..5000');
+  if (!Number.isInteger(o.slippageBps) || o.slippageBps < 0 || o.slippageBps > 500) die('--slippage-bps must be 0..500 (max 5%)');
   return o;
 }
 
@@ -186,11 +186,25 @@ async function prepareBuy(o, ctx, address) {
     console.log(JSON.stringify({ sent: false, why: 'the check does not allow this buy', check: v }, null, 2));
     process.exit(1);
   }
-  // floor only: the circuit already bounds the tax; this guards against price moves between check and inclusion
-  const taxAllow = [500n, 1500n, 5000n, 9999n][v.decoded.buyTax.bucket];
-  let minOut = BigInt(v.buyOut) * (10_000n - BigInt(o.slippageBps)) / 10_000n * (10_000n - taxAllow) / 10_000n;
-  if (minOut === 0n) minOut = 1n;
+  // minOut: ExitProofRouter._settle compares minOut to `out` = the balance increase of `to` AFTER the router forwards
+  // the tokens (fee-on-transfer aware). buyETH returns exactly that, so simulate buyETH itself (minOut = 1) and take
+  // the user's slippage (default 1%, max 5%) off the simulated delivery. No extra tax discount.
   const deadline = (await pub.getBlock()).timestamp + 600n;
+  const sim = [net.factory, o.token, 1n, MODES[o.mode], address, deadline];
+  let delivered;
+  try {
+    ({ result: delivered } = await pub.simulateContract({
+      address: net.router, abi: ROUTER_ABI, functionName: 'buyETH', args: sim, value: o.value, account: address, gas: CALL_GAS,
+      stateOverride: [{ address, balance: o.value + parseEther('1') }],
+    }));
+  } catch (e) {
+    if (isNetworkError(e)) die(`could not reach ${ctx.rpc} (connection problem, not a verdict)`, 3);
+    const r = decodeRevert(revertData(e));
+    console.log(JSON.stringify({ sent: false, why: r.name ?? 'EmptyRevert', reasonText: r.name === 'Blocked' ? reasonText(r.args[0], o.mode) : errorText(r.name), check: v }, null, 2));
+    process.exit(1);
+  }
+  let minOut = delivered * (10_000n - BigInt(o.slippageBps)) / 10_000n;
+  if (minOut === 0n) minOut = 1n;
   const args = [net.factory, o.token, minOut, MODES[o.mode], address, deadline];
   return { v, args, data: encodeFunctionData({ abi: ROUTER_ABI, functionName: 'buyETH', args }) };
 }
@@ -231,7 +245,8 @@ async function txFor(o, ctx) {
 async function buy(o, ctx) {
   const key = process.env.EXITPROOF_KEY;
   if (!key) die('buy needs EXITPROOF_KEY in the environment');
-  const account = privateKeyToAccount(key);
+  let account;
+  try { account = privateKeyToAccount(key); } catch { die('invalid EXITPROOF_KEY'); }
   const { net, pub, chain, rpc } = ctx;
   const { v, args } = await prepareBuy(o, ctx, account.address);
   const gas = await gasFor(o, ctx, account, args);
@@ -240,6 +255,8 @@ async function buy(o, ctx) {
     console.log(JSON.stringify({ sent: false, dryRun: true, note: 'add --yes to send', check: v, tx }, null, 2));
     return;
   }
+  const live = await pub.getChainId();
+  if (live !== net.chainId) die(`RPC is chain ${live}, config says ${net.chainId}: refusing to sign`);
   const w = createWalletClient({ chain, transport: http(rpc), account });
   const hash = await w.writeContract({ address: net.router, abi: ROUTER_ABI, functionName: 'buyETH', args, value: o.value, gas });
   const rc = await pub.waitForTransactionReceipt({ hash });

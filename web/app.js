@@ -89,11 +89,11 @@ async function inspect(token, mode, amount) {
   const tx = { from: PROBE_FROM, to: n.router, data, value: ethers.toQuantity(amount), gas: CALL_GAS };
   let r = await rpc('eth_call', [tx, 'latest', { [PROBE_FROM]: { balance: ethers.toQuantity(amount + ethers.parseEther('1')) } }]);
   // node without state overrides: retry from the connected wallet (needs the OKB) if there is one
-  if (r.error && !r.error.data && /override|param/i.test(r.error.message || '') && state.account) {
+  if (r.error && !walletRevertData(r.error) && /override|param/i.test(r.error.message || '') && state.account) {
     r = await rpc('eth_call', [{ ...tx, from: state.account }, 'latest']);
   }
   if (!r.error) return { kind: 'error', name: 'NoRevert' };
-  return decodeRevert(r.error.data);
+  return decodeRevert(walletRevertData(r.error));
 }
 
 async function runCheck(ev) {
@@ -196,7 +196,8 @@ function render() {
           <span class="step-text">${esc(s.text)}</span></li>`).join('')}
       </ol>
     </section>`;
-  $('#buybox').hidden = !allow;
+  $('#buybox').hidden = !allow || !canBuy();
+  if (allow && !canBuy()) out.insertAdjacentHTML('beforeend', `<p class="notice buy-off">${esc(isLoopback(net().rpc) ? L.buyOffFork : L.buyDisabled)}</p>`);
   if (allow) $('#buy').textContent = fill(L.buy, { amount: ethers.formatEther(r.amount) });
   $('#buy-status').textContent = '';
 }
@@ -290,6 +291,17 @@ function renderFeed(items) {
 }
 
 // ------------------------------------------------------------------ wallet + buy
+/** Buying is allowed only where config says so: never by default on a loopback fork RPC, where a wallet on real
+ *  X Layer (same chain id 196) would send OKB to an address that only exists on the fork. */
+const isLoopback = (url) => { try { return /^(127\.|localhost$|\[::1\]$|0\.0\.0\.0$)/.test(new URL(url).hostname); } catch { return false; } };
+const canBuy = () => Boolean(net().router) && net().buyEnabled === true;
+
+function walletReset() {
+  state.account = null;
+  $('#connect').textContent = S().connect;
+  $('#buy-status').textContent = '';
+}
+
 async function connect() {
   const eth = window.ethereum;
   if (!eth) { $('#buy-status').textContent = S().noWallet; $('#buy-status').className = 'buy-status bad'; return null; }
@@ -304,25 +316,49 @@ async function connect() {
   return state.account;
 }
 
+/** Exact amount the wallet would receive: eth_call of buyETH itself (minOut = 1) on the configured RPC.
+ *  buyETH returns `out` = the balance increase of `to` AFTER the router forwards the tokens (ExitProofRouter._settle
+ *  compares minOut to exactly this post-forward amount), so a forward-hop tax is already inside it. */
+async function simulateBuy(n, r, account, deadline) {
+  const data = ROUTER.encodeFunctionData('buyETH', [n.factory, r.token, 1n, MODES[r.mode], account, deadline]);
+  const res = await rpc('eth_call', [{ from: account, to: n.router, data, value: ethers.toQuantity(r.amount), gas: CALL_GAS }, 'latest',
+    { [account]: { balance: ethers.toQuantity(r.amount + ethers.parseEther('1')) } }]);
+  if (res.error) return { revert: decodeRevert(walletRevertData(res.error)) };
+  return { out: ROUTER.decodeFunctionResult('buyETH', res.result)[0] };
+}
+
 async function buy() {
   const L = S();
   const st = $('#buy-status');
   const r = state.last;
   st.className = 'buy-status';
+  const fail = (text) => { st.className = 'buy-status bad'; st.textContent = text; };
+  if (!canBuy()) return fail(L.buyDisabled);
   if (!r || r.kind !== 'report' || !r.allow || r.net !== state.netKey) { st.textContent = L.buyNeedsCheck; return; }
   try {
     const account = state.account ?? (await connect());
     if (!account) return;
     st.textContent = L.buying;
     const n = net();
-    const slip = BigInt($('#slip').value);
-    const taxAllow = [500n, 1500n, 5000n, 9999n][decodeFacts(r.facts).buyTax];
-    let minOut = r.buyOut * (10_000n - slip) / 10_000n * (10_000n - taxAllow) / 10_000n;
-    if (minOut === 0n) minOut = 1n;
+    const provider = new ethers.BrowserProvider(window.ethereum);
+    // every send: the wallet must be on the configured chain AND see the router's code on ITS network
+    const walletChain = Number(await window.ethereum.request({ method: 'eth_chainId' }));
+    if (walletChain !== n.chainId) return fail(L.wrongChain);
+    const code = await provider.getCode(n.router);
+    if (!code || code === '0x') return fail(L.routerMissing);
+
     const head = await rpcResult('eth_getBlockByNumber', ['latest', false]);
     const deadline = BigInt(head.timestamp) + 600n;
+    const sim = await simulateBuy(n, r, account, deadline);
+    if (sim.revert) {
+      const d = sim.revert;
+      return fail(d.name === 'Blocked' ? fill(L.buyBlocked, { reason: reasonText(d.args[0], r.mode, state.lang) }) : errorText(d.name, state.lang));
+    }
+    // minOut = simulated delivered amount minus the user's slippage (default 1%, max 5%); no extra tax discount
+    const slip = BigInt(Math.min(500, Math.max(0, Number($('#slip').value) || 100)));
+    let minOut = sim.out * (10_000n - slip) / 10_000n;
+    if (minOut === 0n) minOut = 1n;
     const data = ROUTER.encodeFunctionData('buyETH', [n.factory, r.token, minOut, MODES[r.mode], account, deadline]);
-    const provider = new ethers.BrowserProvider(window.ethereum);
     const signer = await provider.getSigner();
     const tx = { from: account, to: n.router, data, value: r.amount };
     let gasLimit;
@@ -330,10 +366,12 @@ async function buy() {
       gasLimit = (await provider.estimateGas(tx)) * 12n / 10n;
     } catch (e) {
       const d = decodeRevert(walletRevertData(e));
-      if (d.name === 'Blocked') { st.className = 'buy-status bad'; st.textContent = fill(L.buyBlocked, { reason: reasonText(d.args[0], r.mode, state.lang) }); return; }
-      if (d.name) { st.className = 'buy-status bad'; st.textContent = errorText(d.name, state.lang); return; }
+      if (d.name === 'Blocked') return fail(fill(L.buyBlocked, { reason: reasonText(d.args[0], r.mode, state.lang) }));
+      if (d.name) return fail(errorText(d.name, state.lang));
       gasLimit = FALLBACK_GAS; // no reason given: send with room for the probe; the router still reverts on deny
     }
+    // re-check right before signing: the user may have switched networks while we were estimating
+    if (Number(await window.ethereum.request({ method: 'eth_chainId' })) !== n.chainId) return fail(L.wrongChain);
     const sent = await signer.sendTransaction({ ...tx, gasLimit });
     const rc = await sent.wait();
     const ev = rc.logs.map((l) => { try { return ROUTER.parseLog(l); } catch { return null; } }).find((x) => x?.name === 'Checked');
@@ -343,9 +381,8 @@ async function buy() {
     loadFeed();
   } catch (e) {
     const d = decodeRevert(walletRevertData(e));
-    st.className = 'buy-status bad';
-    st.textContent = d.name === 'Blocked' ? fill(L.buyBlocked, { reason: reasonText(d.args[0], r.mode, state.lang) })
-      : d.name ? errorText(d.name, state.lang) : (e.shortMessage || e.message);
+    fail(d.name === 'Blocked' ? fill(L.buyBlocked, { reason: reasonText(d.args[0], r.mode, state.lang) })
+      : d.name ? errorText(d.name, state.lang) : (e.shortMessage || e.message));
   }
 }
 
@@ -357,7 +394,8 @@ async function switchNet(key) {
   const live = Boolean(n.router);
   $('#pending').hidden = live;
   $('#check').disabled = !live;
-  $('#connect').hidden = !live;
+  $('#connect').hidden = !canBuy();
+  walletReset();
   state.last = null;
   state.feedItems = null;
   render();
@@ -399,6 +437,11 @@ async function boot() {
   $('#form').addEventListener('submit', runCheck);
   $('#connect').addEventListener('click', () => connect().catch((e) => { $('#buy-status').textContent = e.shortMessage || e.message; }));
   $('#buy').addEventListener('click', buy);
+  if (window.ethereum?.on) {
+    // a different account or chain invalidates the connection and any half-finished buy
+    window.ethereum.on('accountsChanged', walletReset);
+    window.ethereum.on('chainChanged', walletReset);
+  }
   const q = new URLSearchParams(location.search);
   if (q.get('token')) $('#token').value = q.get('token');
   if (q.get('mode') && q.get('mode') in MODES) { state.mode = q.get('mode'); document.querySelector(`input[name="mode"][value="${state.mode}"]`).checked = true; }

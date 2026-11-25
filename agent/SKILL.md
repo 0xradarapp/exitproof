@@ -76,7 +76,7 @@ node cli/exitproof.mjs tx <token> --wallet <wallet> --mode balanced --amount <ok
 This re-runs the check for `<wallet>`. If the check does not allow, it prints `why` and exits `1` with **no transaction**. If it allows, it prints a `transactions` array with one entry:
 - `description`: one line in plain words
 - `to`: the ExitProofRouter
-- `inputData`: `buyETH(factory, token, minOut, mode, wallet, deadline)`; `minOut` already includes slippage (`--slippage-bps`, default 100) and the measured tax bucket
+- `inputData`: `buyETH(factory, token, minOut, mode, wallet, deadline)`; `minOut` is the amount a simulation of this exact buyETH delivers to `<wallet>` (after any transfer tax), minus slippage (`--slippage-bps`, default 100 = 1%, max 500)
 - `amt`: the OKB amount in wei
 - `chain`: `196`
 - `onchainos`: the ready command
