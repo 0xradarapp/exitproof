@@ -21,7 +21,7 @@ import {
   parseAbi, parseEther, formatEther, formatUnits, isAddress, getAddress, keccak256,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
-import { MODES, ROUTER_ERRORS, decodeFacts, reasonText, errorText, TAX_RANGE } from '../web/verdict.js';
+import { MODES, ROUTER_ERRORS, decodeFacts, reasonText, errorText, TAX_RANGE, isLoopbackUrl } from '../web/verdict.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CONFIG = JSON.parse(fs.readFileSync(path.join(ROOT, 'web', 'config.json'), 'utf8'));
@@ -229,10 +229,6 @@ async function gasFor(o, ctx, account, args) {
   }
 }
 
-const isLoopback = (url) => {
-  try { return /^(127\.|localhost$|\[::1\]$)/.test(new URL(url).hostname); } catch { return false; }
-};
-
 async function txFor(o, ctx) {
   // `tx` hands a ready `onchainos … --chain 196` command to an agent wallet on REAL X Layer: never for a network whose
   // router only exists on a local fork (same chain id 196, so the wallet could not tell and the OKB would be lost)
@@ -257,7 +253,7 @@ async function buy(o, ctx) {
   try { account = privateKeyToAccount(key); } catch { die('invalid EXITPROOF_KEY'); }
   const { net, pub, chain, rpc } = ctx;
   // the key signs against ctx.rpc itself, so a fork router is safe only when that RPC really is the local fork
-  if (net.buyEnabled !== true && !isLoopback(rpc)) die(`buy is disabled for network "${o.network}" unless its RPC is loopback (got ${rpc})`);
+  if (net.buyEnabled !== true && !isLoopbackUrl(rpc)) die(`buy is disabled for network "${o.network}" unless its RPC is loopback (got ${rpc})`);
   const { v, args } = await prepareBuy(o, ctx, account.address);
   const gas = await gasFor(o, ctx, account, args);
   const tx = { to: net.router, function: 'buyETH', args: args.map(String), valueOKB: o.amount, gas: gas.toString(), from: account.address };

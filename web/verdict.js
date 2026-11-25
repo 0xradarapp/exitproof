@@ -1,6 +1,14 @@
 // ExitProof shared verdict logic: fact decoding, reason codes, router error explanations, EN/TR strings.
 // Plain ES module with no dependencies, so the browser (web/app.js) and Node (cli/exitproof.mjs) both import it.
 
+/** True only for an exact loopback hostname: 127.a.b.c, localhost or [::1] (URL keeps the brackets for IPv6). */
+export function isLoopbackHost(host) {
+  return /^(127(\.\d{1,3}){3}|localhost|\[::1\])$/.test(String(host).toLowerCase());
+}
+export function isLoopbackUrl(url) {
+  try { return isLoopbackHost(new URL(url).hostname); } catch { return false; }
+}
+
 export const MODES = { strict: 0, balanced: 1, permissive: 2 };
 export const MODE_NAMES = ['strict', 'balanced', 'permissive', 'strict'];
 
@@ -97,7 +105,7 @@ export const STRINGS = {
     routerMissing: 'Your wallet\'s network has no ExitProof router at this address. Nothing was sent.',
     buyDisabled: 'Buying is switched off for this network.',
     buyOffFork: 'Buying is off on the local fork: a wallet on real X Layer would send OKB to an address that only exists on the fork. The check above is still exact.',
-    pending: 'Mainnet deployment pending. Checks and buys work on the local fork for now.',
+    pending: 'Mainnet deployment pending. Switch the network to Local fork to try checks; buying there is off in the browser.',
     feedTitle: 'On chain right now',
     feedBody: 'Allowed buys through ExitProof and fresh scanner verdicts. Blocked buys revert, so they never show up here.',
     feedEmpty: 'Nothing in the last {n} blocks.',
@@ -213,7 +221,7 @@ export const STRINGS = {
     routerMissing: 'Cüzdanının ağında bu adreste ExitProof router yok. Hiçbir şey gönderilmedi.',
     buyDisabled: 'Bu ağda alım kapalı.',
     buyOffFork: 'Yerel fork üzerinde alım kapalı: gerçek X Layer\'daki bir cüzdan OKB\'yi sadece fork\'ta var olan bir adrese gönderirdi. Yukarıdaki kontrol yine de birebir doğru.',
-    pending: 'Ana ağ dağıtımı bekleniyor. Şimdilik kontroller ve alımlar yerel fork üzerinde çalışıyor.',
+    pending: 'Ana ağ dağıtımı bekleniyor. Kontrolleri denemek için ağı Yerel fork yap; orada tarayıcıdan alım kapalı.',
     feedTitle: 'Şu an zincirde',
     feedBody: 'ExitProof üzerinden izin verilen alımlar ve yeni tarayıcı kararları. Engellenen alımlar geri döndüğü için burada görünmez.',
     feedEmpty: 'Son {n} blokta bir şey yok.',

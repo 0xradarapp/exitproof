@@ -1,6 +1,6 @@
 // ExitProof web app. No build step: plain ES module + ethers v6 UMD (window.ethers) from the pinned CDN script.
 // Read-only checks talk JSON-RPC to the configured RPC directly (no wallet). Buying uses the injected wallet.
-import { MODES, ROUTER_ERRORS, STRINGS, MODE_LABEL, fill, factRows, reasonText, errorText, decodeFacts } from './verdict.js';
+import { MODES, ROUTER_ERRORS, STRINGS, MODE_LABEL, fill, factRows, reasonText, errorText, decodeFacts, isLoopbackUrl } from './verdict.js';
 
 const { ethers } = window;
 const $ = (s) => document.querySelector(s);
@@ -197,7 +197,7 @@ function render() {
       </ol>
     </section>`;
   $('#buybox').hidden = !allow || !canBuy();
-  if (allow && !canBuy()) out.insertAdjacentHTML('beforeend', `<p class="notice buy-off">${esc(isLoopback(net().rpc) ? L.buyOffFork : L.buyDisabled)}</p>`);
+  if (allow && !canBuy()) out.insertAdjacentHTML('beforeend', `<p class="notice buy-off">${esc(isLoopbackUrl(net().rpc) ? L.buyOffFork : L.buyDisabled)}</p>`);
   if (allow) $('#buy').textContent = fill(L.buy, { amount: ethers.formatEther(r.amount) });
   $('#buy-status').textContent = '';
 }
@@ -293,7 +293,6 @@ function renderFeed(items) {
 // ------------------------------------------------------------------ wallet + buy
 /** Buying is allowed only where config says so: never by default on a loopback fork RPC, where a wallet on real
  *  X Layer (same chain id 196) would send OKB to an address that only exists on the fork. */
-const isLoopback = (url) => { try { return /^(127\.|localhost$|\[::1\]$|0\.0\.0\.0$)/.test(new URL(url).hostname); } catch { return false; } };
 const canBuy = () => Boolean(net().router) && net().buyEnabled === true;
 
 function walletReset() {
