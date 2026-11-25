@@ -1,12 +1,12 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createWalletClient, http, keccak256 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { foundry } from 'viem/chains';
-import { runOnce, loadState } from '../src/daemon.mjs';
+import { runOnce, loadState, MAX_RETRIES } from '../src/daemon.mjs';
 import { attest, reportURI, REGISTRY_ABI } from '../src/attest.mjs';
 import { scan } from '../src/scan.mjs';
 import {
@@ -44,7 +44,7 @@ test('attest writes the scan flags to RiskRegistry', async () => {
   assert.equal(rc.status, 'success');
   const f = await flagsOf(r.codehash);
   assert.deepEqual(f, {
-    scanned: true, privileged: true, upgradeable: false, dangerSetter: true, ownerCanTrap: false, scannerVersion: 2,
+    scanned: true, privileged: true, upgradeable: false, dangerSetter: true, ownerCanTrap: false, scannerVersion: 3,
   });
 });
 
@@ -89,7 +89,7 @@ test('daemon: windows PairCreated logs, scans non-base side, attests, persists c
   assert.equal(fp.upgradeable, true);
   const fc = await flagsOf(keccak256(await env.pub.getCode({ address: clean.address })));
   assert.deepEqual(fc, {
-    scanned: true, privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 2,
+    scanned: true, privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 3,
   });
   const rep = JSON.parse(readFileSync(path.join(reportsDir, `${bombHash}.json`), 'utf8'));
   assert.equal(rep.codehash, bombHash);
@@ -204,5 +204,23 @@ test('M2: a known codehash is re-attested when any flag goes false -> true', asy
   const f = await flagsOf(ch);
   assert.equal(f.upgradeable, true);
   assert.equal(f.privileged, false);
+});
+
+test('simulate keeps failing: after MAX_RETRIES the token is attested ownerCanTrap=true (simulate-gave-up)', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'exitproof-daemon-'));
+  const t = await deployScannerFixture(env, 'MappingAdminToken', [SUPPLY]);
+  const pair = await listToken(env, infra, t);
+  const head = await env.pub.getBlockNumber({ cacheTime: 0 });
+  writeFileSync(path.join(dir, 's.json'), JSON.stringify({
+    cursor: (head + 1n).toString(),
+    retry: [{ token: t.address, pair: pair.address, error: 'simulate: x', attempts: MAX_RETRIES - 1 }],
+  }));
+  const res = await runOnce(runOpts(dir, head + 1n, { forkRpc: 'http://127.0.0.1:9' }));
+  assert.equal(res.attested.length, 1);
+  const f = await flagsOf(await codehashOf(t.address));
+  assert.equal(f.ownerCanTrap, true);
+  assert.deepEqual(JSON.parse(readFileSync(path.join(dir, 's.json'), 'utf8')).retry, []);
+  const rep = JSON.parse(readFileSync(path.join(dir, 'r', `${await codehashOf(t.address)}.json`), 'utf8'));
+  assert.match(rep.instances[0].evidence.simulation.error, /^simulate-gave-up/);
 });
 

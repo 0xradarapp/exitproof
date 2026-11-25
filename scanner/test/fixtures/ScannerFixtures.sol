@@ -138,3 +138,136 @@ contract HolderRevertToken {
         return true;
     }
 }
+
+/// @notice Mapping-based admin: `require(_ops[msg.sender])` (no owner getter, no SLOAD==CALLER compare).
+contract MappingAdminToken is MiniERC20 {
+    mapping(address => bool) private _ops;
+    uint256 private _cfg;
+
+    constructor(uint256 supply) MiniERC20(supply) {
+        _ops[msg.sender] = true;
+    }
+
+    function configure(uint256 v) external {
+        require(_ops[msg.sender], "op");
+        _cfg = v;
+    }
+
+    function _transfer(address from, address to, uint256 a) internal override {
+        require(a >= _cfg, "cfg");
+        super._transfer(from, to, a);
+    }
+}
+
+/// @notice Immutable admin: `msg.sender == admin` compiles to CALLER vs a PUSH32 literal.
+contract ImmutableAdminToken is MiniERC20 {
+    address private immutable admin;
+    bool private _frozen;
+
+    constructor(uint256 supply) MiniERC20(supply) {
+        admin = msg.sender;
+    }
+
+    function configure(uint256 v) external {
+        require(msg.sender == admin, "admin");
+        _frozen = v != 0;
+    }
+
+    function _transfer(address from, address to, uint256 a) internal override {
+        require(!_frozen || from == admin, "frozen");
+        super._transfer(from, to, a);
+    }
+}
+
+/// @notice Sells are blocked whenever 0xBEEF holds any native balance: external state read without a CALL.
+contract BalanceOracleToken is MiniERC20 {
+    constructor(uint256 supply) MiniERC20(supply) {}
+
+    function _transfer(address from, address to, uint256 a) internal override {
+        require(address(uint160(0xBEEF)).balance == 0, "gate");
+        super._transfer(from, to, a);
+    }
+}
+
+/// @notice Standard ERC-20 + EIP-2612 permit + EIP-5267, OZ-shaped external surface. Must not be privileged.
+contract PermitToken {
+    string public name = "Permit";
+    string public symbol = "PMT";
+    uint8 public constant decimals = 18;
+    uint256 public totalSupply;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    mapping(address => uint256) public nonces;
+
+    bytes32 private constant PERMIT_TYPEHASH =
+        keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+    bytes32 private constant DOMAIN_TYPEHASH =
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    constructor(uint256 supply) {
+        totalSupply = supply;
+        balanceOf[msg.sender] = supply;
+        emit Transfer(address(0), msg.sender, supply);
+    }
+
+    function DOMAIN_SEPARATOR() public view returns (bytes32) {
+        return keccak256(abi.encode(DOMAIN_TYPEHASH, keccak256(bytes(name)), keccak256("1"), block.chainid, address(this)));
+    }
+
+    function eip712Domain()
+        external
+        view
+        returns (bytes1, string memory, string memory, uint256, address, bytes32, uint256[] memory)
+    {
+        return (hex"0f", name, "1", block.chainid, address(this), bytes32(0), new uint256[](0));
+    }
+
+    function _approve(address o, address s, uint256 a) internal {
+        allowance[o][s] = a;
+        emit Approval(o, s, a);
+    }
+
+    function approve(address s, uint256 a) external returns (bool) {
+        _approve(msg.sender, s, a);
+        return true;
+    }
+
+    function increaseAllowance(address s, uint256 a) external returns (bool) {
+        _approve(msg.sender, s, allowance[msg.sender][s] + a);
+        return true;
+    }
+
+    function decreaseAllowance(address s, uint256 a) external returns (bool) {
+        _approve(msg.sender, s, allowance[msg.sender][s] - a);
+        return true;
+    }
+
+    function permit(address o, address s, uint256 v, uint256 deadline, uint8 pv, bytes32 r, bytes32 ps) external {
+        require(block.timestamp <= deadline, "expired");
+        bytes32 h = keccak256(abi.encode(PERMIT_TYPEHASH, o, s, v, nonces[o]++, deadline));
+        address signer = ecrecover(keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), h)), pv, r, ps);
+        require(signer != address(0) && signer == o, "sig");
+        _approve(o, s, v);
+    }
+
+    function _move(address f, address t, uint256 a) internal {
+        balanceOf[f] -= a;
+        balanceOf[t] += a;
+        emit Transfer(f, t, a);
+    }
+
+    function transfer(address t, uint256 a) external returns (bool) {
+        _move(msg.sender, t, a);
+        return true;
+    }
+
+    function transferFrom(address f, address t, uint256 a) external returns (bool) {
+        uint256 al = allowance[f][msg.sender];
+        if (al != type(uint256).max) _approve(f, msg.sender, al - a);
+        _move(f, t, a);
+        return true;
+    }
+}

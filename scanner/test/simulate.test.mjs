@@ -157,3 +157,32 @@ test('balanceOf(holder) reverting does not throw out of simulate (pre-baseline: 
   assert.equal(r.evidence.position, 'unreadable');
 });
 
+test('a failing final evm_revert does not replace the trap result', async () => {
+  const { token, pair } = await setup('TimeBombToken');
+  let initialId = null;
+  const srv = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; });
+    req.on('end', async () => {
+      const m = JSON.parse(body);
+      res.setHeader('content-type', 'application/json');
+      if (m.method === 'evm_revert' && m.params[0] === initialId) {
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: m.id, error: { code: -32000, message: 'injected revert fault' } }));
+        return;
+      }
+      const r = await (await fetch(env.rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body })).text();
+      if (m.method === 'evm_snapshot' && initialId === null) initialId = JSON.parse(r).result;
+      res.end(r);
+    });
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const r = await simulate(`http://127.0.0.1:${srv.address().port}`, token.address, pair.address);
+    assert.equal(r.ownerCanTrap, true);
+    assert.match(r.evidence.restoreError, /evm_revert/);
+  } finally {
+    srv.close();
+    await env.pub.request({ method: 'evm_revert', params: [initialId] }); // clean up the node ourselves
+  }
+});
+

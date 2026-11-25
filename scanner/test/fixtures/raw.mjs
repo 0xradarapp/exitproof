@@ -10,13 +10,34 @@ const ERC20_SELECTORS = ['a9059cbb', '23b872dd', '095ea7b3', '70a08231']; // tra
 export const XOR_DISPATCHER = `0x5f3560e01c${ERC20_SELECTORS.map((s) => `8063${s}1815603457`).join('')}5f5ffd5b00`;
 
 /** Standard solc-style EQ dispatcher for the four ERC-20 selectors plus `extra` (hex without 0x), all jumping to a STOP. */
-export function eqDispatcher(extra = [], tail = '') {
+export function eqDispatcher(extra = [], tail = '', noMatch = '5f5ffd') {
   const sels = [...ERC20_SELECTORS, ...extra];
   const body = sels.map((s) => `8063${s}1461ZZZZ57`).join('');
   const prologue = '5f3560e01c';
-  const dest = (prologue.length + body.length) / 2 + 3 + tail.length / 2; // after `5f5ffd` + tail
+  const dest = (prologue.length + body.length + noMatch.length + tail.length) / 2;
   const d = dest.toString(16).padStart(4, '0');
-  return `0x${prologue}${body.replaceAll('ZZZZ', d)}5f5ffd${tail}5b00`;
+  return `0x${prologue}${body.replaceAll('ZZZZ', d)}${noMatch}${tail}5b00`;
+}
+
+/** XOR dispatcher followed by a never-jumped JUMPDEST decoy block holding `PUSH4 sel DUP1 EQ POP` x4. */
+export const DECOY_XOR = `${XOR_DISPATCHER}5b${ERC20_SELECTORS.map((s) => `63${s}801450`).join('')}00`;
+
+/**
+ * solc-style binary split: `DUP1 PUSH4 pivot GT PUSH2 upper JUMPI`, lower EQ cases, revert, upper JUMPDEST, upper
+ * EQ cases, revert, function body JUMPDEST STOP.
+ */
+export function splitDispatcher() {
+  const sorted = [...ERC20_SELECTORS].sort();
+  const [lo, hi] = [sorted.slice(0, 2), sorted.slice(2)];
+  const pro = '5f3560e01c';
+  const split = `8063${lo[1]}1161UUUU57`; // 11 bytes
+  const cases = (xs) => xs.map((s) => `8063${s}1461DDDD57`).join('');
+  const lower = `${cases(lo)}5f5ffd`;
+  const upperStart = (pro.length + split.length + lower.length) / 2;
+  const upper = `5b${cases(hi)}5f5ffd`;
+  const dest = upperStart + upper.length / 2;
+  const hex = (n) => n.toString(16).padStart(4, '0');
+  return `0x${pro}${split.replace('UUUU', hex(upperStart))}${lower}${upper}`.replaceAll('DDDD', hex(dest)) + '5b00';
 }
 
 /** EIP-1167 minimal proxy runtime pointing at `impl`. */

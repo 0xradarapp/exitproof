@@ -25,7 +25,7 @@ test('cli scan prints the scan JSON', async () => {
   const r = JSON.parse(stdout);
   assert.equal(r.dangerSetter, true);
   assert.equal(r.privileged, true);
-  assert.equal(r.scannerVersion, 2);
+  assert.equal(r.scannerVersion, 3);
 });
 
 test('cli without command exits 2 with usage', async () => {
@@ -39,7 +39,7 @@ test('cli attest refuses to downgrade a registry flag unless --force', async () 
   const codehash = keccak256(await env.pub.getCode({ address: t.address }));
   const w = createWalletClient({ chain: foundry, transport: http(env.rpc), account: privateKeyToAccount(DEV_KEY) });
   const hash = await attest(w, registry.address, {
-    codehash, privileged: true, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 2,
+    codehash, privileged: true, upgradeable: false, dangerSetter: false, ownerCanTrap: false, scannerVersion: 3,
   });
   await env.pub.waitForTransactionReceipt({ hash });
   const cliEnv = {

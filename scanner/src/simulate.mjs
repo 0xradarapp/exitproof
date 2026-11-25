@@ -140,7 +140,7 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
   };
 
   const initial = await snapshot();
-  try {
+  const run = async () => {
     const s = await scan(client, token, { blockNumber: await client.getBlockNumber({ cacheTime: 0 }) });
     const setters = s.evidence.dangerous;
 
@@ -285,8 +285,25 @@ export async function simulate(forkRpc, token, pairAddr, opts = {}) {
       return { ownerCanTrap: true, evidence };
     }
     return { ownerCanTrap: trappedAny, evidence };
-  } finally {
-    await revert(initial);
-    for (const who of impersonated) await rpc('anvil_stopImpersonatingAccount', [who]);
+  };
+  let result;
+  let thrown = null;
+  try {
+    result = await run();
+  } catch (e) {
+    thrown = e;
   }
+  // Always rewind; a failing rewind must not replace the result (it is recorded instead).
+  let restoreError = null;
+  try {
+    await revert(initial);
+  } catch (e) {
+    restoreError = `evm_revert(initial) failed: ${e.shortMessage ?? e.message}`;
+  }
+  for (const who of impersonated) {
+    try { await rpc('anvil_stopImpersonatingAccount', [who]); } catch { /* best effort */ }
+  }
+  if (thrown) throw thrown;
+  if (restoreError) result.evidence.restoreError = restoreError;
+  return result;
 }

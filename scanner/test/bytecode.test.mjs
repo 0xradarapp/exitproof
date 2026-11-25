@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { analyzeCode } from '../src/scan.mjs';
-import { DANGEROUS, UPGRADE_SELECTORS, selectorOf } from '../src/selectors.mjs';
+import { eqDispatcher, splitDispatcher, DECOY_XOR } from './fixtures/raw.mjs';
+import { DANGEROUS, UPGRADE_SELECTORS, SAFE, selectorOf } from '../src/selectors.mjs';
 
 const A = (hex) => analyzeCode(`0x${hex}`);
 
@@ -82,18 +83,72 @@ test('live SELFDESTRUCT => dangerSetter, dead one is ignored', () => {
   assert.equal(A('00ff').dangerSetter, false);
 });
 
-test('selector extraction: DUP1 PUSH4 EQ and PUSH4 DUP2 EQ forms', () => {
+test('linear selector heuristic: DUP1 PUSH4 EQ and PUSH4 DUP2 EQ forms (used for the dangerous list only)', () => {
   const r = A('8063aabbccdd1461001057' + '63a9059cbb81146100105700');
-  assert.deepEqual(r.selectors, ['0xa9059cbb', '0xaabbccdd']);
+  assert.deepEqual(r.linearSelectors, ['0xa9059cbb', '0xaabbccdd']);
+  assert.deepEqual(r.selectors, [], 'no CALLDATALOAD(0)>>224 dispatcher chain');
 });
 
-test('selector extraction: PUSH3 (leading-zero selector) is padded', () => {
-  assert.deepEqual(A('8062bbccdd14').selectors, ['0x00bbccdd']);
+test('linear selector heuristic: PUSH3 (leading-zero selector) is padded', () => {
+  assert.deepEqual(A('8062bbccdd14').linearSelectors, ['0x00bbccdd']);
 });
 
 test('PUSH4 not followed by EQ (custom error, mask) is not a selector', () => {
-  assert.deepEqual(A('63aabbccdd5f52').selectors, []);
-  assert.deepEqual(A('63aabbccdd1061001057').selectors, []);
+  assert.deepEqual(A('63aabbccdd5f52').linearSelectors, []);
+  assert.deepEqual(A('63aabbccdd1061001057').linearSelectors, []);
+});
+
+test('dispatcher chain: EQ chain from CALLDATALOAD(0)>>224, no-match revert', () => {
+  const r = analyzeCode(eqDispatcher());
+  assert.deepEqual(r.selectors, ['0x095ea7b3', '0x23b872dd', '0x70a08231', '0xa9059cbb']);
+  assert.equal(r.dispatcher.ok, true);
+  assert.equal(r.dispatcher.fallbackLogic, false);
+});
+
+test('dispatcher chain: solc binary split (GT pivot) is followed on both sides', () => {
+  const r = analyzeCode(splitDispatcher());
+  assert.deepEqual(r.selectors, ['0x095ea7b3', '0x23b872dd', '0x70a08231', '0xa9059cbb']);
+  assert.equal(r.dispatcher.fallbackLogic, false);
+});
+
+test('dispatcher chain: decoy block selectors do not count; XOR compare is fallback logic', () => {
+  const r = analyzeCode(DECOY_XOR);
+  assert.deepEqual(r.selectors, []);
+  assert.equal(r.linearSelectors.length, 4, 'the decoy fools the linear heuristic');
+  assert.equal(r.dispatcher.fallbackLogic, true);
+});
+
+test('dispatcher chain: no-match path with logic (SSTORE) => fallbackLogic', () => {
+  const r = analyzeCode(eqDispatcher([], '', '60015f5500'));
+  assert.equal(r.dispatcher.fallbackLogic, true);
+  assert.equal(analyzeCode(eqDispatcher([], '', '00')).dispatcher.fallbackLogic, false, 'plain STOP');
+});
+
+test('dispatcher chain: dynamic jump cannot be followed => not ok', () => {
+  const r = A('5f3560e01c8056');
+  assert.equal(r.dispatcher.ok, false);
+});
+
+test('caller vs non-zero 20-byte literal (immutable admin) is a caller check', () => {
+  assert.deepEqual(A(`3373${'11'.repeat(20)}14`).callerLiteralChecks, [22]);
+  assert.deepEqual(A('335f14').callerLiteralChecks, []);
+  assert.deepEqual(A(`337f${'00'.repeat(12)}${'22'.repeat(20)}1460016001601b1b0316`).callerLiteralChecks, [34]);
+  assert.equal(A(`3373${'11'.repeat(20)}14`).privilegedCode, true);
+});
+
+test('external state reads: BALANCE/EXTCODESIZE/EXTCODEHASH/EXTCODECOPY', () => {
+  assert.deepEqual(A(`73${'be'.repeat(20)}31`).externalState, { count: 1, offsets: [21] });
+  assert.equal(A('5f353b').externalState.count, 1, 'EXTCODESIZE of calldata address');
+  assert.equal(A('5f353f').externalState.count, 1, 'EXTCODEHASH');
+  assert.equal(A('5f5f5f5f353c').externalState.count, 1, 'EXTCODECOPY');
+  assert.equal(A('3031').externalState.count, 0, 'BALANCE(ADDRESS)');
+  assert.equal(A('600131').externalState.count, 0, 'precompile literal');
+  assert.equal(A('00' + '5f353b').externalState.count, 0, 'dead');
+  assert.equal(A('5f353b').privilegedCode, true);
+  const cc = A('333b');
+  assert.equal(cc.externalState.count, 0);
+  assert.deepEqual(cc.callerCodeChecks, { count: 1, offsets: [1] });
+  assert.equal(cc.privilegedCode, false, 'msg.sender code-size (anti-bot) is evidence only');
 });
 
 test('dangerous selector in dispatcher => dangerSetter; upgradeTo => upgradeable', () => {
@@ -111,6 +166,14 @@ test('AccessControl hasRole selector => privilegedCode', () => {
   assert.equal(A('00').privilegedCode, false);
   assert.deepEqual(A('00').callerChecks, []);
   assert.deepEqual(A('00').externalCalls, { count: 0, offsets: [] });
+});
+
+test('SAFE_SELECTORS allowlist is keccak-derived and excludes every dangerous selector', () => {
+  for (const [sel, sig] of Object.entries(SAFE)) {
+    assert.equal(selectorOf(sig), sel, sig);
+    assert.equal(DANGEROUS[sel], undefined, sig);
+  }
+  assert.ok(SAFE[selectorOf('permit(address,address,uint256,uint256,uint8,bytes32,bytes32)')]);
 });
 
 test('dangerous list is keccak-derived and covers required names', () => {

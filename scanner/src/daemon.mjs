@@ -69,7 +69,8 @@ export async function runOnce({
   const queueRetry = (token, pair, error, prev = 0) => {
     out.errors.push({ token, error });
     log(`error ${token}: ${error}`);
-    if (prev + 1 >= MAX_RETRIES || state.retry.some((x) => x.token === token)) return;
+    if (prev + 1 >= MAX_RETRIES) { log(`giving up on ${token} after ${MAX_RETRIES} attempts`); return; }
+    if (state.retry.some((x) => x.token === token)) return;
     state.retry.push({ token, pair, error, attempts: prev + 1 });
   };
 
@@ -88,9 +89,17 @@ export async function runOnce({
         r.ownerCanTrap = sim.ownerCanTrap;
         r.evidence.simulation = sim.evidence;
       } catch (e) {
-        // the static scan is still attested; the simulation is retried on a later pass
-        r.evidence.simulation = { error: `simulate-error: ${msg(e)}` };
-        queueRetry(token, pair, `simulate: ${msg(e)}`, prevAttempts);
+        if (prevAttempts + 1 >= MAX_RETRIES) {
+          // fail closed: the owner-power question could never be answered
+          r.ownerCanTrap = true;
+          r.evidence.simulation = { error: `simulate-gave-up: ${msg(e)}` };
+          out.errors.push({ token, error: `simulate-gave-up: ${msg(e)}` });
+          log(`simulate gave up on ${token} after ${MAX_RETRIES} attempts: attesting ownerCanTrap=true`);
+        } else {
+          // the static scan is still attested; the simulation is retried on a later pass
+          r.evidence.simulation = { error: `simulate-error: ${msg(e)}` };
+          queueRetry(token, pair, `simulate: ${msg(e)}`, prevAttempts);
+        }
       }
     }
     out.scanned.push({ token, pair, codehash: r.codehash });

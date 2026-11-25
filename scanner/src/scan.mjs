@@ -3,34 +3,33 @@
 // Heuristics (documented here and in the task report):
 //
 // 1. Decoding: canonical linear decode from offset 0; PUSH1..PUSH32 skip their immediates (same as the on-chain
-//    BytecodeScan). Unlike the on-chain scan this is REACHABILITY-PRECISE: a run of instructions is "live" from
-//    offset 0 and from every canonical JUMPDEST (0x5b); a run ends after a terminator: STOP, RETURN, REVERT,
-//    INVALID, SELFDESTRUCT, JUMP, or any opcode undefined in the Cancun set. JUMPI falls through (stays live).
-//    Bytes after a terminator and before the next canonical JUMPDEST can never execute.
-// 2. DELEGATECALL/CALLCODE count only if live. Exception: the target address operand is a literal (PUSH0..PUSH32
-//    value) equal to 0 or a Cancun precompile (0x01..0x0a). Such a call can never run replaceable code (address 0
-//    has no code and no key; precompiles are fixed). The operand is tracked with a tiny symbolic stack inside the
-//    current basic block (PUSH/DUP/SWAP/POP and zero-input environment ops); anything else makes the stack unknown,
-//    which is conservative (unknown target => upgradeable).
-// 3. Selectors: a live PUSH4 (or PUSH3, left-padded: solc shortens selectors with a leading 0x00 byte) followed
-//    within at most 3 instructions by EQ (0x14), with only DUPn/SWAPn in between. Covers solc's `DUP1 PUSH4 EQ` and
-//    `PUSH4 DUP2 EQ` dispatcher forms; PUSH4 used with LT/GT (binary-search pivots), MSTORE (error selectors) or
-//    AND (masks) is not counted.
-// 4. upgradeable = live non-literal-precompile DELEGATECALL/CALLCODE OR EIP-1967 implementation/beacon slot non-zero
-//    OR EIP-1822 PROXIABLE slot non-zero OR upgradeTo/upgradeToAndCall/setImplementation selector in the dispatcher.
-// 5. dangerSetter = any selector from selectors.mjs DANGEROUS in the dispatcher (token, plus the EIP-1967
-//    implementation's dispatcher when the token is a proxy) OR a live SELFDESTRUCT.
-// 5b. Minimal proxies (exact EIP-1167 / ERC-7511 runtime only): the implementation's code is analyzed instead of
-//    the clone's (its own fixed-target DELEGATECALL does not count). An implementation without code, or one that is
-//    itself a clone, is fail-closed: upgradeable + dispatcher-unrecognized + reason `clone-unresolved`.
-// 6. privileged = owner()/getOwner() returns a non-zero 32-byte word (a non-address word counts: conservative)
-//    OR hasRole(bytes32,address) (AccessControl) selector present OR dangerSetter.
-//    The owner probe is an eth_call capped at 100k gas; revert, short (<32 byte) return or gas exhaustion => no owner.
+//    BytecodeScan). REACHABILITY-PRECISE liveness: code is live from offset 0 and from every canonical JUMPDEST; a
+//    live run ends at STOP, RETURN, REVERT, INVALID, SELFDESTRUCT or JUMP (undefined opcodes do NOT end it).
+// 2. Symbolic stack: literals (with constant folding), {set} of literals, and tags C (CALLER/ORIGIN), S (SLOAD),
+//    A (ADDRESS). JUMPDEST entry stacks come from a forward dataflow pass with light context sensitivity (contexts
+//    keyed by return-address literals); if any jump target is unresolved the pass is discarded (every JUMPDEST
+//    starts unknown). Unmodelled ops forget the stack (conservative).
+// 3. DELEGATECALL/CALLCODE count only if live; a literal 0 / precompile (0x01..0x0a) target is exempt.
+// 4. Dispatcher (v3): selectors come ONLY from the dispatcher chain, followed by symbolic execution from offset 0
+//    (CALLDATALOAD(0) >> 224 or / 2^224, EQ compare chain, solc GT/LT binary split, callvalue / calldatasize
+//    checks). Taken EQ branches are function entries. Any non-compare logic reached on the no-match / no-selector
+//    path or in the prologue => fallbackLogic. A dynamic jump or unmodelled op in the chain => not followable.
+//    A linear PUSH4..EQ heuristic is kept only to match the dangerous list (more conservative).
+// 5. upgradeable = unsafe live DELEGATECALL/CALLCODE OR EIP-1967 impl/beacon slot OR EIP-1822 slot OR an upgrade
+//    selector. Minimal proxies (exact EIP-1167 / ERC-7511) are analysed through their implementation (one level;
+//    unresolvable => fail closed: upgradeable + dispatcher-unrecognized + clone-unresolved).
+// 6. dangerSetter = dangerous-list selector OR live SELFDESTRUCT OR dispatcher-unrecognized (chain not followable
+//    or missing transfer/transferFrom/approve/balanceOf).
+// 7. privileged (ALLOWLIST model, v3) = owner()/getOwner() non-zero OR hasRole OR CALLER/ORIGIN compared with an
+//    SLOAD value or a non-zero 20-byte literal OR live CALL/STATICCALL to a non-precompile, non-ADDRESS target OR
+//    BALANCE/EXTCODESIZE/EXTCODEHASH/EXTCODECOPY of a non-ADDRESS/CALLER/precompile target (CALLER targets are
+//    evidence only: anti-bot code-size checks) OR any dispatcher selector outside SAFE (selectors.mjs) OR
+//    fallbackLogic OR dangerSetter. The owner probe is an eth_call capped at 100k gas.
 import { keccak256, hexToBytes, bytesToHex, getAddress } from 'viem';
-import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS, CORE_ERC20 } from './selectors.mjs';
+import { DANGEROUS, UPGRADE_SELECTORS, HAS_ROLE, OWNER_GETTERS, CORE_ERC20, SAFE } from './selectors.mjs';
 import { readProxySlots, UPGRADE_SLOTS, isAddress20 } from './proxy.mjs';
 
-export const SCANNER_VERSION = 2;
+export const SCANNER_VERSION = 3;
 const OWNER_CALL_GAS = 100_000n;
 
 const JUMP = 0x56, JUMPI = 0x57, JUMPDEST = 0x5b, PUSH0 = 0x5f, EQ = 0x14;
@@ -47,7 +46,7 @@ set([0x08, 0x09], [3, 1]);
 set([0x15, 0x19, 0x31, 0x35, 0x3b, 0x3f, 0x40, 0x49, 0x51, 0x54, 0x5c], [1, 1]);
 set([0x30, 0x32, 0x33, 0x34, 0x36, 0x38, 0x3a, 0x3d, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x4a, 0x58,
   0x59, 0x5a], [0, 1]);
-set([0x50], [1, 0]);
+set([0x50, JUMP], [1, 0]);
 set([0x52, 0x53, 0x55, 0x5d, JUMPI], [2, 0]);
 set([0x37, 0x39, 0x3e, 0x5e], [3, 0]);
 set([0x3c], [4, 0]);
@@ -59,7 +58,304 @@ set([CALL, CALLCODE], [7, 1]); set([DELEGATECALL, STATICCALL], [6, 1]);
 const MASK_OPS = new Set([0x04, 0x16, 0x1c]); // DIV, AND, SHR keep taint
 const CMP_OPS = new Set([0x14, 0x03, 0x18]); // EQ, SUB, XOR
 const MAX_PRECOMPILE = 0x0an;
-const isLiteralPrecompile = (v) => typeof v === 'bigint' && v <= MAX_PRECOMPILE;
+const isLiteralPrecompile = (v) => (typeof v === 'bigint' && v <= MAX_PRECOMPILE)
+  || (v !== null && typeof v === 'object' && Array.isArray(v.set) && v.set.every((x) => x <= MAX_PRECOMPILE));
+
+const EXT_STATE_OPS = new Set([0x31, 0x3b, 0x3c, 0x3f]); // BALANCE, EXTCODESIZE, EXTCODECOPY, EXTCODEHASH
+const M256 = (1n << 256n) - 1n;
+
+/** Constant folding for the symbolic stack (args[0] = top of stack). */
+function fold(op, args) {
+  if (!args.every((v) => typeof v === 'bigint')) return null;
+  const [a, b] = args;
+  switch (op) {
+    case 0x01: return (a + b) & M256;
+    case 0x02: return (a * b) & M256;
+    case 0x03: return (a - b) & M256;
+    case 0x04: return b === 0n ? 0n : a / b;
+    case 0x16: return a & b;
+    case 0x17: return a | b;
+    case 0x18: return a ^ b;
+    case 0x19: return M256 ^ a;
+    case 0x1b: return a >= 256n ? 0n : (b << a) & M256;
+    case 0x1c: return a >= 256n ? 0n : b >> a;
+    case 0x14: return a === b ? 1n : 0n;
+    case 0x15: return a === 0n ? 1n : 0n;
+    default: return null;
+  }
+}
+
+/**
+ * One symbolic stack step (mutates `stack`, top = end). Values: bigint literal | {set:[bigint]} (one of a few
+ * literals, from dataflow joins) | 'C' (CALLER/ORIGIN) | 'S' (SLOAD-derived) | 'A' (ADDRESS) | null (unknown).
+ * `onCmp(pc, args)` is called for EQ/SUB/XOR. Unmodelled / undefined ops forget the whole stack (conservative).
+ */
+function stepStack(x, stack, onCmp) {
+  const { op, imm, pc } = x;
+  const peek = (d) => (d < stack.length ? stack[stack.length - 1 - d] : null);
+  if (op === JUMPDEST) return;
+  if (imm !== null) { stack.push(imm); return; }
+  if (op >= 0x80 && op <= 0x8f) { stack.push(peek(op - 0x80)); return; }
+  if (op >= 0x90 && op <= 0x9f) {
+    const n = op - 0x8f;
+    while (stack.length < n + 1) stack.unshift(null);
+    const t = stack.length - 1;
+    [stack[t], stack[t - n]] = [stack[t - n], stack[t]];
+    return;
+  }
+  const io = op >= 0xa0 && op <= 0xa4 ? [2 + op - 0xa0, 0] : ARITY.get(op);
+  if (!io) { stack.length = 0; return; }
+  const args = Array.from({ length: io[0] }, (_, k) => peek(k));
+  stack.length = Math.max(0, stack.length - io[0]);
+  if (io[1] === 0) return;
+  let out = fold(op, args);
+  if (op === 0x33 || op === 0x32) out = 'C';
+  else if (op === 0x30) out = 'A';
+  else if (op === 0x54) out = 'S';
+  else if (MASK_OPS.has(op) && out === null) out = args.find((v) => v === 'C' || v === 'S') ?? null;
+  else if (CMP_OPS.has(op) && onCmp) onCmp(pc, args);
+  stack.push(out);
+}
+
+const MAX_SET = 64;
+const asSet = (v) => (typeof v === 'bigint' ? [v] : v !== null && typeof v === 'object' && v.set ? v.set : null);
+function joinVal(a, b) {
+  if (a === b) return a;
+  const sa = asSet(a);
+  const sb = asSet(b);
+  if (sa && sb) {
+    const u = [...new Set([...sa, ...sb])].sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
+    if (u.length === 1) return u[0];
+    return u.length <= MAX_SET ? { set: u } : null;
+  }
+  return null;
+}
+function joinStacks(a, b) {
+  const n = Math.min(a.length, b.length);
+  const A = a.slice(a.length - n);
+  const B = b.slice(b.length - n);
+  return A.map((v, k) => joinVal(v, B[k]));
+}
+const sig = (st) => st.map((v) => (v === null ? '_' : typeof v === 'bigint' ? v.toString(16)
+  : typeof v === 'string' ? v : `{${v.set.map((x) => x.toString(16)).join(',')}}`)).join(' ');
+
+/**
+ * Forward dataflow over basic blocks with light context sensitivity: each block keeps up to MAX_CTX distinct entry
+ * stacks (so an internal function analysed per call site returns to the right caller frame); past the cap its
+ * contexts collapse into one joined summary. Returns one joined entry stack per instruction index (used by the
+ * detection pass) and whether any jump target stayed unresolved.
+ */
+const MAX_CTX = 64;
+function computeEntries(ins) {
+  const idx = new Map(ins.map((x, k) => [x.pc, k]));
+  const isDest = (v) => typeof v === 'bigint' && v <= 0xffffffffn && ins[idx.get(Number(v))]?.op === JUMPDEST;
+  // Context key = stack depth + the positions/values of JUMPDEST-valued literals (return addresses: a call-string
+  // proxy). Contexts with the same key are joined (this widens loop counters and memory offsets).
+  const ctxKey = (st) => `${st.length}|${st.map((v) => (isDest(v) ? v.toString(16) : '.')).join(',')}`;
+  const ctx = new Map(); // k -> Map(key -> stack), or { summary: stack }
+  const work = [];
+  let unresolved = false;
+  let visits = 0;
+  const targetsOf = (v) => {
+    const s = asSet(v);
+    if (!s) return null;
+    return s.map((t) => (t <= 0xffffffffn ? idx.get(Number(t)) : undefined))
+      .filter((k) => k !== undefined && ins[k].op === JUMPDEST);
+  };
+  const edge = (k, st) => {
+    let c = ctx.get(k);
+    if (!c) { c = { map: new Map(), summary: null }; ctx.set(k, c); }
+    if (c.summary) {
+      const j = joinStacks(c.summary, st);
+      if (sig(j) === sig(c.summary)) return;
+      c.summary = j;
+      work.push([k, 'S']);
+      return;
+    }
+    const key = ctxKey(st);
+    const cur = c.map.get(key);
+    if (cur) {
+      const j = joinStacks(cur, st);
+      if (sig(j) === sig(cur)) return;
+      c.map.set(key, j);
+      work.push([k, key]);
+      return;
+    }
+    if (c.map.size < MAX_CTX) {
+      c.map.set(key, [...st]);
+      work.push([k, key]);
+      return;
+    }
+    c.summary = [...c.map.values()].reduce((acc, x) => joinStacks(acc, x), st);
+    c.map.clear();
+    work.push([k, 'S']);
+  };
+  edge(0, []);
+  while (work.length) {
+    if (++visits > 200_000) return { entries: new Map(), unresolved: true };
+    const [start, key] = work.pop();
+    const c = ctx.get(start);
+    const entry = key === 'S' ? c.summary : c.map.get(key);
+    if (!entry) continue; // superseded by a summary
+    const stack = [...entry];
+    for (let i = start; i < ins.length; i++) {
+      const { op } = ins[i];
+      if (i > start && op === JUMPDEST) { edge(i, stack); break; }
+      if (op === JUMP || op === JUMPI) {
+        const t = targetsOf(stack.length ? stack[stack.length - 1] : null);
+        stepStack(ins[i], stack, null);
+        if (t === null) unresolved = true;
+        else for (const k of t) edge(k, stack);
+        if (op === JUMP) break;
+        continue; // JUMPI falls through within this walk
+      }
+      if (TERMINATORS.has(op)) break;
+      stepStack(ins[i], stack, null);
+    }
+  }
+  const entries = new Map();
+  for (const [k, c] of ctx) {
+    const all = c.summary ? [c.summary] : [...c.map.values()];
+    entries.set(k, all.reduce((acc, x) => joinStacks(acc, x)));
+  }
+  return { entries, unresolved };
+}
+
+// ---- dispatcher chain (scanner v3) ----
+// Symbolic execution from offset 0 over the dispatcher only. Values: bigint | 'CD0' (calldataload(0)) |
+// 'SEL' (selector) | {eq: sel} / {neq: sel} | 'CMP' (SEL vs literal ordering) | 'CDS' (calldatasize-derived) |
+// 'CV' (callvalue-derived) | null. Phases: 'pre' (before any calldatasize check: prologue), 'cds' (after it),
+// 'chain' (selector exists). Taken EQ branches are function entries (not followed); GT/LT pivots, callvalue and
+// calldatasize checks fork both ways. In 'cds'/'chain' only compare-chain ops are allowed; any other op is the
+// body of a fallback/receive (or prologue logic) => fallbackLogic.
+const CHAIN_OPS = new Set([0x00, 0x10, 0x11, 0x14, 0x15, 0x16, 0x34, 0x36, 0x50, 0x56, 0x57, 0x5b, 0xfd, 0xfe]);
+const SEL_OPS = new Set([0x04, 0x1c, 0x35]); // DIV, SHR, CALLDATALOAD (selector extraction)
+const PRE_OPS = new Set([...CHAIN_OPS, ...SEL_OPS, 0x52]); // + MSTORE (free memory pointer)
+const DISPATCH_BUDGET = 20_000;
+const isSelConst = (v) => typeof v === 'bigint' && v <= 0xffffffffn;
+const selHex = (v) => `0x${v.toString(16).padStart(8, '0')}`;
+
+function analyzeDispatcher(ins) {
+  const idx = new Map(ins.map((x, k) => [x.pc, k]));
+  const res = { ok: true, failure: null, selectors: [], fallbackLogic: false, logicAt: [] };
+  const sels = new Set();
+  const logic = new Set();
+  const fail = (why) => { if (res.ok) { res.ok = false; res.failure = why; } };
+  const jumpIdx = (t) => {
+    if (typeof t !== 'bigint' || t > 0xffffffffn) return -1;
+    const k = idx.get(Number(t));
+    return k !== undefined && ins[k].op === JUMPDEST ? k : -1;
+  };
+  const seen = new Set();
+  const work = [{ i: 0, stack: [], phase: 'pre' }];
+  let steps = 0;
+  const key = (st) => `${st.i}|${st.phase}|${st.stack.map((v) => (typeof v === 'bigint' ? v.toString(16) : JSON.stringify(v))).join(',')}`;
+
+  while (work.length && res.ok) {
+    const st = work.pop();
+    const k0 = key(st);
+    if (seen.has(k0)) continue;
+    seen.add(k0);
+    let { i, phase } = st;
+    const stack = [...st.stack];
+    const peek = (d) => (d < stack.length ? stack[stack.length - 1 - d] : null);
+    const pop = () => (stack.length ? stack.pop() : null);
+    for (;;) {
+      if (++steps > DISPATCH_BUDGET) { fail('budget'); break; }
+      if (i >= ins.length) break; // implicit STOP
+      const { op, imm, pc } = ins[i];
+      const allowed = phase === 'chain' ? CHAIN_OPS : phase === 'cds' ? new Set([...CHAIN_OPS, ...SEL_OPS]) : PRE_OPS;
+      if (imm === null && !(op >= 0x80 && op <= 0x9f) && !allowed.has(op)) { logic.add(pc); break; }
+      if (imm !== null) { stack.push(imm); i++; continue; }
+      if (op >= 0x80 && op <= 0x8f) { stack.push(peek(op - 0x80)); i++; continue; }
+      if (op >= 0x90 && op <= 0x9f) {
+        const n = op - 0x8f;
+        while (stack.length < n + 1) stack.unshift(null);
+        const t = stack.length - 1;
+        [stack[t], stack[t - n]] = [stack[t - n], stack[t]];
+        i++;
+        continue;
+      }
+      if (op === 0x00 || op === 0xfd || op === 0xfe) break; // STOP / REVERT / INVALID: path ends cleanly
+      if (op === JUMPDEST) { i++; continue; }
+      if (op === 0x50) { pop(); i++; continue; }
+      if (op === 0x52) { pop(); pop(); i++; continue; }
+      if (op === 0x36) { stack.push('CDS'); i++; continue; }
+      if (op === 0x34) { stack.push('CV'); i++; continue; }
+      if (op === 0x35) { const a = pop(); stack.push(a === 0n ? 'CD0' : null); i++; continue; }
+      if (op === 0x1c) { // SHR
+        const a = pop(); const b = pop();
+        stack.push(a === 224n && b === 'CD0' ? 'SEL' : fold(op, [a, b]));
+        if (stack[stack.length - 1] === 'SEL') phase = 'chain';
+        i++; continue;
+      }
+      if (op === 0x04) { // DIV
+        const a = pop(); const b = pop();
+        stack.push(a === 'CD0' && b === 1n << 224n ? 'SEL' : fold(op, [a, b]));
+        if (stack[stack.length - 1] === 'SEL') phase = 'chain';
+        i++; continue;
+      }
+      if (op === 0x16) { // AND
+        const a = pop(); const b = pop();
+        const isMask = (x) => x === 0xffffffffn;
+        stack.push((a === 'SEL' && isMask(b)) || (b === 'SEL' && isMask(a)) ? 'SEL' : fold(op, [a, b]));
+        i++; continue;
+      }
+      if (op === 0x14) { // EQ
+        const a = pop(); const b = pop();
+        let v = fold(op, [a, b]);
+        if (a === 'SEL' && isSelConst(b)) v = { eq: b };
+        else if (b === 'SEL' && isSelConst(a)) v = { eq: a };
+        else if (a === 'CDS' || b === 'CDS') v = 'CDS';
+        else if (a === 'CV' || b === 'CV') v = 'CV';
+        stack.push(v); i++; continue;
+      }
+      if (op === 0x10 || op === 0x11) { // LT / GT
+        const a = pop(); const b = pop();
+        let v = fold(op === 0x10 ? 0x10 : 0x11, [a, b]);
+        if (v === null && typeof a === 'bigint' && typeof b === 'bigint') v = op === 0x10 ? (a < b ? 1n : 0n) : (a > b ? 1n : 0n);
+        if ((a === 'SEL' && typeof b === 'bigint') || (b === 'SEL' && typeof a === 'bigint')) v = 'CMP';
+        else if (a === 'CDS' || b === 'CDS') v = 'CDS';
+        else if (a === 'CV' || b === 'CV') v = 'CV';
+        stack.push(v); i++; continue;
+      }
+      if (op === 0x15) { // ISZERO
+        const a = pop();
+        let v = fold(op, [a]);
+        if (a && typeof a === 'object') v = a.eq !== undefined ? { neq: a.eq } : { eq: a.neq };
+        else if (a === 'CDS' || a === 'CV' || a === 'CMP') v = a;
+        stack.push(v); i++; continue;
+      }
+      if (op === JUMP) {
+        const t = jumpIdx(pop());
+        if (t < 0) { fail(`dynamic-jump@${pc}`); break; }
+        i = t; continue;
+      }
+      if (op === JUMPI) {
+        const t = jumpIdx(pop()); const c = pop();
+        if (t < 0) { fail(`dynamic-jumpi@${pc}`); break; }
+        if (c && typeof c === 'object' && c.eq !== undefined) { sels.add(selHex(c.eq)); i++; continue; }
+        if (c && typeof c === 'object' && c.neq !== undefined) { sels.add(selHex(c.neq)); i = t; continue; }
+        if (typeof c === 'bigint') { i = c === 0n ? i + 1 : t; continue; }
+        if (c === 'CMP' || c === 'CV' || c === 'CDS' || phase === 'pre') {
+          const np = c === 'CDS' && phase === 'pre' ? 'cds' : phase;
+          work.push({ i: t, stack: [...stack], phase: np });
+          phase = np;
+          i++;
+          continue;
+        }
+        logic.add(pc); // a JUMPI on something that is not a selector compare: not dispatcher code
+        break;
+      }
+      fail(`unmodelled@${pc}`);
+      break;
+    }
+  }
+  res.selectors = [...sels].sort(sortStr);
+  res.logicAt = [...logic].sort((a, b) => a - b);
+  res.fallbackLogic = res.logicAt.length > 0;
+  return res;
+}
 
 const isPush = (op) => op >= 0x60 && op <= 0x7f;
 const sortStr = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -92,19 +388,32 @@ export function analyzeCode(codeHex) {
     deadDelegatecall: 0, deadCallcode: 0, deadSelfdestruct: 0,
     constTargetDelegatecall: 0, constTargetCallcode: 0,
   };
-  const selectors = new Set();
+  const selectors = new Set(); // linear heuristic (dangerous-list matching only)
   const callerChecks = [];
+  const callerLiteralChecks = [];
   const externalCallOffsets = [];
+  const externalStateOffsets = [];
+  const callerCodeOffsets = [];
   let unsafeDelegate = false;
+
+  // Entry stacks for every JUMPDEST from a small dataflow pass (constants / tags flow across internal jumps). If
+  // any jump target cannot be resolved, the pass is discarded and every JUMPDEST starts from an unknown stack
+  // (sound: an unresolved jump could enter any block with any stack).
+  const df = computeEntries(ins);
+  const entries = df.unresolved ? new Map() : df.entries;
 
   let live = true;
   let stack = []; // top = end; the floor below is unknown
   const peek = (d) => (d < stack.length ? stack[stack.length - 1 - d] : null);
-  const pop = (k) => { stack.length = Math.max(0, stack.length - k); };
+  const onCmp = (pc, args) => {
+    if (!args.includes('C')) return;
+    if (args.includes('S')) callerChecks.push(pc);
+    else if (args.some((v) => typeof v === 'bigint' && v > 0n && v < 1n << 160n)) callerLiteralChecks.push(pc);
+  };
 
   for (let i = 0; i < ins.length; i++) {
     const { op, pc } = ins[i];
-    if (op === JUMPDEST) { live = true; stack = []; continue; }
+    if (op === JUMPDEST) { live = true; stack = entries.has(i) ? [...entries.get(i)] : []; continue; }
     if (!live) {
       if (op === DELEGATECALL) opcodes.deadDelegatecall++;
       if (op === CALLCODE) opcodes.deadCallcode++;
@@ -139,47 +448,41 @@ export function analyzeCode(codeHex) {
       const target = peek(1);
       if (!isLiteralPrecompile(target) && target !== 'A') externalCallOffsets.push(pc);
     }
+    if (EXT_STATE_OPS.has(op)) {
+      const target = peek(0);
+      if (target === 'C') callerCodeOffsets.push(pc);
+      else if (target !== 'A' && !isLiteralPrecompile(target)) externalStateOffsets.push(pc);
+    }
     if (op === SELFDESTRUCT) opcodes.selfdestruct++;
     if (TERMINATORS.has(op)) { live = false; stack = []; continue; }
-
-    // symbolic stack step
-    if (ins[i].imm !== null) { stack.push(ins[i].imm); continue; }
-    if (op >= 0x80 && op <= 0x8f) { stack.push(peek(op - 0x80)); continue; }
-    if (op >= 0x90 && op <= 0x9f) {
-      const n = op - 0x8f;
-      while (stack.length < n + 1) stack.unshift(null);
-      const t = stack.length - 1;
-      [stack[t], stack[t - n]] = [stack[t - n], stack[t]];
-      continue;
-    }
-    const io = op >= 0xa0 && op <= 0xa4 ? [2 + op - 0xa0, 0] : ARITY.get(op);
-    if (!io) { stack = []; continue; } // unmodelled / undefined op: forget everything (conservative)
-    const args = Array.from({ length: io[0] }, (_, k) => peek(k));
-    pop(io[0]);
-    if (io[1] === 0) continue;
-    let out = null;
-    if (op === 0x33 || op === 0x32) out = 'C';
-    else if (op === 0x30) out = 'A';
-    else if (op === 0x54) out = 'S';
-    else if (MASK_OPS.has(op)) out = args.find((v) => v === 'C' || v === 'S') ?? null;
-    else if (CMP_OPS.has(op) && args.includes('C') && args.includes('S')) callerChecks.push(pc);
-    stack.push(out);
+    stepStack(ins[i], stack, onCmp);
   }
 
-  const sel = [...selectors].sort(sortStr);
-  const dangerous = sel.filter((s) => DANGEROUS[s]).map((s) => ({ selector: s, signature: DANGEROUS[s] }));
-  const upgradeSelector = sel.some((s) => UPGRADE_SELECTORS.includes(s));
+  const linear = [...selectors].sort(sortStr);
+  const disp = analyzeDispatcher(ins);
+  const sel = disp.selectors;
+  const all = [...new Set([...linear, ...sel])].sort(sortStr);
+  const dangerous = all.filter((s) => DANGEROUS[s]).map((s) => ({ selector: s, signature: DANGEROUS[s] }));
+  const upgradeSelector = all.some((s) => UPGRADE_SELECTORS.includes(s));
+  const accessControl = all.includes(HAS_ROLE);
   return {
     selectors: sel,
+    linearSelectors: linear,
+    dispatcher: { ok: disp.ok, failure: disp.failure, fallbackLogic: disp.fallbackLogic, logicAt: disp.logicAt },
     dangerous,
     opcodes,
+    jumpsResolved: !df.unresolved,
     callerChecks,
+    callerLiteralChecks,
     externalCalls: { count: externalCallOffsets.length, offsets: externalCallOffsets },
+    externalState: { count: externalStateOffsets.length, offsets: externalStateOffsets },
+    callerCodeChecks: { count: callerCodeOffsets.length, offsets: callerCodeOffsets },
     unsafeDelegatecall: unsafeDelegate,
     upgradeable: unsafeDelegate || upgradeSelector,
     dangerSetter: dangerous.length > 0 || opcodes.selfdestruct > 0,
-    accessControl: sel.includes(HAS_ROLE),
-    privilegedCode: sel.includes(HAS_ROLE) || callerChecks.length > 0 || externalCallOffsets.length > 0,
+    accessControl,
+    privilegedCode: accessControl || callerChecks.length > 0 || callerLiteralChecks.length > 0
+      || externalCallOffsets.length > 0 || externalStateOffsets.length > 0,
   };
 }
 
@@ -270,7 +573,9 @@ export async function scan(client, token, { blockNumber } = {}) {
       ia = analyzeCode(implCode);
       implementation = {
         address: impl, codehash: keccak256(implCode), selectors: ia.selectors, dangerous: ia.dangerous,
-        callerChecks: ia.callerChecks, externalCalls: ia.externalCalls, opcodes: ia.opcodes,
+        dispatcher: ia.dispatcher, callerChecks: ia.callerChecks, callerLiteralChecks: ia.callerLiteralChecks,
+        externalCalls: ia.externalCalls, externalState: ia.externalState, callerCodeChecks: ia.callerCodeChecks,
+        opcodes: ia.opcodes,
       };
     }
   }
@@ -279,27 +584,36 @@ export async function scan(client, token, { blockNumber } = {}) {
   const slotUpgradeable = UPGRADE_SLOTS.some((k) => proxySlots[k] !== null);
   const both = (f) => f(a) || (ia !== null && f(ia));
 
-  // Dispatcher coverage: an ERC-20 whose dispatcher does not show the four core selectors in EQ form uses a
-  // dispatcher we cannot read (XOR/SUB/OR tricks, jump tables, Vyper): fail closed.
+  // Dispatcher recognition (v3): selectors come only from the followed dispatcher chain. It must be followable and
+  // contain the four ERC-20 core selectors (token + EIP-1967 implementation merged), else fail closed.
   const merged = new Set([...a.selectors, ...(ia?.selectors ?? [])]);
-  const dispatcherUnrecognized = !CORE_ERC20.every((s) => merged.has(s));
+  const chainOk = a.dispatcher.ok && (ia === null || ia.dispatcher.ok);
+  const dispatcherUnrecognized = !chainOk || !CORE_ERC20.every((s) => merged.has(s));
+  // Allowlist (v3): any dispatcher selector that is not known-safe makes the token privileged.
+  const unknownSelectors = [...merged].filter((s) => !SAFE[s]).sort(sortStr);
+  const fallbackLogic = both((x) => x.dispatcher.fallbackLogic);
 
   const reasons = new Set();
   if (owner !== null) reasons.add('owner-getter');
   if (both((x) => x.accessControl)) reasons.add('access-control');
   if (both((x) => x.callerChecks.length > 0)) reasons.add('caller-vs-storage');
+  if (both((x) => x.callerLiteralChecks.length > 0)) reasons.add('caller-vs-literal');
   if (both((x) => x.externalCalls.count > 0)) reasons.add('external-call');
+  if (both((x) => x.externalState.count > 0)) reasons.add('external-state');
   if (both((x) => x.dangerous.length > 0)) reasons.add('dangerous-selector');
   if (both((x) => x.opcodes.selfdestruct > 0)) reasons.add('live-selfdestruct');
   if (dispatcherUnrecognized) reasons.add('dispatcher-unrecognized');
-  if (a.selectors.some((x) => UPGRADE_SELECTORS.includes(x))) reasons.add('upgrade-selector');
+  if (unknownSelectors.length) reasons.add('unknown-selector');
+  if (fallbackLogic) reasons.add('fallback-logic');
+  if ([...a.selectors, ...a.linearSelectors].some((x) => UPGRADE_SELECTORS.includes(x))) reasons.add('upgrade-selector');
   if (a.unsafeDelegatecall) reasons.add('delegatecall');
   if (slotUpgradeable) reasons.add('proxy-slot');
   if (cloneUnresolved) reasons.add('clone-unresolved');
 
   const upgradeable = a.upgradeable || slotUpgradeable;
   const dangerSetter = both((x) => x.dangerSetter) || dispatcherUnrecognized;
-  const privileged = owner !== null || both((x) => x.privilegedCode) || dangerSetter;
+  const privileged = owner !== null || both((x) => x.privilegedCode) || dangerSetter || unknownSelectors.length > 0
+    || fallbackLogic;
 
   const dangerous = [...a.dangerous, ...(ia?.dangerous ?? [])]
     .filter((d, i, arr) => arr.findIndex((x) => x.selector === d.selector) === i)
@@ -318,8 +632,14 @@ export async function scan(client, token, { blockNumber } = {}) {
       dangerous,
       reasons: [...reasons].sort(sortStr),
       accessControl: a.accessControl,
+      unknownSelectors,
+      dispatcher: a.dispatcher,
+      jumpsResolved: a.jumpsResolved,
       callerChecks: a.callerChecks,
+      callerLiteralChecks: a.callerLiteralChecks,
       externalCalls: a.externalCalls,
+      externalState: a.externalState,
+      callerCodeChecks: a.callerCodeChecks,
       proxySlots,
       implementation,
       clone,

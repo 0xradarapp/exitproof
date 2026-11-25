@@ -5,7 +5,7 @@ import { scan } from '../src/scan.mjs';
 import { selectorOf } from '../src/selectors.mjs';
 import { SLOTS } from '../src/proxy.mjs';
 import { startAnvil, deployToken, deployScannerFixture, SUPPLY } from './helpers.mjs';
-import { XOR_DISPATCHER, eqDispatcher, eip1167, erc7511 } from './fixtures/raw.mjs';
+import { XOR_DISPATCHER, DECOY_XOR, eqDispatcher, eip1167, erc7511 } from './fixtures/raw.mjs';
 
 let env;
 before(async () => { env = await startAnvil(); });
@@ -19,13 +19,16 @@ test('CleanToken: all flags false, codehash = keccak(runtime), version 1', async
   const t = await deployToken(env, 'CleanToken');
   const r = await scan(env.pub, t.address);
   assert.deepEqual(FLAGS(r), { privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
-  assert.equal(r.scannerVersion, 2);
+  assert.equal(r.scannerVersion, 3);
   assert.equal(r.codehash, keccak256(await env.pub.getCode({ address: t.address })));
   assert.equal(r.evidence.owner, null);
   assert.ok(r.evidence.selectors.includes(selectorOf('transfer(address,uint256)')));
   assert.deepEqual(r.evidence.dangerous, []);
   assert.deepEqual(r.evidence.reasons, []);
+  assert.deepEqual(r.evidence.unknownSelectors, []);
+  assert.equal(r.evidence.dispatcher.fallbackLogic, false);
   assert.deepEqual(r.evidence.externalCalls, { count: 0, offsets: [] });
+  assert.deepEqual(r.evidence.externalState, { count: 0, offsets: [] });
 });
 
 test('scan output is identical across runs', async () => {
@@ -41,6 +44,7 @@ test('OwnedCleanToken: privileged only', async () => {
   const r = await scan(env.pub, t.address);
   assert.deepEqual(FLAGS(r), { privileged: true, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
   assert.equal(r.evidence.owner.toLowerCase(), env.account.address.toLowerCase());
+  assert.deepEqual(r.evidence.unknownSelectors, [], 'owner()/renounceOwnership() are allowlisted');
 });
 
 test('TimeBombToken: privileged + dangerSetter (setSellFee)', async () => {
@@ -73,16 +77,24 @@ test('ProxyToken: upgradeable via EIP-1967 slot, live DELEGATECALL and upgradeTo
 test('ScanFalsePositiveToken: delegatecall to literal 0 is cleared (not upgradeable)', async () => {
   const t = await deployToken(env, 'ScanFalsePositiveToken');
   const r = await scan(env.pub, t.address);
-  assert.deepEqual(FLAGS(r), { privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
+  // v3: still not upgradeable (literal-0 DELEGATECALL), but privileged: ping() is not allowlisted and is gated on
+  // `caller() == 0xdead` (caller vs literal).
+  assert.deepEqual(FLAGS(r), { privileged: true, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
+  assert.deepEqual(r.evidence.reasons, ['caller-vs-literal', 'unknown-selector']);
   assert.equal(r.evidence.opcodes.constTargetDelegatecall, 1);
 });
 
 test('owner() probe robustness: revert / gas hog => no owner; garbage word => privileged', async () => {
-  for (const n of ['OwnerRevertsToken', 'OwnerGasHogToken', 'OwnerShortToken']) {
+  for (const n of ['OwnerRevertsToken', 'OwnerShortToken']) {
     const t = await deployToken(env, n);
     const r = await scan(env.pub, t.address);
     assert.equal(r.privileged, false, n);
+    assert.equal(r.evidence.owner, null, n);
   }
+  // GasHog: owner() runs out of gas => no owner; privileged only because its public `sink()` is not allowlisted
+  const h = await scan(env.pub, (await deployToken(env, 'OwnerGasHogToken')).address);
+  assert.equal(h.evidence.owner, null);
+  assert.deepEqual(h.evidence.reasons, ['unknown-selector']);
   const g = await deployToken(env, 'OwnerGarbageToken');
   assert.equal((await scan(env.pub, g.address)).privileged, true);
 });
@@ -110,7 +122,8 @@ test('live SELFDESTRUCT => dangerSetter; AccessControl hasRole => privileged (re
   const r2 = await scan(env.pub, ac);
   assert.equal(r2.privileged, true);
   assert.equal(r2.dangerSetter, false);
-  assert.deepEqual(r2.evidence.reasons, ['access-control']);
+  assert.deepEqual(r2.evidence.reasons, ['access-control', 'unknown-selector']);
+  assert.deepEqual(r2.evidence.unknownSelectors, ['0x91d14854']);
 });
 
 test('XOR dispatcher (no EQ selectors) => dispatcher-unrecognized, fail-closed', async () => {
@@ -132,7 +145,8 @@ test('HiddenOwnerToken: custom-slot onlyOwner + unlisted configure(uint256) => p
   assert.equal(r.upgradeable, false);
   assert.equal(r.evidence.owner, null);
   assert.ok(r.evidence.callerChecks.length >= 1);
-  assert.deepEqual(r.evidence.reasons, ['caller-vs-storage']);
+  assert.deepEqual(r.evidence.reasons, ['caller-vs-storage', 'unknown-selector']);
+  assert.ok(r.evidence.unknownSelectors.includes(selectorOf('configure(uint256)')));
 });
 
 test('OracleFeeToken: STATICCALL to a stored/immutable oracle in _transfer => privileged (externalCalls)', async () => {
@@ -142,28 +156,86 @@ test('OracleFeeToken: STATICCALL to a stored/immutable oracle in _transfer => pr
   assert.equal(r.dangerSetter, false);
   assert.ok(r.evidence.externalCalls.count >= 1);
   assert.equal(r.evidence.externalCalls.offsets.length, r.evidence.externalCalls.count);
-  assert.deepEqual(r.evidence.reasons, ['external-call']);
+  assert.ok(r.evidence.reasons.includes('external-call'));
 });
 
-test('fixture audit: flags for every test/fixtures/Tokens.sol token under scanner v2', async () => {
+test('decoy JUMPDEST block + XOR dispatcher => dispatcher-unrecognized', async () => {
+  const addr = '0x000000000000000000000000000000000000dec0';
+  await env.pub.request({ method: 'anvil_setCode', params: [addr, DECOY_XOR] });
+  const r = await scan(env.pub, addr);
+  assert.deepEqual(r.evidence.selectors, []);
+  assert.ok(r.evidence.reasons.includes('dispatcher-unrecognized'));
+  assert.equal(r.privileged, true);
+  assert.equal(r.dangerSetter, true);
+});
+
+test('MappingAdminToken: require(_ops[msg.sender]) + configure(uint256) => privileged via unknownSelectors', async () => {
+  const t = await deployScannerFixture(env, 'MappingAdminToken', [SUPPLY]);
+  const r = await scan(env.pub, t.address);
+  assert.equal(r.privileged, true);
+  assert.equal(r.dangerSetter, false);
+  assert.deepEqual(r.evidence.unknownSelectors, [selectorOf('configure(uint256)')]);
+  assert.deepEqual(r.evidence.reasons, ['unknown-selector']);
+});
+
+test('ImmutableAdminToken: CALLER vs immutable literal => privileged', async () => {
+  const t = await deployScannerFixture(env, 'ImmutableAdminToken', [SUPPLY]);
+  const r = await scan(env.pub, t.address);
+  assert.equal(r.privileged, true);
+  assert.ok(r.evidence.callerLiteralChecks.length >= 1);
+  assert.deepEqual(r.evidence.reasons, ['caller-vs-literal', 'unknown-selector']);
+});
+
+test('BalanceOracleToken: BALANCE(0xBEEF) on the transfer path => privileged (external-state)', async () => {
+  const t = await deployScannerFixture(env, 'BalanceOracleToken', [SUPPLY]);
+  const r = await scan(env.pub, t.address);
+  assert.equal(r.privileged, true);
+  assert.ok(r.evidence.externalState.count >= 1);
+  assert.deepEqual(r.evidence.reasons, ['external-state']);
+});
+
+test('PermitToken (OZ-shaped ERC20 + permit + eip712Domain) is not privileged', async () => {
+  const t = await deployScannerFixture(env, 'PermitToken', [SUPPLY]);
+  const r = await scan(env.pub, t.address);
+  assert.deepEqual(FLAGS(r), { privileged: false, upgradeable: false, dangerSetter: false, ownerCanTrap: false });
+  assert.deepEqual(r.evidence.reasons, []);
+  assert.deepEqual(r.evidence.unknownSelectors, []);
+  assert.ok(r.evidence.selectors.includes(selectorOf('permit(address,address,uint256,uint256,uint8,bytes32,bytes32)')));
+});
+
+test('fixture audit: flags for every test/fixtures/Tokens.sol token under scanner v3', async () => {
   // [privileged, upgradeable, dangerSetter, reasons]
+  // v3 changes vs v2 (all flag changes are privileged false -> true, from the allowlist / literal-caller rules):
+  //  - FeeToken: public `feeBps()` getter is not allowlisted (unknown-selector).
+  //  - PairAware fixtures (BlacklistOnBuy, SellTax99, MaxTxToken, CooldownToken, GasBombToken, ReturnBombToken,
+  //    TxOriginTrap, ForgedProbeToken): `initPair(address)` is a deployer-only setter (unknown-selector) gated on
+  //    `msg.sender == deployer` (immutable => caller-vs-literal); extra getters (maxTx, lastBuy, blacklisted, sink,
+  //    boughtAt) are not allowlisted either.
+  //  - ScanFalsePositiveToken: `ping()` unknown + `caller() == 0xdead` literal check.
+  //  - ReentrantToken: setTarget/factory/reentered/attempted unknown (already privileged in v2 via external-call).
+  //  - TradingDisabled / TimeBombToken / ProxyToken: flags unchanged; extra reasons only. ProxyToken's own
+  //    fallback (delegatecall forwarder) is reported as fallback-logic.
+  //  - CleanToken / OwnedCleanToken: unchanged.
   const expected = {
     CleanToken: [false, false, false, []],
-    OwnedCleanToken: [true, false, false, ['caller-vs-storage', 'owner-getter']], // renounceOwnership check
-    FeeToken: [false, false, false, []],
-    BlacklistOnBuy: [false, false, false, []],
-    SellTax99: [false, false, false, []],
-    MaxTxToken: [false, false, false, []],
-    CooldownToken: [false, false, false, []],
-    TradingDisabled: [true, false, true, ['caller-vs-storage', 'dangerous-selector', 'owner-getter']],
-    TimeBombToken: [true, false, true, ['caller-vs-storage', 'dangerous-selector', 'owner-getter']],
-    GasBombToken: [false, false, false, []],
-    ReturnBombToken: [false, false, false, []],
-    TxOriginTrap: [false, false, false, []],
-    ScanFalsePositiveToken: [false, false, false, []],
-    ReentrantToken: [true, false, false, ['external-call']], // v2 change: was all-false in v1
-    ForgedProbeToken: [false, false, false, []],
-    ProxyToken: [true, true, true, ['caller-vs-storage', 'dangerous-selector', 'delegatecall', 'proxy-slot', 'upgrade-selector']],
+    OwnedCleanToken: [true, false, false, ['caller-vs-storage', 'owner-getter']],
+    FeeToken: [true, false, false, ['unknown-selector']],
+    BlacklistOnBuy: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    SellTax99: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    MaxTxToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    CooldownToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    TradingDisabled: [true, false, true,
+      ['caller-vs-literal', 'caller-vs-storage', 'dangerous-selector', 'owner-getter', 'unknown-selector']],
+    TimeBombToken: [true, false, true,
+      ['caller-vs-literal', 'caller-vs-storage', 'dangerous-selector', 'owner-getter', 'unknown-selector']],
+    GasBombToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    ReturnBombToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    TxOriginTrap: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    ScanFalsePositiveToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    ReentrantToken: [true, false, false, ['caller-vs-literal', 'external-call', 'unknown-selector']],
+    ForgedProbeToken: [true, false, false, ['caller-vs-literal', 'unknown-selector']],
+    ProxyToken: [true, true, true, ['caller-vs-storage', 'dangerous-selector', 'delegatecall', 'fallback-logic',
+      'proxy-slot', 'unknown-selector', 'upgrade-selector']],
   };
   const got = {};
   for (const name of Object.keys(expected)) {
