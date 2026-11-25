@@ -212,24 +212,27 @@ every shard.
 Each shard sends with **its own attester key**, created on the server, so the shards never race for a nonce and your
 main key never leaves this machine. Type your server login after `SRV=` (for example `you@<server-ip>`) and the
 shard count after `N=`, and paste the block. It copies the repo (without `.env` and `node_modules`), installs the
-dependencies, and creates one key per shard, `~/.exitproof-shard0.key` to `~/.exitproof-shard<N-1>.key`, readable by
-you only (mode 600). An existing key file is kept, so the block is safe to run again. The server needs Node ≥ 22 and
+dependencies, and creates one key per shard, `~/.exitproof-shard0.key` to `~/.exitproof-shard<N-1>.key`, with its
+address next to it in `~/.exitproof-shard<i>.addr`, both readable by you only (mode 600). The key and address are
+written once, from the output of `cast wallet new`; an existing key is kept, so the block is safe to run again. No key
+ever appears on a command line. The server needs Node ≥ 22 and
 Foundry, as in [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ```zsh
 SRV=
 N=5
-[ -n "$SRV" ] || { echo "set SRV=user@<server-ip> first"; false; } && rsync -a --exclude .git --exclude node_modules --exclude .env --exclude refs --exclude .superpowers --exclude scanner/state --exclude scanner/reports ./ "$SRV:exitproof/" && ssh "$SRV" 'cd ~/exitproof && npm ci && cd scanner && npm ci' && ssh "$SRV" "umask 077 && for i in \$(seq 0 $((N-1))); do f=\$HOME/.exitproof-shard\$i.key; [ -s \$f ] || ~/.foundry/bin/cast wallet new | awk '/Private key/{print \$3}' > \$f; chmod 600 \$f; done"
+[ -n "$SRV" ] || { echo "set SRV=user@<server-ip> first"; false; } && rsync -a --exclude .git --exclude node_modules --exclude .env --exclude refs --exclude .superpowers --exclude scanner/state --exclude scanner/reports ./ "$SRV:exitproof/" && ssh "$SRV" 'cd ~/exitproof && npm ci && cd scanner && npm ci' && ssh "$SRV" "set -o pipefail; umask 077 && cd ~/exitproof && for i in \$(seq 0 $((N-1))); do f=\$HOME/.exitproof-shard\$i.key; a=\$HOME/.exitproof-shard\$i.addr; if [ ! -s \$f ]; then ~/.foundry/bin/cast wallet new | awk -v k=\$f -v a=\$a '/^Address/{print \$2 > a} /^Private key/{print \$3 > k}' || exit 1; elif [ ! -s \$a ]; then chmod 600 \$f && node scripts/key-address.mjs \$f > \$a || exit 1; fi; [ -s \$f ] && [ -s \$a ] || { echo shard \$i: key or address file empty; exit 1; }; chmod 600 \$f \$a; done"
 ```
 
-Read the shard addresses into `ATT`. The server derives each address from its key file (the key is read inside the
-server's shell and never printed). The second line checks that there are exactly `N` addresses and prints them, or
-clears `ATT`. The third line must print `600` for every key file.
+Read the shard addresses into `ATT`. The server reads each `.addr` file and checks it against its key file with
+`scripts/key-address.mjs`, which reads the key inside node and prints only the address. The second line checks that
+there are exactly `N` addresses and prints them, or clears `ATT`. The third line must print `600` for every key and
+address file.
 
 ```zsh
-ATT=$(ssh "$SRV" "for i in \$(seq 0 $((N-1))); do ~/.foundry/bin/cast wallet address --private-key \"\$(cat \$HOME/.exitproof-shard\$i.key)\" || exit 1; done | paste -sd, -")
+ATT=$(ssh "$SRV" "set -o pipefail; cd ~/exitproof && for i in \$(seq 0 $((N-1))); do a=\$(cat \$HOME/.exitproof-shard\$i.addr) && [ -n \"\$a\" ] && [ \"\$a\" = \"\$(node scripts/key-address.mjs \$HOME/.exitproof-shard\$i.key)\" ] || { echo shard \$i: address file missing or does not match its key >&2; exit 1; }; echo \$a; done | paste -sd, -")
 [ "$(printf '%s' "$ATT" | tr ',' '\n' | grep -c '^0x')" = "$N" ] && echo "$ATT" || { echo "expected $N shard addresses, got: $ATT"; ATT=; }
-ssh "$SRV" "for i in \$(seq 0 $((N-1))); do stat -c '%a %n' \$HOME/.exitproof-shard\$i.key; done"
+ssh "$SRV" "for i in \$(seq 0 $((N-1))); do stat -c '%a %n' \$HOME/.exitproof-shard\$i.key \$HOME/.exitproof-shard\$i.addr; done"
 ```
 
 Register those addresses as attesters and give each 0.001 OKB for gas (a shard of 190 tokens needs about 0.0003),
