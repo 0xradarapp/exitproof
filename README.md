@@ -203,17 +203,24 @@ do), refuses mainnet without `CONFIRM_MAINNET=yes`, and takes the key only from 
 [docs/CENSUS.md](docs/CENSUS.md) applies ExitProof itself (the real router's `inspect` with the real taped-out circuit,
 on a fork of mainnet, plus the static scanner) to a sample of live PotatoSwap WOKB pools, and cross-checks every
 "cannot sell" and "cannot buy" result with a plain wallet. See it for the latest run; the file states the block, the
-sample and the method. The run at block 76,868,206 found:
+sample and the method. The current run (block 76,875,879, the final router, scanner v10) found:
 
 - 953 live WOKB pools out of 26,996 WOKB pairs; 96.5% of the pairs hold less than 0.01 OKB (never funded, drained or rugged);
-- of 740 buyable tokens in an 800-token sample, **31.1% could not be sold back** (reason 1; a plain wallet confirmed 225 of those 230 and sold 3 of them fine);
-- **38.4%** have an active owner holding dangerous switches;
-- ExitProof would allow 68% in permissive, 49.6% in balanced and 11.4% in strict mode;
-- 60 more tokens could not be bought through ExitProof at all (50 of 58 checked could not be bought by a plain wallet either).
+- of 740 buyable tokens in an 800-token sample, **12.4% are blocked even in permissive mode**, about 1 in 8: **6.6%
+  cannot be sold back at all** (reason 1), and the rest carry a sell tax (5.1%) or buy tax (4.7%) of 15% or more;
+- a plain wallet selling through PotatoSwap's own router agrees on 44 of the 49 "cannot sell" tokens (one more could
+  not even be bought). The 4 that differ are deliberate ExitProof blocks: tokens that skim or zero the hop to the
+  buyer, and one that refuses a `transferFrom` sale by any spender but PotatoSwap's router;
+- **79.5%** are flagged by the scanner's conservative heuristics as having an active owner with dangerous switches.
+  That is a capability flag from rules that also hold back honest tokens, not a finding of malice;
+- ExitProof would allow 87.6% in permissive, 20.5% in balanced and 11.6% in strict mode;
+- 60 more tokens could not be bought through ExitProof at all; none of the 58 checked could be bought by a plain wallet either.
 
-That run predates the final router fix (Flap-style tokens that swap their tax back on a sell were then counted as
-"cannot sell"), and its per-mode verdicts were computed with an earlier scanner version than the one described here.
-A re-run with the final router is in progress; docs/CENSUS.md will carry its results.
+**Correction.** The first census (block 76,868,206) reported 31.1% "cannot sell". That was wrong: the router of that
+time priced its sell-back on pool reserves read before the token transfer, so tax tokens that swap their collected
+tax inside the sale (182 of them, not only Flap's) failed the pool's check and were counted as honeypots, and that
+census's wallet cross-check had the same flaw. The final router reads the reserves after the transfer, as
+PotatoSwap's router does; docs/CENSUS.md documents the correction token by token.
 
 ## Security review history
 
