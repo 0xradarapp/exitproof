@@ -163,7 +163,8 @@ anvil --fork-url https://xlayerrpc.okx.com --chain-id 196 --host 127.0.0.1 --por
 Back in the first terminal: the registry address, two live example tokens and their PotatoSwap pairs, and a
 read-only check of each through the new router. Both were checked against the final router on a fork of block
 76,876,829: `RED` (OKS) is a honeypot that nobody can sell (reason 1 in every mode; a buy sent anyway reverted with
-`Blocked(1)`), and `AMBER` (羊屎蛋) is a Flap launchpad token that sells fine but is a proxy, so balanced mode holds it
+`Blocked(1)`), and `AMBER` (羊屎蛋) is a Flap launchpad token that sells fine but is a proxy. The default mode is
+permissive (the exit proof), so `AMBER` is allowed, and the owner-risk advisory shows balanced and strict holding it
 back (reason 4) until it is scanned. Re-check both on the day; tokens change.
 
 ```zsh
@@ -176,7 +177,8 @@ node cli/exitproof.mjs check "$RED" --network xlayer
 node cli/exitproof.mjs check "$AMBER" --network xlayer
 ```
 
-Expect `RED`: `"state": "red"`, reason 1. `AMBER`: `"state": "amber"`, reason 4 (balanced is the default mode).
+Expect `RED`: `"state": "red"`, reason 1, and `"ownerRisk": null`. `AMBER`: `"state": "green"` (permissive), and
+`ownerRisk` lists balanced and strict with reason 4. The per-mode verdicts are under `modes`.
 
 Attest `AMBER` as a dry run first, with the simulation; it prints what it would write and takes a minute or two.
 
@@ -185,9 +187,9 @@ REGISTRY="$REG" FORK_RPC=http://127.0.0.1:8547 ATTESTER_KEY="$(k)" node scanner/
 ```
 
 Then send it, and check the token again through the router. The scanner resolves the Flap clone to its
-implementation, so the entry replaces the on-chain "upgradeable" guess: expect `allow` in balanced if the scan and the
-simulation found nothing, or amber reason 5 if they flagged an owner power or a failed simulated sell. Either way the
-verdict now comes from the attestation, and reason 4 is gone.
+implementation, so the entry replaces the on-chain "upgradeable" guess: permissive stays green, and the advisory now
+shows reason 5 for balanced and strict (the scanner flags its owner powers). Reason 4 is gone: the verdict comes from
+the attestation.
 
 ```zsh
 REGISTRY="$REG" FORK_RPC=http://127.0.0.1:8547 ATTESTER_KEY="$(k)" SEND=1 CONFIRM_MAINNET=yes node scanner/src/cli.mjs attest "$AMBER" "$AMBER_PAIR"

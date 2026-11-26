@@ -48,12 +48,15 @@ actually received.
 
 Users pick a mode:
 
-- **permissive:** "is it a honeypot?"
-- **balanced:** the default. It also blocks upgradeable tokens, and tokens whose active owner holds dangerous switches or hasn't been scanned yet.
+- **permissive (the default):** the on-chain exit proof. The buy stands only if the whole position sold back and both taxes are under 15%. This is the measured, enforced guarantee.
+- **balanced:** permissive plus conservative scanner heuristics: no upgradeable code, and no active owner with dangerous switches or unscanned code.
 - **strict:** allowlisted code only.
 
-The app shows three states: green "you can get out", amber "sells now, but risky" (the sell-back worked, but the mode's
-owner, upgrade or scan policy says no), and red "exit blocked". The same check is free as `inspect()`, an `eth_call`
+Every check runs all three modes. Permissive is the main verdict; balanced and strict are shown as an **owner-risk
+advisory** (for example "sells now, but the owner can still change fees: reason 5"), with a one-click "Buy in balanced
+/ strict mode" that makes the router enforce them. The app shows three states: green "you can get out", amber "sells
+now, but risky", and red "exit blocked". The scanner's flags are heuristics with documented gaps, which is why they
+advise rather than decide by default. The same check is free as `inspect()`, an `eth_call`
 that never buys. The web app (EN/TR/中文, with a second RPC as fallback), the CLI and an OKX Agentic Wallet skill all
 use it.
 
@@ -63,12 +66,13 @@ on a fork whose coinbase, gas limit and base fee match the forked mainnet block:
 PotatoSwap's router (correct for Flap tokens that swap their tax back), sells from one block up to 30 days later, a
 sell after a third party has traded (sequence traps), the owner's dangerous setters, and a sweep of unknown setters
 with magic arguments and two-step pairs that fails closed when it cannot finish. That catches time bombs such as an
-owner who can disable trading later, and tokens that only let you sell in the block you bought. Until a token is attested, balanced mode treats it as unscanned: an unscanned token with an
-active owner is held back with reason 6.
+owner who can disable trading later, and tokens that only let you sell in the block you bought. Since v8–v10 its rules are structural: a token passes balanced only with standard
+OpenZeppelin token bodies and plain Ownable/Ownable2Step ownership. Until a token is attested, balanced mode treats it
+as unscanned: an unscanned token with an active owner is held back with reason 6.
 
 ### Target users
 
-1. **Retail memecoin buyers on X Layer.** PotatoSwap has about 27,500 pairs, but only about 950 have a live WOKB pool. In our census of 800 of those live tokens (block 76,868,206; see `docs/CENSUS.md` for the latest run), 31.1% of the buyable ones could not be sold back, and 38.4% had an active owner holding dangerous switches. Buying through ExitProof costs 0.1% more. It blocks any buy whose full exit fails at the moment of purchase, so the common "bought, can't sell" trap is caught before any money moves. The residuals (later blocks, later owner actions, tokens that single out the router or `tx.origin`) are listed in the README.
+1. **Retail memecoin buyers on X Layer.** PotatoSwap has about 27,500 pairs, but only about 950 have a live WOKB pool. In our census of 800 of those live tokens (block 76,868,206; see `docs/CENSUS.md` for the latest run), 31.1% of the buyable ones could not be sold back, and 38.4% had an active owner holding dangerous switches. That run predates the final router fix and used an earlier scanner for its per-mode verdicts; a re-run with the final router is in progress. Buying through ExitProof costs 0.1% more. It blocks any buy whose full exit fails at the moment of purchase, so the common "bought, can't sell" trap is caught before any money moves. The residuals (later blocks, later owner actions, tokens that single out the router or `tx.origin`) are listed in the README.
 2. **AI trading agents** (OKX Agentic Wallet, Onchain OS). An agent can't judge a token by reading its website. ExitProof gives agents a JSON verdict they can read by machine, and enforces the same verdict on chain when they buy. Token names reach the agent only as labelled untrusted text. An agent that was talked into a bad token still can't get past a failing exit check: the buy reverts.
 3. **Launchpads and wallets** that want to show "can you sell this?" next to every token, and to badge clean launches.
 
@@ -106,19 +110,20 @@ All of it. First commit 2026-11-25.
 - The circuit: spec, RTL, Yosys synthesis, exhaustive verification.
 - RiskRegistry (keyed by token address, with a codehash check and two-step ownership), the BytecodeScan library and
   ExitProofRouter, with the full-exit probe from a code-less holder through `transferFrom` and a measured delivery.
-- Foundry tests, counted at commit `2ed1b9f`:
+- Foundry tests, counted at commit `94fbeae`:
   - 119 offline tests: unit, fuzz, invariant, gas and the final-audit regressions;
   - 35 fork tests against the real PotatoSwap and a real TapeOut processor on a fork of mainnet, including a 37-step
     stress run and 10 real launchpad and honeypot tokens checked against PotatoSwap's own router.
-- The deterministic scanner (v6: allowlist model, mainnet-matched fork environment, Flap-correct router-path sells,
-  delayed sells up to +30 d, sequence-trap and tax-jump signals, a fail-closed unknown-setter sweep, sharded backfill,
-  mainnet send gate), covered by 124 tests (at commit `f475f0c`).
-- The static web app (three-state verdict, circuit explorer, new-pairs list, totals since launch, EN/TR/中文, RPC
-  fallback), the CLI and the agent skill, with 12 tests.
+- The deterministic scanner (v10: allowlist model with structural caller-gated and storage-write rules,
+  mainnet-matched fork environment, Flap-correct router-path sells, delayed sells up to +30 d, sequence-trap and
+  tax-jump signals, a fail-closed unknown-setter sweep, sharded backfill, mainnet send gate), covered by 155 tests.
+- The static web app (permissive verdict with an owner-risk advisory from all three modes, circuit explorer,
+  new-pairs list, totals since launch, EN/TR/中文, RPC fallback), the CLI and the agent skill, with 13 tests.
 - The mainnet-gated tape-out, deploy and DeWEB scripts, and a one-command fork rehearsal of the whole flow
   (`scripts/rehearse.sh`).
 - A Token Safety Census of live PotatoSwap tokens, measured by ExitProof itself on a fork (`docs/CENSUS.md`).
-- Adversarial reviews of each component, then two independent final audits (security and functional) before mainnet.
+- Adversarial reviews of each component, then two independent final audits (security and functional) and four more
+  scanner re-review rounds (v7–v10) before mainnet.
   They found real bypasses (a forged CBOR trailer, a PUSH overrun, a second-hop blacklist, hidden or constant admins,
   a balance kill switch, a skimmed delivery hop, a `transferFrom` trap, a same-block sell trap, codehash-keyed
   attestations, EIP-7702 tokens) and a false "honeypot" verdict on real launchpad tokens. Each one was fixed and
@@ -131,7 +136,10 @@ prove a sale in a later block: tokens that allow a sale only in the receiving bl
 delayed sells (up to +30 d), the naive sequence trap by its third-party trade, and a sequence trap that reacts only to
 chosen counterparties or amounts, kept open by the attacker's own bot, by nothing in this design. The simulation's
 fork still differs from mainnet in `prevrandao`, fork block hashes and gas price, and its sweep misses some hidden
-admins and argument combinations. An
+admins and argument combinations. Inside allowlisted functions, a trap written into a mapping entry gated by a mapping
+admin, a fee stored by a magic argument anyone can send to transfer/approve, or a value packed next to `totalSupply`
+is not flagged. In the other direction, balanced and strict hold back many honest tokens, which is why permissive is
+the default and the stricter modes are an advisory. An
 owner action after the buy is stopped only if the scanner flagged that power. A token that treats the router or
 `tx.origin` differently can still pass the probe. Unscanned proxies (including launchpad clones) are read as
 upgradeable until scanned. The first buy of a very large token can cost up to about 5M gas. TapeOut's factory isn't

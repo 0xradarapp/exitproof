@@ -22,6 +22,11 @@ A token whose pair exists before it has code or liquidity is kept pending and sc
 pair's `Sync`, or a re-check every 600 blocks); it is never dropped. A simulation or scan that keeps failing is
 attested fail-closed. Progress is kept in `scanner/state/daemon.json`, so a restart resumes where it stopped.
 
+What the attestations are for: the default mode, permissive, is the on-chain exit proof and does not use the
+registry. Balanced and strict read the scanner's flags (scanner v10: conservative structural rules with documented
+gaps, see scanner/README.md), and the app and CLI show them as an owner-risk advisory on every check, with a one-click
+buy in those modes. A token the daemon has not attested yet shows as "not scanned" in that advisory.
+
 ### Environment
 
 | Var | Meaning |

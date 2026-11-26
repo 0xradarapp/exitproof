@@ -191,12 +191,12 @@ node -e 'const j=require(process.argv[1]);console.log("  flags: privileged="+j.p
 expect TimeBombToken  balanced   blocked 5
 
 step "5/6 CLI buy (EXITPROOF_KEY = anvil #3, CleanToken 0.01 OKB, balanced, --yes)"
-BUY=$(EXITPROOF_KEY="$BUYER_KEY" node cli/exitproof.mjs buy "$(tok CleanToken)" --amount 0.01 --network fork --yes) || { printf '%s\n' "$BUY"; fail "CLI buy"; }
+BUY=$(EXITPROOF_KEY="$BUYER_KEY" node cli/exitproof.mjs buy "$(tok CleanToken)" --amount 0.01 --mode balanced --network fork --yes) || { printf '%s\n' "$BUY"; fail "CLI buy"; }
 printf '%s' "$BUY" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const j=JSON.parse(s);if(!j.sent||j.status!=="success"){console.log(s);process.exit(1)}console.log("  sent "+j.tx+" · status "+j.status+" · gasUsed "+j.gasUsed+" · received "+j.receivedFormatted+" "+(j.check.symbol||""))})' \
   || fail "CLI buy did not succeed"
 BUY_GAS=$(printf '%s' "$BUY" | node -p 'JSON.parse(require("fs").readFileSync(0,"utf8")).gasUsed')
 echo "  blocked buy refused before sending:"
-NOBUY=$(EXITPROOF_KEY="$BUYER_KEY" node cli/exitproof.mjs buy "$(tok BlacklistOnBuy)" --amount 0.01 --network fork --yes || true)
+NOBUY=$(EXITPROOF_KEY="$BUYER_KEY" node cli/exitproof.mjs buy "$(tok BlacklistOnBuy)" --amount 0.01 --mode permissive --network fork --yes || true)
 case "$NOBUY" in *'"sent": false'*) ;; *) false ;; esac || { printf '%s\n' "$NOBUY"; fail "BlacklistOnBuy buy was not refused"; }
 echo "  BlacklistOnBuy: sent=false ✓"
 
