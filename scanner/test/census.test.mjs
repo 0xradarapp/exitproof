@@ -112,3 +112,23 @@ test('aggregate: EOA cross-check tallies, thrown checks count as unchecked', () 
     cannotBuyChecked: 2, cannotBuyEoaAlsoFails: 1, cannotBuyEoaBuys: 1, cannotBuyEoaBuysCannotSell: 1,
   });
 });
+
+test('compareRuns: counts cannot-sell -> sells (Flap), buyability and per-mode flips', async () => {
+  const { compareRuns } = await import('../src/census-report.mjs');
+  const flapV1 = row('0xaaaa7777', 0, clean);
+  const flapV2 = row('0xaaaa7777', 1, clean);
+  const same1 = row('0xb2', 1, clean);
+  const cb1 = { type: 'token', token: '0xb3', inspect: { kind: 'revert', error: 'SwapFailed' }, scan: clean };
+  const cb2 = row('0xb3', 1 | (2 << 3), clean); // now buyable, buy tax 15-50%
+  const c = compareRuns([flapV1, same1, cb1, row('0xgone', 1, clean)], [flapV2, row('0xb2', 1, { ...clean, privileged: true }), cb2]);
+  assert.equal(c.common, 3);
+  assert.equal(c.onlyPrev, 1);
+  assert.equal(c.cannotSellToSells, 1);
+  assert.equal(c.cannotSellToSellsFlap, 1);
+  assert.equal(c.cannotBuyToBuyable, 1);
+  assert.equal(c.dynamicChanged, 1);
+  assert.equal(c.staticChanged, 1); // 0xb2 became privileged
+  assert.equal(c.flips.permissive.toAllowed, 1); // flap token
+  assert.equal(c.flips.strict.toBlocked, 1); // 0xb2: owner now active
+  assert.equal(c.flips.permissive.reasonChanged, 1); // 0xb3: cannotBuy -> reason 3
+});

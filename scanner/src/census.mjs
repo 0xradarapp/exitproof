@@ -55,7 +55,7 @@ const MODES = { strict: 0, balanced: 1, permissive: 2 };
 export const ROUTER_ABI = parseAbi([
   'function inspect(address factory, address tokenIn, uint256 amountIn, address token, uint8 mode) payable',
   'error Blocked(uint8 reason, uint16 facts)',
-  'error Report(uint16 facts, bool allow, uint8 reason, uint256 buyOut, uint256 sellOut)',
+  'error Report(uint16 facts, bool allow, uint8 reason, uint256 buyOut, uint256 sellOut, uint256 delivered)',
   'error BadPair()', 'error Expired()', 'error TooLittle()', 'error BadEval()', 'error BadConfig()',
   'error BadMode()', 'error BadTo()', 'error BadAmount()', 'error NotSelf()', 'error LowGas()', 'error Locked()',
   'error TransferFailed()', 'error SwapFailed()',
@@ -78,8 +78,9 @@ export function verdictOf(facts) {
 }
 
 /**
- * Facts the router builds once the registry holds the scan result (RiskRegistry flags = scan), from the facts it
- * built for the unscanned token. Mirrors ExitProofRouter._facts: scanned => upgradeable = registry flag (the on-chain
+ * Facts the router builds once the registry holds the scan result for this token address and its current codehash
+ * (RiskRegistry v2 is keyed by token: flagsOf(token) -> (Flags, codehash)), from the facts it built for the unscanned
+ * token. Mirrors ExitProofRouter._riskBits: scanned => upgradeable = registry flag (the on-chain
  * opcode scan is ignored), danger = dangerSetter | ownerCanTrap, ownerActive = privileged | owner() != 0, unscanned 0.
  * `raw` has fl.scanned = false, so its ownerActive bit is exactly owner() != 0.
  */
@@ -390,8 +391,8 @@ async function inspectToken(fork, router, t) {
       try {
         const d = decodeErrorResult({ abi: ROUTER_ABI, data: rd });
         if (d.errorName === 'Report') {
-          const [facts, allow, reason, buyOut, sellOut] = d.args;
-          return { amountIn: amountIn.toString(), kind: 'report', facts: Number(facts), allow, reason: Number(reason), buyOut: buyOut.toString(), sellOut: sellOut.toString() };
+          const [facts, allow, reason, buyOut, sellOut, delivered] = d.args;
+          return { amountIn: amountIn.toString(), kind: 'report', facts: Number(facts), allow, reason: Number(reason), buyOut: buyOut.toString(), sellOut: sellOut.toString(), delivered: delivered.toString() };
         }
         return { amountIn: amountIn.toString(), kind: 'revert', error: d.errorName };
       } catch {
@@ -451,36 +452,35 @@ async function processToken(fork, router, block, t) {
 
 // ------------------------------------------------------------------------------------- EOA cross-check (phase 2)
 
-const PAIR_SWAP_ABI = parseAbi([
-  'function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes data)',
-  'function getReserves() view returns (uint112, uint112, uint32)',
-]);
 const TOKEN_ABI = parseAbi([
-  'function transfer(address to, uint256 amount) returns (bool)', 'function balanceOf(address) view returns (uint256)',
-  'function deposit() payable',
+  'function approve(address spender, uint256 amount) returns (bool)', 'function balanceOf(address) view returns (uint256)',
 ]);
-const POTATO_FEE_BPS = BigInt(K.potatoFeeBps);
-const v2Out = (amountIn, rIn, rOut) => {
-  const x = amountIn * (10_000n - POTATO_FEE_BPS);
-  return rIn === 0n || rOut === 0n ? 0n : (x * rOut) / (rIn * 10_000n + x);
-};
+// PotatoSwap V2 router on X Layer (same address as test/fork/FlapFork.t.sol); the path real users take.
+export const POTATO_ROUTER = getAddress('0x881fB2f98c13d521009464e7D1CBf16E1b394e8E');
+const POTATO_ROUTER_ABI = parseAbi([
+  'function swapExactETHForTokensSupportingFeeOnTransferTokens(uint256 amountOutMin, address[] path, address to, uint256 deadline) payable',
+  'function swapExactTokensForETHSupportingFeeOnTransferTokens(uint256 amountIn, uint256 amountOutMin, address[] path, address to, uint256 deadline)',
+]);
+export const EOA_METHOD = 'potato-router';
 
 /**
- * Cross-check on the fork, independent of the router: a fresh impersonated EOA buys directly on the pair (WOKB in,
- * pair.swap to itself, like PotatoSwap's router) and then sells its whole balance back the same way, in real
- * (auto-mined) fork transactions inside evm_snapshot / evm_revert. Tells "trading closed for everyone" apart from
- * "blocks contracts only", and checks ExitProof's cannot-sell findings against a plain wallet. SERIAL ONLY.
+ * Cross-check on the fork, independent of ExitProof: a fresh impersonated EOA buys through PotatoSwap's own V2 router
+ * (swapExactETHForTokensSupportingFeeOnTransferTokens), waits one block, approves the router and sells its WHOLE
+ * balance with swapExactTokensForETHSupportingFeeOnTransferTokens: exactly what a wallet user does in the PotatoSwap
+ * UI (router transferFrom, reserves read after the transfer, amountIn = balanceOf(pair) - reserve). Real auto-mined
+ * fork transactions inside evm_snapshot / evm_revert, amountOutMin 0 (no slippage guard: we test sellability).
+ * SERIAL ONLY.
  */
 export async function eoaCheck(fork, t, amountIn) {
   const eoa = getAddress('0x' + keccak256(t.token).slice(-40));
   const snap = await fork.request({ method: 'evm_snapshot', params: [] });
-  const res = { buyOk: false, sellOk: false };
+  const res = { method: EOA_METHOD, buyOk: false, sellOk: false };
   const send = async (to, data, value = 0n) => {
-    const hash = await fork.request({ method: 'eth_sendTransaction', params: [{ from: eoa, to, data, value: toHex(value), gas: toHex(3_000_000n) }] });
-    // anvil automines: the receipt exists as soon as eth_sendTransaction returns
+    const hash = await fork.request({ method: 'eth_sendTransaction', params: [{ from: eoa, to, data, value: toHex(value), gas: toHex(5_000_000n) }] });
+    // anvil automines: poll the receipt directly
     for (let i = 0; i < 600; i++) {
       const r = await fork.request({ method: 'eth_getTransactionReceipt', params: [hash] });
-      if (r) return r.status === '0x1';
+      if (r) return { ok: r.status === '0x1', fee: BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice ?? '0x0') };
       await sleep(100);
     }
     throw new Error('no receipt for ' + hash);
@@ -488,31 +488,24 @@ export async function eoaCheck(fork, t, amountIn) {
   try {
     await fork.request({ method: 'anvil_impersonateAccount', params: [eoa] });
     await fork.request({ method: 'anvil_setBalance', params: [eoa, toHex(parseEther('1'))] });
-    const wokbIs0 = getAddress(WOKB) < getAddress(t.token);
-    const reserves = async () => {
-      const [r0, r1] = await fork.readContract({ address: t.pair, abi: PAIR_SWAP_ABI, functionName: 'getReserves' });
-      return wokbIs0 ? { w: r0, k: r1 } : { w: r1, k: r0 };
-    };
-    if (!(await send(WOKB, encodeFunctionData({ abi: TOKEN_ABI, functionName: 'deposit' }), amountIn))) throw new Error('deposit');
-    if (!(await send(WOKB, encodeFunctionData({ abi: TOKEN_ABI, functionName: 'transfer', args: [t.pair, amountIn] })))) throw new Error('wokb transfer');
-    let r = await reserves();
-    const outTok = v2Out(amountIn, r.w, r.k);
-    const buyArgs = wokbIs0 ? [0n, outTok, eoa, '0x'] : [outTok, 0n, eoa, '0x'];
-    res.buyOk = outTok > 0n && await send(t.pair, encodeFunctionData({ abi: PAIR_SWAP_ABI, functionName: 'swap', args: buyArgs }));
-    if (!res.buyOk) return res;
+    const deadline = (await fork.getBlock()).timestamp + 3600n;
+    const buy = await send(POTATO_ROUTER, encodeFunctionData({ abi: POTATO_ROUTER_ABI,
+      functionName: 'swapExactETHForTokensSupportingFeeOnTransferTokens', args: [0n, [WOKB, t.token], eoa, deadline] }), amountIn);
     const bal = await fork.readContract({ address: t.token, abi: TOKEN_ABI, functionName: 'balanceOf', args: [eoa] });
+    res.buyOk = buy.ok && bal > 0n;
     res.received = bal.toString();
-    if (bal === 0n) return res;
+    if (!res.buyOk) return res;
     await fork.request({ method: 'evm_mine', params: [] }); // next block, like a later sell
-    r = await reserves();
-    if (!(await send(t.token, encodeFunctionData({ abi: TOKEN_ABI, functionName: 'transfer', args: [t.pair, bal] })))) { res.sellStep = 'transfer'; return res; }
-    const pairBal = await fork.readContract({ address: t.token, abi: TOKEN_ABI, functionName: 'balanceOf', args: [t.pair] });
-    const inTok = pairBal > r.k ? pairBal - r.k : 0n;
-    const outW = v2Out(inTok, r.k, r.w);
-    const sellArgs = wokbIs0 ? [outW, 0n, eoa, '0x'] : [0n, outW, eoa, '0x'];
-    res.sellOk = outW > 0n && await send(t.pair, encodeFunctionData({ abi: PAIR_SWAP_ABI, functionName: 'swap', args: sellArgs }));
-    if (!res.sellOk) res.sellStep = 'swap';
-    res.sellOut = outW.toString();
+    const ap = await send(t.token, encodeFunctionData({ abi: TOKEN_ABI, functionName: 'approve', args: [POTATO_ROUTER, bal] }));
+    if (!ap.ok) { res.sellStep = 'approve'; return res; }
+    const before = await fork.getBalance({ address: eoa });
+    const sell = await send(POTATO_ROUTER, encodeFunctionData({ abi: POTATO_ROUTER_ABI,
+      functionName: 'swapExactTokensForETHSupportingFeeOnTransferTokens', args: [bal, 0n, [t.token, WOKB], eoa, deadline] }));
+    const after = await fork.getBalance({ address: eoa });
+    const out = after + sell.fee - before;
+    res.sellOk = sell.ok && out > 0n;
+    if (!sell.ok) res.sellStep = 'router-sell';
+    res.sellOut = out.toString();
     return res;
   } catch (e) {
     res.error = (e.shortMessage || e.message || '').split('\n')[0].slice(0, 160);
@@ -523,9 +516,20 @@ export async function eoaCheck(fork, t, amountIn) {
   }
 }
 
-/** Rows that need the EOA cross-check: cannot buy (SwapFailed / other reverts) and cannot sell. */
-export const needsEoaCheck = (r) => r.type === 'token' && !r.eoa && (
+/** Rows that need the EOA cross-check (or a re-check with the current method): cannot buy and cannot sell. */
+export const needsEoaCheck = (r) => r.type === 'token' && r.eoa?.method !== EOA_METHOD && (
   (r.inspect?.kind === 'revert' && r.inspect.error !== 'TooLittle') || (r.inspect?.kind === 'report' && (r.inspect.facts & 1) === 0));
+
+/** Which router build the census ran: git HEAD of the repo and keccak of the compiled router bytecode. */
+function routerArtifactInfo() {
+  const j = JSON.parse(fs.readFileSync(path.join(ROOT, 'out', 'ExitProofRouter.sol', 'ExitProofRouter.json'), 'utf8'));
+  let commit = null;
+  try {
+    const head = fs.readFileSync(path.join(ROOT, '.git', 'HEAD'), 'utf8').trim();
+    commit = head.startsWith('ref: ') ? fs.readFileSync(path.join(ROOT, '.git', head.slice(5)), 'utf8').trim() : head;
+  } catch { /* packed ref or no git */ }
+  return { commit, bytecodeKeccak: keccak256(j.bytecode.object), reportFields: j.abi.find((x) => x.name === 'Report')?.inputs.length };
+}
 
 // ------------------------------------------------------------------------------------------------------ main
 
@@ -596,7 +600,7 @@ async function main() {
       blockTime: new Date(Number(snap.timestamp) * 1000).toISOString(), chainId: 196, upstream: UPSTREAM,
       factory: FACTORY, wokb: WOKB, N, M, seed: SEED, prng: 'mulberry32 partial Fisher-Yates', dustOkb: DUST,
       amountInRule: 'min(0.001 OKB, 1% of WOKB reserve)', inspectMode: 'permissive', scannerVersion: SCANNER_VERSION,
-      startedAt: new Date().toISOString(), sample: s,
+      startedAt: new Date().toISOString(), routerArtifact: routerArtifactInfo(), sample: s,
     };
     fs.mkdirSync(path.dirname(OUT), { recursive: true });
     fs.writeFileSync(OUT, J(meta) + '\n');
@@ -628,13 +632,43 @@ async function main() {
   }
   await Promise.all(Array.from({ length: CONC }, worker));
 
-  // phase 2 (serial): EOA cross-check for cannot-buy / cannot-sell rows
-  const latest = new Map();
-  for (const line of fs.readFileSync(OUT, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
-    const r = JSON.parse(line);
-    if (r.type === 'token') latest.set(r.token, r);
+  const readLatest = () => {
+    const m = new Map();
+    for (const line of fs.readFileSync(OUT, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      const r = JSON.parse(line);
+      if (r.type === 'token') m.set(r.token, r);
+    }
+    return m;
+  };
+
+  // phase 1b (RESCAN=1): re-run the static scan with the current scanner on rows scanned by an older version, and
+  // recompute the attested facts + verdicts from the SAME dynamic Report (the router facts do not change)
+  if (process.env.RESCAN === '1') {
+    const stale = [...readLatest().values()].filter((r) => r.scan && r.scan.scannerVersion !== SCANNER_VERSION
+      && (r.inspect?.kind === 'report' || r.inspect?.kind === 'revert'));
+    log(`re-scan ${stale.length} rows with scanner v${SCANNER_VERSION}`);
+    let k = 0, i = 0;
+    const rescanWorker = async () => {
+      while (i < stale.length) {
+        const r = stale[i++];
+        try {
+          const sc = compactScan(await retry(() => scan(fork, r.token, { blockNumber: forkHead }), 'rescan ' + r.token, 4));
+          const row = { ...r, scan: sc, rescannedFrom: r.scan.scannerVersion };
+          if (r.inspect.kind === 'report') {
+            row.scannedFacts = scannedFacts(r.inspect.facts & 0x1ff, sc);
+            row.verdicts = verdictsFor(row.scannedFacts);
+          }
+          fs.appendFileSync(OUT, J(row) + '\n');
+        } catch (e) { log(`rescan ${r.token} failed: ${(e.message || '').slice(0, 120)}`); }
+        if (++k % 100 === 0) log(`  rescanned ${k}/${stale.length}`);
+      }
+    };
+    await Promise.all(Array.from({ length: CONC }, rescanWorker));
   }
+
+  // phase 2 (serial): EOA cross-check for cannot-buy / cannot-sell rows
+  const latest = readLatest();
   const diag = [...latest.values()].filter(needsEoaCheck);
   log(`EOA cross-check for ${diag.length} cannot-buy / cannot-sell tokens`);
   for (const r of diag) {
