@@ -12,13 +12,13 @@ the buy amount is never taken, and only the gas of the reverted transaction is s
 ## Form fields
 
 - **Project name:** ExitProof
-- **Processor contract address:** `TBD (mainnet pending)`. This is ExitProof's own TapeOut processor "ExitProof Guard" (EXITP) on X Layer, chain 196.
-- **Circuit ID:** `TBD (mainnet pending)`. The policy chip: 54 NAND, 11 inputs, 4 outputs (allow + 3-bit reason). All 2048 inputs were verified on the processor after tape-out, and again right before the router was deployed.
+- **Processor contract address:** `0x215a67c3495BdAAaA9D7294399c9635582d6FfcB`. This is ExitProof's own TapeOut processor "ExitProof Guard" (EXITP) on X Layer, chain 196.
+- **Circuit ID:** `1`. The policy chip: 54 NAND, 11 inputs, 4 outputs (allow + 3-bit reason). All 2048 inputs were verified on the processor after tape-out, and again right before the router was deployed.
 - **Other contracts:**
-  - ExitProofRouter `TBD (mainnet pending)`
-  - RiskRegistry `TBD (mainnet pending)`
+  - ExitProofRouter `0x14f95d99d25af10a2f617BcB088828686E45103a`
+  - RiskRegistry `0x8dBcA53908240B3c91017e2A9A93d717417Bd830`
   - The router trades on PotatoSwap V2 (factory `0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF`).
-- **Access link:** `TBD (live app URL)`. On DeWEB: `TBD (after mainnet publish: https://<circuitId>-2-<processorIndex>.tapekit.org/)`.
+- **Access link:** https://1-2-453.tapekit.org/ (on DeWEB, `1.2.453.tape`, fully on-chain).
 - **Repo:** `TBD (repo URL)`
 - **Demo video (≤ 3 min):** `TBD (video link)`
 
@@ -100,7 +100,7 @@ as unscanned: an unscanned token with an active owner is held back with reason 6
   - ExitProof created its own processor ("ExitProof Guard"), minted 54 NAND transistors and taped out the policy circuit, all scripted in `scripts/tapeout.mjs`.
   - The netlist was synthesized with Yosys (`abc -g NAND`).
   - It was verified on all 2048 inputs off chain, and again on the processor after tape-out: the netlist bytes read back identical, `circuitInfo` matched, and 2048/2048 evals agreed. `scripts/deploy.mjs` repeats those checks on chain before it deploys.
-- **DeWEB / TapeKit (pending publish).** ethers and the fonts are vendored, so the page loads from zero external hosts and passes TapeKit's "100% on-chain" rule; its CSP allows only the two X Layer RPC hosts. `scripts/publish-deweb.mjs` stores it in the circuit's own ERC-6551 container and binds `<circuitId>.2.<processorIndex>.tape`; the publish was rehearsed on a fork (38 txs, ≈0.083 OKB estimated on mainnet). Gateway URL `TBD` after the mainnet publish.
+- **DeWEB / TapeKit (published).** ethers and the fonts are vendored, so the page loads from zero external hosts and passes TapeKit's "100% on-chain" rule; its CSP allows only the two X Layer RPC hosts. `scripts/publish-deweb.mjs` stores it in the circuit's own ERC-6551 container and binds `<circuitId>.2.<processorIndex>.tape`; published on mainnet as `1.2.453.tape` → https://1-2-453.tapekit.org/.
 - **OKX Agentic Wallet:** `agent/SKILL.md`. The CLI prepares the `buyETH` call, and the agent signs it with `onchainos wallet contract-call` after the user confirms.
 
 ### What was built during the event
