@@ -1,6 +1,6 @@
 # ExitProof: submission kit (X Layer TapeOut Accelerate)
 
-Ready-to-paste answers for the Google Form. All values below are live on X Layer mainnet (from `deployments/xlayer.json`); only the demo video link is still open.
+Ready-to-paste answers for the Google Form. All values below are live on X Layer mainnet (from `deployments/xlayer.json`).
 
 ## One line
 
@@ -19,7 +19,7 @@ the buy amount is never taken, and only the gas of the reverted transaction is s
   - The router trades on PotatoSwap V2 (factory `0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF`).
 - **Access link:** https://1-2-453.tapekit.org/ (on DeWEB, `1.2.453.tape`, fully on-chain).
 - **Repo:** https://github.com/0xradarapp/exitproof
-- **Demo video (≤ 3 min):** `TBD (video link)`
+- **Demo video (≤ 3 min):** https://github.com/0xradarapp/exitproof/releases/download/v1.0-demo/exitproof-demo.mp4
 
 ### Product / service
 
