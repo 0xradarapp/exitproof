@@ -9,7 +9,7 @@ policy circuit, run on a local anvil fork of X Layer mainnet at that block, plus
 - **12.4%** of 740 buyable live tokens are blocked by ExitProof **even in permissive mode** (cannot sell all back, or a tax of 15% or more).
 - **6.6%** cannot be sold back at all (reason 1, honeypot).
 - **79.5%** have an active owner holding dangerous switches (a listed fee / blacklist / pause / limit setter, or since scanner v10 any setter gated by a caller check): time bombs that look fine today.
-- ExitProof allows **87.6%** in permissive, **20.5%** in balanced (default) and **11.6%** in strict mode.
+- ExitProof allows **87.6%** in permissive (the default mode), **20.5%** in balanced and **11.6%** in strict mode.
 - A further 60 of 800 sampled live tokens (7.5%) cannot be bought through ExitProof at all right now (58 of 58 cannot be bought by a plain wallet either: trading closed or buys disabled); they are reported apart and are not counted above.
 
 ![Census chart](census.svg)

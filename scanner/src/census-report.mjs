@@ -269,7 +269,7 @@ export function renderMarkdown(a, meta, extra = {}) {
   L.push(`- **${a.honeypotLikePct}%** of ${a.measured} buyable live tokens are blocked by ExitProof **even in permissive mode** (cannot sell all back, or a tax of 15% or more).`);
   L.push(`- **${P.cannotSell}%** cannot be sold back at all (reason 1, honeypot).`);
   L.push(`- **${P.dangerousOwnerSwitches}%** have an active owner holding dangerous switches (a listed fee / blacklist / pause / limit setter, or since scanner v10 any setter gated by a caller check): time bombs that look fine today.`);
-  L.push(`- ExitProof allows **${a.allowedPct.permissive}%** in permissive, **${a.allowedPct.balanced}%** in balanced (default) and **${a.allowedPct.strict}%** in strict mode.`);
+  L.push(`- ExitProof allows **${a.allowedPct.permissive}%** in permissive (the default mode), **${a.allowedPct.balanced}%** in balanced and **${a.allowedPct.strict}%** in strict mode.`);
   L.push(`- A further ${a.cannotBuy} of ${a.classified} sampled live tokens (${a.cannotBuyPct}%) cannot be bought through ExitProof at all right now${a.eoa.cannotBuyChecked ? ` (${a.eoa.cannotBuyEoaAlsoFails} of ${a.eoa.cannotBuyChecked} cannot be bought by a plain wallet either: trading closed or buys disabled)` : ''}; they are reported apart and are not counted above.`);
   L.push('');
   L.push('![Census chart](census.svg)');
