@@ -444,6 +444,83 @@
       "gas": "185482",
       "gasPrice": "20000001",
       "status": "success"
+    },
+    {
+      "label": "putFile index.html 1/7",
+      "nonce": 69,
+      "value": "0",
+      "sentAt": "2026-11-27T07:30:11.394Z",
+      "hash": "0x4373356cff8ed1fad2992f0e3a30d7e0515377deb6a1249d2139a7df23c6641d",
+      "block": "76995578",
+      "gas": "5354990",
+      "gasPrice": "20000001",
+      "status": "success"
+    },
+    {
+      "label": "appendChunk index.html 2/7",
+      "nonce": 70,
+      "value": "0",
+      "sentAt": "2026-11-27T07:30:16.343Z",
+      "hash": "0x07d38369b51308bacc57a0317dca122718fcc6c857fa4dde48543c71cadbc34e",
+      "block": "76995583",
+      "gas": "5366471",
+      "gasPrice": "20000001",
+      "status": "success"
+    },
+    {
+      "label": "appendChunk index.html 3/7",
+      "nonce": 71,
+      "value": "0",
+      "sentAt": "2026-11-27T07:30:22.963Z",
+      "hash": "0x5a725a84f7f82eaba4848decc71726466685b4a822715f11b0b986e668b39b2b",
+      "block": "76995589",
+      "gas": "5366471",
+      "gasPrice": "20000001",
+      "status": "success"
+    },
+    {
+      "label": "appendChunk index.html 4/7",
+      "nonce": 72,
+      "value": "0",
+      "sentAt": "2026-11-27T07:30:27.860Z",
+      "hash": "0x27a4056c6d5f2895944472cbb3288f0f9c2d1ffaaa8572ffebfbef577e9cb98d",
+      "block": "76995594",
+      "gas": "5366471",
+      "gasPrice": "20000001",
+      "status": "success"
+    },
+    {
+      "label": "appendChunk index.html 5/7",
+      "nonce": 73,
+      "value": "0",
+      "sentAt": "2026-11-27T07:30:34.291Z",
+      "hash": "0x9c043f649fb74fe34d121c7ac2e14f63b05f566e92bb51994d30316e2923e061",
+      "block": "76995600",
+      "gas": "5366471",
+      "gasPrice": "20000001",
+      "status": "success"
+    },
+    {
+      "label": "appendChunk index.html 6/7",
+      "nonce": 74,
+      "value": "0",
+      "sentAt": "2026-11-27T07:30:40.643Z",
+      "hash": "0xf4f671637baa2af38d0c3a6cf748580159cbd519da7da472f82b272a42322f1e",
+      "block": "76995607",
+      "gas": "5366471",
+      "gasPrice": "20000001",
+      "status": "success"
+    },
+    {
+      "label": "appendChunk index.html 7/7",
+      "nonce": 75,
+      "value": "0",
+      "sentAt": "2026-11-27T07:30:47.956Z",
+      "hash": "0x0ccc45ba2022c9a86315e2f5552685f6684fbb4ffea6d90eba59ecce6aec41a6",
+      "block": "76995614",
+      "gas": "5222761",
+      "gasPrice": "20000001",
+      "status": "success"
     }
   ],
   "files": {
@@ -514,9 +591,9 @@
       "verified": true
     },
     "index.html": {
-      "sha256": "0x9d301e8c579ca3ca6ca14c893e9e789d7e4af5a51ce28667621eb727d2ceb968",
-      "size": 116245,
-      "chunks": 5,
+      "sha256": "0x7ac78a6d255921f817bf7833cc82a3761b8ce19002fc24ec1f35f2c0bb92d305",
+      "size": 167337,
+      "chunks": 7,
       "verified": true
     }
   },
@@ -529,10 +606,10 @@
     "block": "76901677"
   },
   "spent": {
-    "okb": "0.083316082025804093",
-    "gas": "165804093",
-    "gasOkb": "0.003316082025804093",
+    "okb": "0.112310641095532044",
+    "gas": "203214199",
+    "gasOkb": "0.004064284183214199",
     "feesOkb": "0.08"
   },
-  "done": "2026-11-26T05:30:28.234Z"
+  "done": "2026-11-27T07:31:35.239Z"
 }

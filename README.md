@@ -4,6 +4,11 @@
 in the same transaction, and lets a TapeOut circuit decide whether the buy goes through. If the circuit says no, the
 transaction reverts: the buy amount and fee are never taken, and only the gas of the reverted transaction is spent.
 
+> **Why it matters, measured:** we ran ExitProof's own router and circuit on a mainnet fork against 740 buyable live
+> PotatoSwap tokens. **12.4% (about 1 in 8) fail the exit proof even in the most permissive mode**: 6.6% cannot be sold
+> back at all, and the rest carry a tax of 15% or more. A plain wallet selling through PotatoSwap's own router confirms
+> 44 of the 49 unsellable ones. Method and sample: [Token Safety Census](#token-safety-census) · [docs/CENSUS.md](docs/CENSUS.md).
+
 **English** · [Türkçe özet](#türkçe-özet)
 
 ## What one transaction can prove, and what it can't
@@ -49,12 +54,29 @@ tokens, and some traps still pass them.
 | **Contracts** | ExitProofRouter [`0x14f95d99d25af10a2f617BcB088828686E45103a`](https://www.oklink.com/xlayer/address/0x14f95d99d25af10a2f617BcB088828686E45103a) · RiskRegistry [`0x8dBcA53908240B3c91017e2A9A93d717417Bd830`](https://www.oklink.com/xlayer/address/0x8dBcA53908240B3c91017e2A9A93d717417Bd830) (deploy block 76901134) · trades on PotatoSwap V2 (factory [`0x630D…7fcF`](https://www.oklink.com/xlayer/address/0x630DB8E822805c82Ca40a54daE02dd5aC31f7fcF), 25 bps) with WOKB `0xe538…9b2b` |
 | **TapeOut features used** | **Circuits / `eval` in every buy:** every `buyETH`, `buy` and `inspect` call runs `processor.eval(circuitId, facts)` inside the transaction. The router has no other allow/deny logic; Solidity only adds money checks (minOut, deadline, fee cap) and a backstop that can turn an allow into a revert, never a deny into an allow. **Live circuit explorer:** the web app has 11 bit toggles that call `processor.eval` on chain and compare it with the reference model in the browser. **Own processor + tape-out:** createCPU, NAND mint and tapeout, all scripted and rehearsed (`scripts/tapeout.mjs`); `deploy.mjs` re-runs all 2048 evals before it deploys. **DeWEB/TapeKit (published at https://1-2-453.tapekit.org/):** `scripts/build-deweb.mjs` vendors ethers and the fonts (zero external hosts; TapeKit's "100% on-chain" rule checked), and `scripts/publish-deweb.mjs` stores the site in the circuit's ERC-6551 container and binds the `.tape` name; rehearsed on a fork ([docs/OPERATIONS.md](docs/OPERATIONS.md)). |
 | **Business** | 10 bps on routed buys, with an immutable cap of 30 bps. Paid scanner API and bulk attestations for launchpads and wallets. An "ExitProof verified" launch badge. See [Revenue](#revenue) and [SUBMISSION.md](SUBMISSION.md). |
-| **Usage** | The app shows totals since the deploy block: tokens scanned, flagged, guarded buys and OKB routed, from the router's `Checked` and the registry's `Attested` events (`node cli/exitproof.mjs stats` prints the same). Blocked buys revert, so they never show up as events, and we don't claim on-chain "blocked" counts. |
+| **Usage** | The app shows totals since the deploy block: tokens scanned, flagged, guarded buys and OKB routed, from the router's `Checked` and the registry's `Attested` events (`node cli/exitproof.mjs stats` prints the same). Blocked buys revert, so they never show up as events, and we don't claim on-chain "blocked" counts. Mainnet proof: [team test transactions](#mainnet-test-transactions). |
 | **Census** | ExitProof measured live PotatoSwap tokens on a mainnet fork; see [docs/CENSUS.md](docs/CENSUS.md) for the latest run and [Token Safety Census](#token-safety-census) below. |
 | **Verified source** | Sourcify exact match: [router](https://repo.sourcify.dev/196/0x14f95d99d25af10a2f617BcB088828686E45103a) · [registry](https://repo.sourcify.dev/196/0x8dBcA53908240B3c91017e2A9A93d717417Bd830); registry also verified on OKLink. `scripts/deploy.mjs` prints the exact `forge verify-contract … --verifier sourcify --chain 196` and OKLink commands after deploying. |
 | **Assurance** | Circuit checked on all 2048 inputs off chain and again on a real TapeOut processor (fork of mainnet) · test counts at commit `94fbeae`: 119 offline Foundry tests (unit, fuzz, invariant, gas, audit regressions), 35 fork tests on real PotatoSwap pairs and the real processor (including a 37-step stress run and 10 real Flap and honeypot tokens), 155 scanner tests, 13 CLI/web-logic tests, 8 circuit tests · adversarial reviews after every task plus two independent final audits and four scanner re-review rounds, with every bypass they found fixed ([Security review history](#security-review-history)) · one-command fork rehearsal of the whole mainnet flow (`scripts/rehearse.sh`) |
 | **AI agents** | [`agent/SKILL.md`](agent/SKILL.md): an OKX Agentic Wallet skill. `cli/exitproof.mjs check` gives a JSON verdict for permissive (the default) plus all three modes and an `ownerRisk` advisory; `tx` prepares a `buyETH` call for `onchainos wallet contract-call`. Agents get a check they can read by machine, and the same check is enforced on chain when they buy. Token names are passed to agents only as labelled untrusted data. |
 | **Built during the event** | All of it. First commit 2026-11-25. |
+
+## Mainnet test transactions
+
+These are the team's own test transactions on X Layer mainnet (2026-11-27), sent through the live router from the
+deployer wallet. They are not user traction; they show the full path working on mainnet.
+
+| Token | Mode | Result | Tx |
+|---|---|---|---|
+| KINGX `0xB313…d96e` | permissive | allowed, 0.005 OKB, tokens delivered | [`0x0eea…be27`](https://www.oklink.com/xlayer/tx/0x0eeaf34776d66c88409fd5a4b31ff06e1b5c2a1029d8cfb9eeb4e9618f0ebe27) |
+| XFROG `0xaa7E…3d9B` | permissive | allowed, 0.005 OKB, tokens delivered | [`0xafe4…f2be`](https://www.oklink.com/xlayer/tx/0xafe47663a14a489f94b14efc5229812c7680578878fba4d40ec3a6f2d980f2be) |
+| PUFF `0x4D87…A90e` | permissive | allowed, 0.005 OKB, tokens delivered | [`0x55c4…0517`](https://www.oklink.com/xlayer/tx/0x55c4b251b3efbb4bac3d74beb6b9131caf9e4798b6b421b4fd4423d6f3c20517) |
+| NIUB `0xbB17…36fC` | permissive | allowed, 0.005 OKB, tokens delivered | [`0x134d…38de`](https://www.oklink.com/xlayer/tx/0x134d670fe0bca95bea66d067cc1a17685a6ba1abced1b70244c7a73d430138de) |
+| honeypot `0xFF0c…929b` | permissive | **blocked**: reverted with `Blocked(1, 686)` (reason 1: cannot sell back); the 0.005 OKB was never taken, only gas was spent | [`0xc1a6…1391`](https://www.oklink.com/xlayer/tx/0xc1a6d815f61a3ef451aadd4025122bcbcb2e46177e3532c5b0137f8616451391) |
+
+The same four tokens are blocked in balanced and strict mode, because the scanner flags each of them for an active
+owner with dangerous switches; permissive is the default mode. Reproduce any row for free with
+`node cli/exitproof.mjs check <token> --network xlayer`.
 
 ## What it does
 
